@@ -9,13 +9,15 @@
 //! kernel version, the Type-C driver (`tcpm` vs `ucsi` vs vendor), and on the
 //! platform firmware. Absent is the normal case, not an error.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 /// One complete read of the system's USB state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Snapshot {
     pub captured_at_unix_ms: u64,
     pub host: Host,
@@ -137,9 +139,129 @@ impl Snapshot {
             .filter(|(_, b)| !b.is_empty())
             .collect()
     }
+
+    /// A hash of the state a viewer would notice a change in.
+    ///
+    /// For watchers: two snapshots with the same fingerprint describe the same
+    /// situation and need no repaint. It covers topology, port and contract
+    /// state, batteries, USB4 routers, and how many kernel events have been
+    /// logged.
+    ///
+    /// Three things are deliberately left out, because they move on their own
+    /// and would make a change-driven display repaint forever:
+    ///
+    /// * capture time and uptime — always different;
+    /// * I/O counters and throughput — non-zero whenever any disk is busy;
+    /// * battery power draw below half a watt of change — it wanders constantly
+    ///   on a charging machine. This is the one place where the display can show
+    ///   a slightly stale number, and it is worth it to keep the screen still.
+    pub fn fingerprint(&self) -> u64 {
+        let h = &mut DefaultHasher::new();
+        for bus in &self.buses {
+            hash_device(bus, h);
+        }
+        for p in &self.ports {
+            hash_port(p, h);
+        }
+        for pd in &self.orphan_pd {
+            hash_pd(pd, h);
+        }
+        for b in &self.block_devices {
+            // The device's existence and identity, not its counters.
+            (&b.name, &b.sysfs_path, b.size_bytes, b.rotational).hash(h);
+        }
+        for b in &self.batteries {
+            (&b.name, &b.status, b.capacity_pct).hash(h);
+            b.power_now_w.map(|w| (w * 2.0).round() as i64).hash(h);
+        }
+        self.mains_online.hash(h);
+
+        let tb = &self.thunderbolt;
+        for r in &tb.routers {
+            (&r.name, r.is_host, &r.tx_speed, &r.rx_speed, r.tx_lanes, r.rx_lanes).hash(h);
+            (r.authorized, &r.nvm_version).hash(h);
+        }
+        for r in &tb.retimers {
+            (&r.name, &r.nvm_version).hash(h);
+        }
+
+        // Count plus newest line: cheap, and enough to catch a fresh reset.
+        let log = &self.kernel_log;
+        (log.source, log.events.len()).hash(h);
+        if let Some(last) = log.events.last() {
+            (&last.text, last.monotonic_s.map(f64::to_bits)).hash(h);
+        }
+        h.finish()
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+fn hash_device(d: &UsbDevice, h: &mut DefaultHasher) {
+    (&d.sysfs_name, d.id_vendor, d.id_product, &d.serial).hash(h);
+    (&d.usb_version, d.rx_lanes, d.tx_lanes).hash(h);
+    d.speed.as_ref().map(|s| s.mbps.to_bits()).hash(h);
+    (d.max_power_ma, d.self_powered, d.authorized, &d.power_control).hash(h);
+    for p in &d.ports {
+        (&p.name, &p.state, &p.child, p.over_current_count).hash(h);
+    }
+    for i in &d.interfaces {
+        (&i.sysfs_name, i.class, &i.driver).hash(h);
+    }
+    for c in &d.children {
+        hash_device(c, h);
+    }
+}
+
+fn hash_port(p: &TypecPort, h: &mut DefaultHasher) {
+    (&p.name, &p.power_operation_mode, p.vconn_source, &p.orientation).hash(h);
+    for r in [&p.data_role, &p.power_role, &p.port_type, &p.usb_capability] {
+        r.as_ref().map(|r| &r.raw).hash(h);
+    }
+    (&p.pd_revision, &p.typec_revision).hash(h);
+    for m in &p.alt_modes {
+        (&m.sysfs_name, m.active).hash(h);
+    }
+    match &p.partner {
+        Some(pt) => {
+            (1u8, &pt.kind, pt.supports_pd, &pt.accessory_mode, &pt.pd_revision).hash(h);
+            pt.identity
+                .as_ref()
+                .map(|i| (i.decoded.vendor_id, i.decoded.product_id))
+                .hash(h);
+            for m in &pt.alt_modes {
+                (&m.sysfs_name, m.active).hash(h);
+            }
+            if let Some(pd) = &pt.pd {
+                hash_pd(pd, h);
+            }
+        }
+        None => 0u8.hash(h),
+    }
+    match &p.cable {
+        Some(c) => {
+            (1u8, &c.kind, &c.plug_type, &c.pd_revision).hash(h);
+            c.identity.as_ref().map(|i| i.id_header.map(|v| v.raw)).hash(h);
+        }
+        None => 0u8.hash(h),
+    }
+    if let Some(pd) = &p.local_pd {
+        hash_pd(pd, h);
+    }
+    if let Some(ps) = &p.power_supply {
+        (&ps.name, ps.online, ps.voltage_now_mv, ps.current_now_ma).hash(h);
+        (ps.voltage_min_mv, ps.voltage_max_mv, ps.current_max_ma).hash(h);
+        ps.usb_type.as_ref().map(|t| &t.raw).hash(h);
+    }
+}
+
+fn hash_pd(pd: &PowerDelivery, h: &mut DefaultHasher) {
+    (&pd.name, &pd.revision).hash(h);
+    for p in pd.source_capabilities.iter().chain(&pd.sink_capabilities) {
+        (p.index, p.kind, p.role, p.voltage_mv, p.current_ma).hash(h);
+        (p.min_voltage_mv, p.max_voltage_mv, p.power_mw_field).hash(h);
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Host {
     pub kernel_release: Option<String>,
     pub product_name: Option<String>,
@@ -831,7 +953,7 @@ fn fmt_ma(ma: Option<u32>) -> String {
     .unwrap_or_else(|| "?A".into())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PdoKind {
     FixedSupply,
@@ -853,7 +975,7 @@ impl PdoKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PdoRole {
     Source,
@@ -1165,7 +1287,7 @@ pub struct Retimer {
 // Kernel log
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct KernelLog {
     pub source: KernelLogSource,
     /// Why the log could not be read, when it couldn't.
@@ -1195,12 +1317,14 @@ impl KernelLog {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KernelLogSource {
     DevKmsg,
     Journalctl,
     Dmesg,
+    /// Also the default: no log read means no log source.
+    #[default]
     Unavailable,
 }
 
@@ -1385,5 +1509,102 @@ pub struct Report {
 impl Report {
     pub fn worst_severity(&self) -> Option<Severity> {
         self.findings.iter().map(|f| f.severity).max()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support as ts;
+
+    /// The point of the fingerprint: a watcher must not repaint because time
+    /// passed or because a disk was busy.
+    #[test]
+    fn fingerprint_ignores_time_and_io_counters() {
+        let mut a = ts::empty_snapshot();
+        a.buses.push(ts::root_hub("usb1", 5000.0));
+        a.block_devices.push(BlockDevice {
+            name: "sdb".into(),
+            sysfs_path: PathBuf::from("/sys/devices/test/usb1/block/sdb"),
+            model: None,
+            vendor: None,
+            size_bytes: Some(1_000_000),
+            rotational: Some(false),
+            removable: Some(true),
+            stats: None,
+            throughput: None,
+        });
+
+        let mut b = a.clone();
+        b.captured_at_unix_ms = 99_999;
+        b.uptime_s = Some(1234.5);
+        b.block_devices[0].stats = Some(BlockStats {
+            read_ios: 10,
+            sectors_read: 5_000_000,
+            ms_reading: 40,
+            write_ios: 2,
+            sectors_written: 900,
+            ms_writing: 3,
+            ios_in_flight: 1,
+            sampled_at_unix_ms: 99_999,
+        });
+        b.block_devices[0].throughput = Some(Throughput {
+            read_bps: 4.5e8,
+            write_bps: 0.0,
+            interval_ms: 1000,
+        });
+
+        assert_eq!(a.fingerprint(), b.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_changes_when_something_is_plugged_in() {
+        let mut a = ts::empty_snapshot();
+        a.buses.push(ts::root_hub("usb1", 5000.0));
+        let before = a.fingerprint();
+
+        a.buses[0]
+            .children
+            .push(ts::device("1-1", "3.20", 5000.0, Some("usb1")));
+        assert_ne!(before, a.fingerprint(), "a new device must be noticed");
+    }
+
+    #[test]
+    fn fingerprint_changes_when_the_contract_changes() {
+        let mut a = ts::empty_snapshot();
+        a.ports.push(ts::charging_port(100_000, Some(5000), 20_000, 3000));
+        let before = a.fingerprint();
+
+        // Same charger, renegotiated down to 15 V.
+        if let Some(ps) = a.ports[0].power_supply.as_mut() {
+            ps.voltage_now_mv = Some(15_000);
+        }
+        assert_ne!(before, a.fingerprint(), "a new contract must be noticed");
+    }
+
+    /// A fresh kernel event is a reason to look again even when sysfs is
+    /// unchanged — that is how a reset storm becomes visible.
+    #[test]
+    fn fingerprint_changes_when_the_kernel_logs_something_new() {
+        let mut a = ts::empty_snapshot();
+        a.buses.push(ts::root_hub("usb1", 5000.0));
+        let before = a.fingerprint();
+
+        a.kernel_log = ts::reset_log("1-1", 3);
+        assert_ne!(before, a.fingerprint());
+    }
+
+    /// Orphan PD objects are part of the state, so a change in them counts.
+    #[test]
+    fn fingerprint_covers_orphan_pd() {
+        let mut a = ts::empty_snapshot();
+        let before = a.fingerprint();
+        a.orphan_pd.push(PowerDelivery {
+            name: "pd9".into(),
+            revision: Some("3.0".into()),
+            source_capabilities: Vec::new(),
+            sink_capabilities: Vec::new(),
+        });
+        assert_ne!(before, a.fingerprint());
     }
 }

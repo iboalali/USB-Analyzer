@@ -38,7 +38,7 @@ pub fn read_buses_from(root: &Path) -> Vec<UsbDevice> {
     for (name, (_, real)) in &flat {
         let parent = real
             .parent()
-            .map(|p| fsx::file_name(p))
+            .map(fsx::file_name)
             .filter(|p| flat.contains_key(p));
         parent_of.insert(name.clone(), parent.clone());
         children_of.entry(parent).or_default().push(name.clone());

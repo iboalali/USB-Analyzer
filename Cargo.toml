@@ -5,7 +5,8 @@ members = ["crates/usb-probe", "crates/usbdiag"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+# 1.82 for Option::is_none_or, which the model and the rule engine both use.
+rust-version = "1.82"
 license = "MIT"
 
 [workspace.dependencies]

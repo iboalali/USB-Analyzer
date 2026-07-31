@@ -216,6 +216,69 @@ pub fn ports(out: &mut String, snap: &Snapshot, t: &Theme) {
     }
 }
 
+/// Power Delivery objects the kernel exposed that no Type-C port refers to.
+///
+/// The capture keeps these so that nothing sysfs offered is silently dropped;
+/// this prints them so that promise is real rather than notional. On a normal
+/// machine it prints nothing. When it does print, it means one of two things:
+/// firmware exposed a PD object for something outside the Type-C class, or this
+/// tool failed to follow a port's link to it — and either is worth seeing.
+pub fn orphan_pd(out: &mut String, snap: &Snapshot, t: &Theme) {
+    if snap.orphan_pd.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "{}", t.heading("unattached power delivery objects"));
+    let _ = writeln!(
+        out,
+        "  {}",
+        t.dim("exposed by the kernel but not reachable from any Type-C port")
+    );
+
+    for pd in &snap.orphan_pd {
+        let _ = writeln!(
+            out,
+            "  {}{}",
+            t.bold(&pd.name),
+            pd.revision
+                .as_ref()
+                .map(|r| t.dim(&format!("  PD {r}")))
+                .unwrap_or_default()
+        );
+        if !pd.source_capabilities.is_empty() {
+            row(
+                out,
+                t,
+                "offers",
+                &format!(
+                    "up to {}   {}",
+                    pd.max_source_power_mw()
+                        .map(watts)
+                        .unwrap_or_else(|| "?".into()),
+                    t.dim(&pdo_line(&pd.source_capabilities))
+                ),
+            );
+        }
+        if !pd.sink_capabilities.is_empty() {
+            row(
+                out,
+                t,
+                "accepts",
+                &format!(
+                    "up to {}   {}",
+                    pd.max_sink_power_mw()
+                        .map(watts)
+                        .unwrap_or_else(|| "?".into()),
+                    t.dim(&pdo_line(&pd.sink_capabilities))
+                ),
+            );
+        }
+        if pd.source_capabilities.is_empty() && pd.sink_capabilities.is_empty() {
+            row(out, t, "", &t.dim("no capabilities reported"));
+        }
+    }
+    let _ = writeln!(out);
+}
+
 fn row(out: &mut String, t: &Theme, label: &str, value: &str) {
     let _ = writeln!(out, "    {} {}", t.dim(&format!("{label:<14}")), value);
 }
@@ -1132,5 +1195,60 @@ mod tests {
             verbose: false,
         };
         assert!(t.severity(Severity::High).contains("\x1b[31m"));
+    }
+
+    fn fixed_pdo(index: u32, mv: u32, ma: u32) -> Pdo {
+        Pdo {
+            index,
+            kind: PdoKind::FixedSupply,
+            role: PdoRole::Source,
+            voltage_mv: Some(mv),
+            min_voltage_mv: None,
+            max_voltage_mv: None,
+            current_ma: Some(ma),
+            power_mw_field: None,
+            flags: Default::default(),
+            peak_current: None,
+            fast_role_swap_current: None,
+        }
+    }
+
+    /// `Snapshot::orphan_pd` exists so that a PD object no port claims is not
+    /// silently discarded. That is only true if something renders it.
+    #[test]
+    fn an_unattached_pd_object_is_rendered() {
+        let mut snap = Snapshot::default();
+        snap.orphan_pd.push(PowerDelivery {
+            name: "pd7".into(),
+            revision: Some("3.0".into()),
+            source_capabilities: vec![fixed_pdo(1, 5000, 3000), fixed_pdo(2, 20_000, 5000)],
+            sink_capabilities: Vec::new(),
+        });
+
+        let t = Theme {
+            color: false,
+            verbose: false,
+        };
+        let mut out = String::new();
+        orphan_pd(&mut out, &snap, &t);
+
+        assert!(out.contains("pd7"), "{out}");
+        assert!(out.contains("PD 3.0"), "{out}");
+        // The headline capability must survive, not just the name.
+        assert!(out.contains("100 W"), "{out}");
+    }
+
+    #[test]
+    fn no_unattached_pd_objects_prints_nothing() {
+        let mut out = String::new();
+        orphan_pd(
+            &mut out,
+            &Snapshot::default(),
+            &Theme {
+                color: false,
+                verbose: false,
+            },
+        );
+        assert!(out.is_empty());
     }
 }

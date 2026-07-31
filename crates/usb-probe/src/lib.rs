@@ -31,6 +31,7 @@ pub mod block;
 pub mod diag;
 pub mod kernel;
 pub mod model;
+pub mod monitor;
 pub mod pd;
 pub mod sysfs;
 pub mod thunderbolt;
@@ -58,6 +59,21 @@ pub struct Options {
 
 /// Read the current state of the system.
 pub fn capture(opts: Options) -> Snapshot {
+    capture_with_log(opts, None)
+}
+
+/// Read the current state, optionally reusing a kernel log read earlier.
+///
+/// Reading the log is by far the most expensive part of a capture: on a machine
+/// with `kernel.dmesg_restrict=1` it is a `journalctl` process spawn, which
+/// costs more than everything else here put together. A live view that refreshes
+/// sysfs on every uevent can hand the previous log back in and re-read it on its
+/// own, slower cadence.
+///
+/// The cost of doing that is bounded and one-directional: findings derived from
+/// the log lag by however long the caller waits. Nothing becomes *wrong*, only
+/// late — log events are append-only, so a stale copy is a prefix of the truth.
+pub fn capture_with_log(opts: Options, log: Option<KernelLog>) -> Snapshot {
     let ports = typec::read_ports();
     let (batteries, mains_online) = pd::read_batteries();
 
@@ -96,7 +112,7 @@ pub fn capture(opts: Options) -> Snapshot {
         mains_online,
         uptime_s: read_uptime_s(),
         orphan_pd,
-        kernel_log: kernel::collect(opts.kernel),
+        kernel_log: log.unwrap_or_else(|| kernel::collect(opts.kernel)),
     }
 }
 
@@ -184,6 +200,25 @@ mod tests {
         let back: Report = serde_json::from_str(&json).unwrap();
         assert_eq!(back.findings.len(), rep.findings.len());
         assert_eq!(back.worst_severity(), rep.worst_severity());
+    }
+
+    /// Handing a log back in must use it verbatim, not merge or re-read it —
+    /// that is the whole point of the call, and a silent re-read would put the
+    /// `journalctl` spawn back into every cycle of a live view.
+    #[test]
+    fn a_supplied_kernel_log_is_used_as_is() {
+        let supplied = KernelLog {
+            source: KernelLogSource::Dmesg,
+            note: Some("supplied by the caller".into()),
+            events: Vec::new(),
+        };
+        let snap = capture_with_log(Options::default(), Some(supplied));
+        assert_eq!(snap.kernel_log.source, KernelLogSource::Dmesg);
+        assert_eq!(
+            snap.kernel_log.note.as_deref(),
+            Some("supplied by the caller")
+        );
+        assert!(snap.kernel_log.events.is_empty());
     }
 
     /// A real capture must not panic on this machine, whatever it finds.

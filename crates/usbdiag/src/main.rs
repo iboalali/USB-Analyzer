@@ -7,8 +7,10 @@ mod render;
 
 use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
-use usb_probe::model::{Report, Severity, Snapshot};
+use usb_probe::model::{KernelLog, Report, Severity};
+use usb_probe::monitor::{Monitor, Source};
 use usb_probe::{kernel, Options};
 
 use render::Theme;
@@ -114,6 +116,7 @@ fn format_report(report: &Report, args: &Args) -> String {
     match args.command {
         Command::Ports => {
             render::ports(&mut out, &report.snapshot, &theme);
+            render::orphan_pd(&mut out, &report.snapshot, &theme);
             render::battery(&mut out, &report.snapshot, &theme);
             render::thunderbolt(&mut out, &report.snapshot, &theme);
         }
@@ -127,6 +130,7 @@ fn format_report(report: &Report, args: &Args) -> String {
         }
         Command::All | Command::Watch => {
             render::ports(&mut out, &report.snapshot, &theme);
+            render::orphan_pd(&mut out, &report.snapshot, &theme);
             render::battery(&mut out, &report.snapshot, &theme);
             render::thunderbolt(&mut out, &report.snapshot, &theme);
             render::devices(&mut out, &report.snapshot, &theme);
@@ -150,10 +154,25 @@ fn json_of<T: serde::Serialize>(v: &T) -> String {
     }
 }
 
+/// A burst of uevents ends when this long passes with no further event.
+const DEBOUNCE_MS: u64 = 250;
+
+/// Never coalesce for longer than this. A device in a reset loop emits events
+/// continuously and must not be able to hold the display still.
+const DEBOUNCE_MAX_MS: u64 = 1500;
+
+/// How often to re-read the kernel log when nothing has happened. Sysfs is
+/// cheap and re-read every cycle; the log is a process spawn, so it gets its own
+/// slower cadence — and is read immediately whenever a real event arrives.
+const LOG_REFRESH_MS: u64 = 10_000;
+
 /// Re-render whenever the observed state changes. Useful for plugging and
 /// unplugging: it shows the PD contract settling in real time.
+///
+/// Driven by uevents where they are available, so a plug shows up immediately
+/// rather than up to one poll interval later. `--interval` remains the fallback:
+/// the longest this will go without looking at sysfs regardless of events.
 fn watch(args: &Args, opts: Options) -> ExitCode {
-    let mut last = String::new();
     let mut args = Args {
         command: Command::All,
         ..*args
@@ -163,30 +182,59 @@ fn watch(args: &Args, opts: Options) -> ExitCode {
         args.color = Some(std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none());
     }
 
+    let mut monitor = Monitor::start();
+    let mut last: Option<u64> = None;
+    let mut cached_log: Option<KernelLog> = None;
+    let mut log_read_at = Instant::now();
+    // Nothing has been read yet, so the first pass reads everything.
+    let mut events = 1;
+
     loop {
-        let report = usb_probe::report(opts);
-        let fingerprint = fingerprint(&report.snapshot);
-        if fingerprint != last {
-            last = fingerprint;
+        // An event is exactly when new log lines are worth having; otherwise the
+        // cached copy stands until it ages out.
+        let stale = log_read_at.elapsed() >= Duration::from_millis(LOG_REFRESH_MS);
+        let reuse = if events > 0 || stale {
+            log_read_at = Instant::now();
+            None
+        } else {
+            cached_log.take()
+        };
+
+        let report = usb_probe::diag::report(usb_probe::capture_with_log(opts, reuse));
+
+        // Live throughput is meant to move, so when it was asked for, repaint on
+        // every pass. Otherwise repaint only when the state actually differs.
+        let fingerprint = report.snapshot.fingerprint();
+        if last != Some(fingerprint) || args.sample_ms > 0 {
+            last = Some(fingerprint);
             let text = format_report(&report, &args);
             // Clear screen and home the cursor, then repaint.
             print!("\x1b[2J\x1b[H{text}");
-            println!(
-                "watching — press Ctrl-C to stop (poll {}ms)",
-                args.interval_ms
-            );
+            println!("{}", watch_status(&monitor, &args));
             let _ = std::io::stdout().flush();
         }
-        std::thread::sleep(std::time::Duration::from_millis(args.interval_ms));
+
+        // Reclaim the log rather than cloning it: the report is finished with.
+        cached_log = Some(report.snapshot.kernel_log);
+
+        events = monitor.wait_for_change(
+            Duration::from_millis(args.interval_ms),
+            Duration::from_millis(DEBOUNCE_MS),
+            Duration::from_millis(DEBOUNCE_MAX_MS),
+        );
     }
 }
 
-/// State identity for change detection: everything except the capture time. The
-/// kernel log is included, so a fresh reset also triggers a repaint.
-fn fingerprint(snap: &Snapshot) -> String {
-    let mut s = snap.clone();
-    s.captured_at_unix_ms = 0;
-    serde_json::to_string(&s).unwrap_or_default()
+fn watch_status(monitor: &Monitor, args: &Args) -> String {
+    let how = match monitor.source() {
+        Source::Udev => format!("udev events, {}ms fallback", args.interval_ms),
+        Source::TimerOnly => format!(
+            "polling every {}ms — {}",
+            args.interval_ms,
+            monitor.note().unwrap_or("no event source")
+        ),
+    };
+    format!("watching — press Ctrl-C to stop ({how})")
 }
 
 // ---------------------------------------------------------------------------
@@ -273,7 +321,8 @@ COMMANDS
     ports      Type-C ports: roles, PD contract, cable e-marker, alt modes
     devices    USB topology, plus storage speed, why, and live throughput
     diag       Findings only
-    watch      Re-render on change — plug a cable in and watch it negotiate
+    watch      Re-render on change, driven by uevents — plug a cable in and
+               watch it negotiate
     json       Full snapshot and findings as JSON
 
 OPTIONS
@@ -282,7 +331,9 @@ OPTIONS
         --raw-log       Keep kernel lines that matched no known pattern
         --color         Force ANSI colour
         --no-color      Disable ANSI colour (also honours NO_COLOR)
-        --interval MS   Poll interval for watch, default 2000
+        --interval MS   Fallback refresh for watch, default 2000. Watch is
+                        event-driven; this is the longest it will go without
+                        looking anyway
         --sample MS     Measure live storage throughput over this window
                         (costs exactly this much wall-clock; off by default)
     -h, --help          This text
@@ -297,6 +348,9 @@ NOTES
     Runs unprivileged. On systems with kernel.dmesg_restrict=1 the kernel ring
     buffer is read via journalctl; if neither that nor /dev/kmsg is readable, the
     reset-history rules are skipped and that is reported as a finding.
+
+    watch uses 'udevadm monitor' for change notification, and falls back to
+    plain polling at --interval if udevadm is not available.
 
     Cable capability can only be read from an e-marker chip. Signal integrity and
     the true rating of an unmarked cable need a hardware analyzer.

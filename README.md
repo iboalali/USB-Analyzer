@@ -60,7 +60,7 @@ COMMANDS
     ports      Type-C ports: roles, PD contract, cable e-marker, alt modes
     devices    USB topology, plus storage speed, why, and live throughput
     diag       Findings only
-    watch      Re-render on change — plug a cable in and watch it negotiate
+    watch      Re-render on change, driven by uevents
     json       Full snapshot and findings as JSON
 
 OPTIONS
@@ -72,7 +72,17 @@ Exit status is `0` when nothing actionable was found and `1` when there is a
 medium-or-worse finding, so it works as a CI or scripting gate.
 
 `watch` is the most useful mode while debugging: run it, plug the cable in, and
-watch the PD contract and cable identity appear.
+watch the PD contract and cable identity appear. It is event-driven — a plug
+shows up as soon as udev reports it, not at the next poll — and it repaints only
+when the state it is showing actually differs, so the screen stays still while
+nothing is happening.
+
+Events come from `udevadm monitor --udev`, which needs no privileges. Where
+`udevadm` is missing the tool falls back to polling at `--interval` (default
+2000 ms), which is also the fallback refresh when events *are* available, so a
+missed event can never wedge the display. The kernel log is re-read on its own
+slower cadence, and immediately on any event, because reading it is a process
+spawn and everything else is a handful of sysfs reads.
 
 ## Where the data comes from
 
@@ -88,6 +98,7 @@ Everything is read-only. Nothing requires root.
 | `/sys/class/power_supply/*` | The negotiated contract (`voltage_now` x `current_now`), plus batteries and mains |
 | `/sys/block/*/stat` | Live storage throughput — two reads and the time between them, no privileges |
 | `/dev/kmsg`, else `journalctl -k`, else `dmesg` | Resets, enumeration failures, link-training failures, over-current |
+| `udevadm monitor --udev` | Change notification for `watch`. Not data — just a reason to look again |
 
 Capabilities and the live contract are kept strictly apart, because a charging
 complaint is almost always the gap between them.
