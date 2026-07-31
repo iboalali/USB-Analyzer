@@ -10,6 +10,8 @@
 //! Findings carry a [`Confidence`] so a UI can distinguish a register read from
 //! a symptom match, and they always carry the readings they rest on.
 
+use std::collections::BTreeMap;
+
 use crate::model::*;
 use crate::vdo;
 
@@ -38,6 +40,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Finding> {
     for dev in snap.devices() {
         device_rules(snap, dev, &mut f);
     }
+    ss_half_idle_rules(snap, &mut f);
     hub_port_rules(snap, &mut f);
 
     // Strongest first, then by confidence, then stable by code for determinism.
@@ -188,8 +191,56 @@ fn port_rules(snap: &Snapshot, port: &TypecPort, out: &mut Vec<Finding>) {
     let wanted_mw = port.local_pd.as_ref().and_then(|pd| pd.max_sink_power_mw());
     let contract_mw = contract.and_then(|c| c.contract_power_mw());
 
+    // --- Sinking far less than this machine can accept, with no PD ---------
+    // Checked before PARTNER_NO_PD because the two describe the same electrical
+    // state and must never both fire: one calls it routine, the other a problem.
+    let ceiling_mw = port.typec_advertised_ceiling_mw();
+    let underpowered = port.is_sinking()
+        && !port.pd_contract_active()
+        // When the partner does claim PD, PD_NO_CONTRACT already covers it.
+        && !partner.speaks_pd()
+        && matches!((wanted_mw, ceiling_mw), (Some(w), Some(c)) if w > c * 2);
+
+    if underpowered {
+        let (want, ceil) = (wanted_mw.unwrap_or(0), ceiling_mw.unwrap_or(0));
+        out.push(Finding {
+            code: "SINK_UNDERPOWERED_NO_PD".into(),
+            severity: Severity::Medium,
+            confidence: Confidence::Measured,
+            subject: Subject::Port(port.name.clone()),
+            title: format!(
+                "Drawing at most {} from this port, but this machine can accept {}",
+                watts(ceil),
+                watts(want)
+            ),
+            detail: "There is no PD contract, so the link is limited to 5 V at the Type-C \
+                     current advertisement. Two causes are indistinguishable from here: the \
+                     supply genuinely is not a PD source, or the cable is charge-only or has a \
+                     failed CC line — which passes 5 V perfectly while making PD negotiation \
+                     impossible, so a good PD charger then reports itself as a non-PD device. \
+                     Note that without a contract the supply advertises no capabilities at all, \
+                     which is why nothing about its real rating can be read here."
+                .into(),
+            evidence: vec![
+                format!(
+                    "power_operation_mode = {} ({} ceiling)",
+                    port.power_operation_mode.as_deref().unwrap_or("?"),
+                    watts(ceil)
+                ),
+                "partner supports_usb_power_delivery = no".into(),
+                format!("best local sink PDO: {}", best_pdo_desc(port.local_pd.as_ref(), false)),
+                "partner advertises no source capabilities".into(),
+            ],
+            suggestion: Some(
+                "Reseat both ends, then try a known-good USB-C cable. If PD comes back, the \
+                 cable was the problem."
+                    .into(),
+            ),
+        });
+    }
+
     // --- Attached device does not speak PD at all --------------------------
-    if partner.supports_pd == Some(false) {
+    if partner.supports_pd == Some(false) && !underpowered {
         let (title, detail) = if port.is_sourcing() {
             (
                 "Attached device does not support Power Delivery — 5 V only".to_string(),
@@ -790,6 +841,125 @@ fn kernel_history_rules(snap: &Snapshot, dev: &UsbDevice, out: &mut Vec<Finding>
     }
 }
 
+/// USB mass storage class code.
+const CLASS_MASS_STORAGE: u8 = 0x08;
+
+/// A downstream port together with the speed of the hub it belongs to.
+struct PortSite<'a> {
+    port: &'a HubPort,
+    hub_speed_mbps: f64,
+}
+
+/// A device on the USB 2.0 half of a receptacle whose SuperSpeed half is idle.
+///
+/// This exists because the obvious check — "device claims USB 3 but linked at
+/// 480" — cannot work. A USB 3 device carries separate descriptor sets for
+/// SuperSpeed and High-Speed operation, so when it falls back it reports
+/// `bcdUSB 2.10` and stops claiming USB 3 at exactly the moment we need it to.
+/// Verified on one drive, same cable, two sockets: `version 3.00 / speed 5000`
+/// became `version 2.10 / speed 480`.
+///
+/// The port topology has no such blind spot. One physical receptacle appears as
+/// two logical ports sharing an ACPI `_PLD` location token — a USB 2.0 half and
+/// a SuperSpeed half on different buses. A device on the slow half while the
+/// fast half sits empty means SuperSpeed training never happened, whatever the
+/// device claims about itself.
+///
+/// Restricted to mass storage on purpose. A USB 2.0 keyboard on a SuperSpeed
+/// receptacle produces exactly the same topology and is entirely normal, so
+/// firing for every device class would bury the signal. Storage is the class
+/// where SuperSpeed is both expected and worth having.
+fn ss_half_idle_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
+    let mut groups: BTreeMap<&str, Vec<PortSite>> = BTreeMap::new();
+    for dev in snap.devices() {
+        let Some(speed) = dev.speed.as_ref().map(|s| s.mbps) else {
+            continue;
+        };
+        for port in &dev.ports {
+            if let Some(loc) = port.location.as_deref() {
+                groups.entry(loc).or_default().push(PortSite {
+                    port,
+                    hub_speed_mbps: speed,
+                });
+            }
+        }
+    }
+
+    for (location, sites) in groups {
+        // Only a clean two-port group is a real receptacle. Firmware emits a
+        // catch-all token shared by many unrelated ports — six of them on the
+        // machine this was developed against — and grouping those would pair
+        // ports that have no physical relationship.
+        if sites.len() != 2 {
+            continue;
+        }
+        let Some(slow) = sites.iter().find(|s| s.hub_speed_mbps <= 480.0) else {
+            continue;
+        };
+        let Some(fast) = sites.iter().find(|s| s.hub_speed_mbps >= 5000.0) else {
+            continue;
+        };
+
+        // The slow half is occupied and the fast half is empty.
+        let (Some(child_name), None) = (slow.port.child.as_deref(), fast.port.child.as_deref())
+        else {
+            continue;
+        };
+        let Some(dev) = snap.device(child_name) else {
+            continue;
+        };
+        if !dev.has_interface_class(CLASS_MASS_STORAGE) {
+            continue;
+        }
+
+        let mut evidence = vec![
+            format!(
+                "{} (hub at {}) has {}",
+                slow.port.name,
+                LinkSpeed::from_mbps(slow.hub_speed_mbps).short(),
+                child_name
+            ),
+            format!(
+                "{} (hub at {}) is idle — same receptacle, location {}",
+                fast.port.name,
+                LinkSpeed::from_mbps(fast.hub_speed_mbps).short(),
+                location
+            ),
+            format!(
+                "device reports USB {} — which a USB 3 device in fallback also does",
+                dev.usb_version.as_deref().unwrap_or("?")
+            ),
+        ];
+        if let Some(loc) = slow.port.physical_location.as_ref() {
+            evidence.push(format!("physical location: {}", loc.display()));
+        }
+
+        out.push(Finding {
+            code: "SS_HALF_IDLE".into(),
+            severity: Severity::Medium,
+            confidence: Confidence::Heuristic,
+            subject: Subject::Device(dev.sysfs_name.clone()),
+            title: format!(
+                "{} is on the USB 2.0 half of a SuperSpeed-capable socket",
+                dev.label()
+            ),
+            detail: "This receptacle has a SuperSpeed half, and it is empty while the device sits \
+                     on the USB 2.0 half — so the SuperSpeed pairs never trained. For storage that \
+                     usually means the cable or adapter carries no SuperSpeed wiring at all, which \
+                     is normal for charge-only cables and for USB 2.0-only adapters. The device's \
+                     own descriptors cannot confirm this either way: a USB 3 device operating at \
+                     High Speed presents its USB 2.0 descriptor set and stops advertising USB 3."
+                .into(),
+            evidence,
+            suggestion: Some(
+                "If this is a USB 3 device, replace the cable or adapter with one rated for USB 3 \
+                 data. If it is genuinely a USB 2.0 device, nothing is wrong."
+                    .into(),
+            ),
+        });
+    }
+}
+
 fn hub_port_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
     for dev in snap.devices() {
         for p in &dev.ports {
@@ -1290,6 +1460,170 @@ mod tests {
             .find(|x| x.code == "PD_NO_CONTRACT")
             .expect("PD-capable partner with no contract must be reported");
         assert_eq!(hit.severity, Severity::Medium);
+    }
+
+    // --- SS_HALF_IDLE -------------------------------------------------------
+
+    /// The case LINK_BELOW_DEVICE_CAPABILITY is blind to: a USB 3 drive behind a
+    /// USB 2.0-only adapter. It reports `version 2.10` because a USB 3 device at
+    /// High Speed presents its USB 2.0 descriptor set, so only the port topology
+    /// reveals the problem.
+    #[test]
+    fn detects_a_storage_device_stranded_on_the_usb2_half() {
+        let mut snap = empty_snapshot();
+        let (mut slow, fast) = receptacle("0x80000001", Some("5-1"), None);
+        slow.children
+            .push(device_with_class("5-1", " 2.10", 480.0, Some("usb5"), 0x08));
+        snap.buses.push(slow);
+        snap.buses.push(fast);
+
+        let f = analyze(&snap);
+        let hit = f.iter().find(|x| x.code == "SS_HALF_IDLE").unwrap();
+        assert_eq!(hit.severity, Severity::Medium);
+        assert_eq!(hit.confidence, Confidence::Heuristic);
+        assert!(hit.evidence.iter().any(|e| e.contains("0x80000001")));
+        assert!(
+            hit.evidence.iter().any(|e| e.contains("in fallback also does")),
+            "must record that the descriptors cannot settle it"
+        );
+
+        // The descriptor-based rule stays silent, which is the whole point.
+        assert!(!codes(&f).contains(&"LINK_BELOW_DEVICE_CAPABILITY"));
+    }
+
+    /// A USB 2.0 keyboard on a SuperSpeed socket produces identical topology and
+    /// is completely normal. Firing here would bury the signal in noise.
+    #[test]
+    fn does_not_fire_for_a_non_storage_device_on_the_usb2_half() {
+        let mut snap = empty_snapshot();
+        let (mut slow, fast) = receptacle("0x80000001", Some("5-1"), None);
+        // 0x03 = HID.
+        slow.children
+            .push(device_with_class("5-1", " 2.00", 12.0, Some("usb5"), 0x03));
+        snap.buses.push(slow);
+        snap.buses.push(fast);
+        assert!(!codes(&analyze(&snap)).contains(&"SS_HALF_IDLE"));
+    }
+
+    #[test]
+    fn does_not_fire_when_storage_is_on_the_superspeed_half() {
+        let mut snap = empty_snapshot();
+        let (slow, mut fast) = receptacle("0x80000001", None, Some("6-1"));
+        fast.children
+            .push(device_with_class("6-1", " 3.00", 5000.0, Some("usb6"), 0x08));
+        snap.buses.push(slow);
+        snap.buses.push(fast);
+        assert!(!codes(&analyze(&snap)).contains(&"SS_HALF_IDLE"));
+    }
+
+    /// Firmware emits a catch-all location token shared by many unrelated ports —
+    /// six of them on the development machine. Grouping those would pair ports
+    /// with no physical relationship, so only clean two-port groups count.
+    #[test]
+    fn rejects_the_firmware_catch_all_location_group() {
+        let mut snap = empty_snapshot();
+        let (mut slow, fast) = receptacle("0x80000008", Some("5-1"), None);
+        slow.children
+            .push(device_with_class("5-1", " 2.10", 480.0, Some("usb5"), 0x08));
+        // A third port sharing the token makes the group ambiguous.
+        let mut extra = root_hub("usb7", 480.0);
+        extra.ports.push(hub_port("usb7-port1", 0));
+        extra.ports[0].location = Some("0x80000008".into());
+        snap.buses.push(slow);
+        snap.buses.push(fast);
+        snap.buses.push(extra);
+        assert!(!codes(&analyze(&snap)).contains(&"SS_HALF_IDLE"));
+    }
+
+    #[test]
+    fn does_not_fire_on_a_receptacle_with_no_superspeed_half() {
+        let mut snap = empty_snapshot();
+        // Two USB 2.0 ports sharing a token: no SuperSpeed to be missing.
+        let mut a = root_hub("usb5", 480.0);
+        let mut b = root_hub("usb7", 480.0);
+        a.ports.push(hub_port("usb5-port1", 0));
+        a.ports[0].location = Some("0x80000000".into());
+        a.ports[0].child = Some("5-1".into());
+        b.ports.push(hub_port("usb7-port1", 0));
+        b.ports[0].location = Some("0x80000000".into());
+        b.ports[0].child = None;
+        a.children
+            .push(device_with_class("5-1", " 2.10", 480.0, Some("usb5"), 0x08));
+        snap.buses.push(a);
+        snap.buses.push(b);
+        assert!(!codes(&analyze(&snap)).contains(&"SS_HALF_IDLE"));
+    }
+
+    // --- SINK_UNDERPOWERED_NO_PD -------------------------------------------
+
+    /// A 100 W-capable laptop reduced to a 15 W Type-C advertisement. Reported at
+    /// Medium, not Info — and PARTNER_NO_PD must stand down so the two do not
+    /// contradict each other.
+    #[test]
+    fn reports_an_underpowered_sink_and_suppresses_the_info_variant() {
+        let mut snap = empty_snapshot();
+        snap.ports.push(sinking_port_no_pd("3.0A"));
+        let f = analyze(&snap);
+
+        let hit = f
+            .iter()
+            .find(|x| x.code == "SINK_UNDERPOWERED_NO_PD")
+            .unwrap();
+        assert_eq!(hit.severity, Severity::Medium);
+        assert_eq!(hit.confidence, Confidence::Measured);
+        assert!(hit.title.contains("15 W") && hit.title.contains("100 W"));
+        assert!(
+            hit.detail.contains("CC line"),
+            "must name the failed-cable cause, which looks identical from sysfs"
+        );
+        assert!(
+            !codes(&f).contains(&"PARTNER_NO_PD"),
+            "the Info variant must not also fire"
+        );
+    }
+
+    #[test]
+    fn underpowered_sink_scales_with_the_advertised_ceiling() {
+        for (mode, watts) in [("default", "4.5 W"), ("1.5A", "7.5 W"), ("3.0A", "15 W")] {
+            let mut snap = empty_snapshot();
+            snap.ports.push(sinking_port_no_pd(mode));
+            let hit = analyze(&snap)
+                .into_iter()
+                .find(|x| x.code == "SINK_UNDERPOWERED_NO_PD")
+                .unwrap_or_else(|| panic!("no finding for mode {mode}"));
+            assert!(hit.title.contains(watts), "mode {mode}: {}", hit.title);
+        }
+    }
+
+    /// Sourcing to an accessory is not an underpowered sink. The watch-charger
+    /// case must keep its Info wording.
+    #[test]
+    fn sourcing_is_never_an_underpowered_sink() {
+        let mut snap = empty_snapshot();
+        snap.ports.push(sourcing_port_non_pd());
+        let f = analyze(&snap);
+        assert!(!codes(&f).contains(&"SINK_UNDERPOWERED_NO_PD"));
+        assert!(codes(&f).contains(&"PARTNER_NO_PD"));
+    }
+
+    /// When the partner does claim PD, PD_NO_CONTRACT owns the diagnosis.
+    #[test]
+    fn a_pd_capable_partner_is_left_to_pd_no_contract() {
+        let mut snap = empty_snapshot();
+        let mut port = sinking_port_no_pd("3.0A");
+        port.partner.as_mut().unwrap().supports_pd = Some(true);
+        snap.ports.push(port);
+        let f = analyze(&snap);
+        assert!(codes(&f).contains(&"PD_NO_CONTRACT"));
+        assert!(!codes(&f).contains(&"SINK_UNDERPOWERED_NO_PD"));
+    }
+
+    /// A working PD contract is not underpowered, whatever the wattage.
+    #[test]
+    fn a_negotiated_contract_is_never_underpowered() {
+        let mut snap = empty_snapshot();
+        snap.ports.push(official_charger_port_65w());
+        assert!(!codes(&analyze(&snap)).contains(&"SINK_UNDERPOWERED_NO_PD"));
     }
 
     #[test]

@@ -142,11 +142,35 @@ Two limits worth knowing:
   share one location descriptor — and a wrong correlation would pin a finding on
   the wrong cable.
 
+### The descriptor trap
+
+A USB 3 device carries **separate descriptor sets** for SuperSpeed and High-Speed
+operation. When it falls back to USB 2.0 it presents the USB 2.0 set, reports
+`bcdUSB 2.10`, and stops advertising USB 3 — precisely when you want to know.
+Verified on one drive, one cable, two sockets:
+
+```
+USB-A socket:              version 3.00   speed 5000   bMaxPower 144mA
+via a USB 2.0-only adapter: version 2.10   speed  480   bMaxPower 100mA
+```
+
+So "claims USB 3 but linked at 480" is structurally unable to catch a real
+fallback, and a single snapshot of the fallback state is indistinguishable from a
+genuine USB 2.0 device.
+
+The port topology has no such blind spot. One physical receptacle appears as two
+logical ports sharing an ACPI `_PLD` location token — a USB 2.0 half and a
+SuperSpeed half on different buses. A device on the slow half while the fast half
+sits empty means SuperSpeed never trained, whatever the device says about itself.
+That is `SS_HALF_IDLE`, and it is restricted to mass storage on purpose: a USB 2.0
+keyboard produces identical topology and is entirely normal.
+
 ## Rules
 
 | Code | Confidence | Catches |
 |---|---|---|
-| `LINK_BELOW_DEVICE_CAPABILITY` | inferred | SuperSpeed device stuck on a USB 2.0 link. Distinguishes a USB 2.0 hub upstream from a suspect cable, and internal devices from cabled ones. |
+| `SS_HALF_IDLE` | heuristic | Storage on the USB 2.0 half of a receptacle whose SuperSpeed half is idle — the **only** detector that survives a USB 3 fallback (see below). |
+| `LINK_BELOW_DEVICE_CAPABILITY` | inferred | A device still reporting USB 3.x while linked at 480 Mbps. Distinguishes a USB 2.0 hub upstream from a suspect cable, and internal devices from cabled ones. Cannot see a true fallback. |
 | `LINK_SLOW_DESPITE_CAPABLE_CABLE` | inferred | Slow link where the e-marker already rules the cable out. |
 | `LINK_SINGLE_LANE` | measured | USB 3.2 device running one lane instead of two. |
 | `CABLE_DATA_LIMIT` | measured | E-marker says USB 2.0 only, so SuperSpeed is impossible. |
@@ -155,7 +179,8 @@ Two limits worth knowing:
 | `CABLE_NOT_EMARKED` | heuristic | No cable identity available and the rating could matter; capability unknown. |
 | `CABLE_EMARKER_NOT_REPORTED` | inferred | Controller reports no e-marker, but a >3 A contract proves the cable is 5 A rated. |
 | `PD_NO_CONTRACT` | inferred | PD-capable device attached but no contract in effect. |
-| `PARTNER_NO_PD` | measured | Attached device speaks no PD at all, so the link is capped at 5 V. Explains a slow-charging watch charger or accessory. |
+| `SINK_UNDERPOWERED_NO_PD` | measured | This machine is drawing 5 V with no PD contract while advertising far higher sink capability — the "why is my laptop barely charging" case. |
+| `PARTNER_NO_PD` | measured | Attached device speaks no PD at all, so the link is capped at 5 V. Info-level: normal for a watch charger or accessory being powered. |
 | `PD_CONTRACT_BELOW_OFFER` | measured | Took much less power than the source offered. |
 | `PD_SOURCE_BELOW_SINK_CAPABILITY` | measured | Charger smaller than the port can accept. |
 | `DP_ALTMODE_NOT_ACTIVE` | measured | DisplayPort advertised but not engaged. |
@@ -172,7 +197,7 @@ Two limits worth knowing:
 
 ```sh
 cargo build --release        # ./target/release/usbdiag
-cargo test                   # 78 tests
+cargo test                   # 90 tests
 ```
 
 No non-Rust dependencies. Dependencies are `serde` and `serde_json` only; sysfs

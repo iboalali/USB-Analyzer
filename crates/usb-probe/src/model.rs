@@ -124,6 +124,23 @@ impl UsbDevice {
     }
 
     /// True when the device's own descriptors claim SuperSpeed or better.
+    ///
+    /// **This cannot detect a USB 3 device that has fallen back to USB 2.0.** A
+    /// USB 3 device carries separate descriptor sets for SuperSpeed and
+    /// High-Speed operation, so once it falls back it reports `bcdUSB 2.10` and
+    /// stops claiming USB 3 — exactly when you would want to know. Verified on
+    /// one drive, same cable, two sockets:
+    ///
+    /// ```text
+    /// USB-A socket:      version 3.00, speed 5000, bMaxPower 144mA
+    /// USB 2.0 adapter:   version 2.10, speed  480, bMaxPower 100mA
+    /// ```
+    ///
+    /// So this is only useful where a device links slow while *still* reporting
+    /// 3.x, which happens when a SuperSpeed-capable path is bandwidth-limited
+    /// upstream. For the fallback case use the port topology instead — see
+    /// `SS_HALF_IDLE` in [`crate::diag`], which reads the receptacle rather than
+    /// the device and therefore has no such blind spot.
     pub fn claims_superspeed(&self) -> bool {
         self.usb_version_num.is_some_and(|v| v >= 3.0)
     }
@@ -131,6 +148,14 @@ impl UsbDevice {
     /// True when the negotiated link is USB 2.0 or slower.
     pub fn linked_below_superspeed(&self) -> bool {
         self.speed.as_ref().is_some_and(|s| s.mbps <= 480.0)
+    }
+
+    /// True when any interface reports this USB class code.
+    ///
+    /// Needed because `bDeviceClass` is usually `0x00` ("see interfaces"), so the
+    /// device-level field cannot be relied on to identify what something is.
+    pub fn has_interface_class(&self, class: u8) -> bool {
+        self.interfaces.iter().any(|i| i.class == Some(class))
     }
 
     /// True when the device is soldered down or on an internal header, so no
@@ -333,6 +358,21 @@ impl TypecPort {
             .as_ref()
             .and_then(|r| r.current.as_deref())
             .is_some_and(|r| r.eq_ignore_ascii_case("source"))
+    }
+
+    /// Power ceiling implied by the Type-C current advertisement, in mW.
+    ///
+    /// This is what the CC resistors alone permit, with no PD contract. Returns
+    /// `None` while a PD contract is in effect, since the contract supersedes it.
+    pub fn typec_advertised_ceiling_mw(&self) -> Option<u32> {
+        match self.power_operation_mode.as_deref()? {
+            // USB 3 default is 5 V at 900 mA; USB 2 default is lower still.
+            "default" => Some(4_500),
+            "1.5A" => Some(7_500),
+            "3.0A" => Some(15_000),
+            // "usb_power_delivery" and anything unrecognised: not applicable.
+            _ => None,
+        }
     }
 
     /// This machine is drawing power from the attached device.

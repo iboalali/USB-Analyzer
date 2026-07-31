@@ -394,6 +394,105 @@ pub fn sourcing_port_non_pd() -> TypecPort {
     port
 }
 
+/// A receptacle: one physical socket exposed as a USB 2.0 half and a SuperSpeed
+/// half on different buses, sharing an ACPI `_PLD` location token.
+///
+/// `slow_child` / `fast_child` name the device attached to each half. Values
+/// mirror the real 0x80000001 pair (usb5-port1 480M + usb6-port1 10000M).
+pub fn receptacle(
+    location: &str,
+    slow_child: Option<&str>,
+    fast_child: Option<&str>,
+) -> (UsbDevice, UsbDevice) {
+    let mut slow_hub = root_hub("usb5", 480.0);
+    let mut fast_hub = root_hub("usb6", 10_000.0);
+    slow_hub.ports.push(site("usb5-port1", location, slow_child));
+    fast_hub.ports.push(site("usb6-port1", location, fast_child));
+    (slow_hub, fast_hub)
+}
+
+fn site(name: &str, location: &str, child: Option<&str>) -> HubPort {
+    HubPort {
+        name: name.to_string(),
+        number: Some(1),
+        state: Some(if child.is_some() {
+            "configured".into()
+        } else {
+            "not attached".into()
+        }),
+        connect_type: Some("hotplug".into()),
+        over_current_count: Some(0),
+        location: Some(location.to_string()),
+        physical_location: Some(PhysicalLocation {
+            panel: Some("left".into()),
+            vertical_position: Some("center".into()),
+            horizontal_position: Some("left".into()),
+            dock: Some(false),
+            lid: Some(false),
+        }),
+        connector: None,
+        child: child.map(str::to_string),
+    }
+}
+
+/// A device with one interface of the given class, so `has_interface_class`
+/// works. `version`/`mbps` let a caller build the fallback state.
+pub fn device_with_class(
+    name: &str,
+    version: &str,
+    mbps: f64,
+    parent: Option<&str>,
+    class: u8,
+) -> UsbDevice {
+    let mut d = device(name, version, mbps, parent);
+    d.interfaces.push(UsbInterface {
+        sysfs_name: format!("{name}:1.0"),
+        number: Some(0),
+        class: Some(class),
+        subclass: Some(0x06),
+        protocol: Some(0x50),
+        driver: Some("usb-storage".into()),
+        description: None,
+    });
+    d
+}
+
+/// A Type-C port sinking with no PD contract — a charger connected through
+/// something that prevents PD negotiation, or a supply that has none.
+///
+/// Mirrors a real reading: a 45 W PD charger reduced to a 15 W Type-C
+/// advertisement, with the partner reporting `supports_usb_power_delivery = no`
+/// and no source capabilities exposed at all.
+pub fn sinking_port_no_pd(mode: &str) -> TypecPort {
+    let mut port = idle_port();
+    port.power_operation_mode = Some(mode.to_string());
+    port.power_role = Some(RoleField::parse("source [sink]"));
+    port.data_role = Some(RoleField::parse("host [device]"));
+    port.partner = Some(Partner {
+        sysfs_name: "port0-partner".into(),
+        kind: None,
+        supports_pd: Some(false),
+        accessory_mode: None,
+        pd_revision: Some("0.0".into()),
+        num_alt_modes: None,
+        identity: None,
+        alt_modes: Vec::new(),
+        // No contract means the supply advertises nothing at all.
+        pd: None,
+    });
+    port.power_supply = Some(PortPowerSupply {
+        name: "ucsi-source-psy-USBC000:001".into(),
+        online: Some(true),
+        voltage_now_mv: Some(0),
+        current_now_ma: Some(0),
+        voltage_min_mv: Some(5000),
+        voltage_max_mv: Some(13_400),
+        current_max_ma: Some(5720),
+        usb_type: Some(RoleField::parse("C [PD] PD_PPS")),
+    });
+    port
+}
+
 /// A passive Type-C cable VDO1: 10 Gbps, ~1 m, 20 V, with the given current
 /// rating. Speed is deliberately *not* limiting so current-rating tests isolate
 /// the current rule.
