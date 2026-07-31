@@ -1,0 +1,13 @@
+[package]
+name = "usb-probe"
+description = "Read-only USB / USB-C / Power Delivery state from Linux sysfs, plus a cable & charging diagnostic rule engine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

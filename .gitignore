@@ -1,0 +1,5 @@
+# Rust build output
+/target
+
+# Screenshots, recordings and other session captures (never committed)
+/captures
