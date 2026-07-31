@@ -1338,11 +1338,23 @@ fn phantom_device_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
         // A failure that predates the socket's current occupant belonged to
         // whatever was plugged in before, and must not be reported against what
         // is there now.
+        //
+        // Two independent ways to date it, applied together because each covers
+        // what the other misses:
+        //
+        // * the USB 2.0 companion of the same receptacle — but a socket holding
+        //   a SuperSpeed-only device has an empty companion, so this often
+        //   yields nothing;
+        // * the nearest ancestor of the phantom that still exists. `6-1.2`'s
+        //   parent `6-1` is decisive: if a webcam is sitting there now and it
+        //   attached after these events, the events belonged to the hub that
+        //   used to be there.
         let mut excluded = 0;
-        if let Some(sib) = sibling {
-            let (kept, dropped) = snap.filter_since_attach(events, sib);
+        let ancestor = snap.nearest_existing_ancestor(name);
+        for reference in [sibling, ancestor].into_iter().flatten() {
+            let (kept, dropped) = snap.filter_since_attach(events, reference);
             events = kept;
-            excluded = dropped;
+            excluded += dropped;
         }
         if events.is_empty() {
             continue;
@@ -2515,6 +2527,60 @@ mod tests {
             hit.title
         );
         assert!(hit.evidence.iter().any(|e| e.contains("ETIMEDOUT")));
+    }
+
+    /// Real hardware, 2026-08-01. A hub at `6-1.2` was unplugged at monotonic
+    /// 62778 s after failing to enumerate. A webcam took the same socket at
+    /// 65598 s. At uptime 65700 s the tool still reported the hub's failures as
+    /// a High finding — accusing hardware that had been gone for 47 minutes.
+    ///
+    /// The receptacle's USB 2.0 companion was empty, so the existing staleness
+    /// filter had nothing to date against. The phantom's own parent did: `6-1`
+    /// is in the tree and attached long after the events.
+    #[test]
+    fn a_phantom_is_not_charged_to_the_device_now_above_it() {
+        let mut snap = empty_snapshot();
+        snap.uptime_s = Some(65_700.0);
+
+        let mut bus = root_hub("usb6", 10_000.0);
+        // The webcam arrived 102 s ago, i.e. at 65598 s.
+        bus.children.push(attached_ago(
+            device("6-1", " 3.20", 5000.0, Some("usb6")),
+            102.0,
+        ));
+        snap.buses.push(bus);
+        snap.kernel_log.events = phantom_failure_events("6-1.2", 62_776.0);
+
+        let f = analyze(&snap);
+        assert!(
+            !codes(&f).contains(&"DEVICE_FAILED_TO_ENUMERATE"),
+            "events predating the current occupant of 6-1 are not about it: {:?}",
+            codes(&f)
+        );
+    }
+
+    /// The other half of the same rule: a phantom whose failures happened after
+    /// its parent arrived is genuinely current, and must still be reported.
+    #[test]
+    fn a_phantom_below_a_device_that_was_already_there_is_reported() {
+        let mut snap = empty_snapshot();
+        snap.uptime_s = Some(65_700.0);
+
+        let mut bus = root_hub("usb6", 10_000.0);
+        // The hub has been there for an hour; the failures are two minutes old.
+        bus.children.push(attached_ago(
+            device("6-1", " 3.20", 5000.0, Some("usb6")),
+            3600.0,
+        ));
+        snap.buses.push(bus);
+        snap.kernel_log.events = phantom_failure_events("6-1.2", 65_580.0);
+
+        let hit = analyze(&snap)
+            .into_iter()
+            .find(|x| x.code == "DEVICE_FAILED_TO_ENUMERATE")
+            .expect("6-1.2 failed while 6-1 was already attached");
+        assert_eq!(hit.severity, Severity::High);
+        assert!(hit.evidence.iter().any(|e| e.contains("EPROTO")));
     }
 
     /// One physical fault must read as one finding. On real hardware a single

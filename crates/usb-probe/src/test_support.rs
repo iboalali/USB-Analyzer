@@ -581,6 +581,46 @@ pub fn ss_uplink_failure_events(bus_num: u32, retries: usize, trained: bool) -> 
     events
 }
 
+/// Failures logged against a device path that never reached sysfs.
+///
+/// The real sequence, from an Anker hub whose built-in cable is loose:
+/// two `Device not responding to setup address` lines, then
+/// `device not accepting address N, error -71`.
+///
+/// `port` is deliberately left unset: these date the phantom by its ancestry,
+/// not by a port name, which is the case the ancestor filter has to handle.
+pub fn phantom_failure_events(device: &str, at_s: f64) -> Vec<KernelEvent> {
+    let mut events: Vec<KernelEvent> = (0..2)
+        .map(|i| KernelEvent {
+            kind: EventKind::EnumerationFailure,
+            severity: Severity::High,
+            device: Some(device.to_string()),
+            port: None,
+            errno: None,
+            monotonic_s: Some(at_s + i as f64 * 0.2),
+            timestamp: None,
+            text: format!("usb {device}: Device not responding to setup address."),
+        })
+        .collect();
+    events.push(KernelEvent {
+        kind: EventKind::EnumerationFailure,
+        severity: Severity::High,
+        device: Some(device.to_string()),
+        port: None,
+        errno: Some(-71),
+        monotonic_s: Some(at_s + 0.5),
+        timestamp: None,
+        text: format!("usb {device}: device not accepting address 27, error -71"),
+    });
+    events
+}
+
+/// A device with a known attach time, expressed as seconds before `uptime_s`.
+pub fn attached_ago(mut d: UsbDevice, seconds_ago: f64) -> UsbDevice {
+    d.connected_duration_ms = Some((seconds_ago * 1000.0) as u64);
+    d
+}
+
 /// A device presenting a USB Billboard interface — a USB-C device's own
 /// declaration that an Alternate Mode it requested could not be entered.
 /// Modelled on the Anker hub's `291a:8383`.

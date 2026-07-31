@@ -83,6 +83,30 @@ impl Snapshot {
         }
     }
 
+    /// The closest thing above `sysfs_name` in the tree that exists right now.
+    ///
+    /// Walks `6-1.2.4` → `6-1.2` → `6-1` → `usb6` and returns the first one the
+    /// kernel still knows about. The caller is usually holding a name that is
+    /// *not* in the tree — a device that appears only in the log — and needs
+    /// something real to date it against.
+    ///
+    /// That date is what separates "this failed just now" from "this failed
+    /// before the thing currently in the socket was even plugged in". If `6-1`
+    /// is a webcam that attached two minutes ago, nothing logged about `6-1.2`
+    /// an hour ago can possibly be about hardware that is here now.
+    ///
+    /// A root hub is a valid answer but a weak one: it attached at boot, so
+    /// dating against it excludes nothing.
+    pub fn nearest_existing_ancestor(&self, sysfs_name: &str) -> Option<&UsbDevice> {
+        let mut cur = sysfs_name.to_string();
+        loop {
+            cur = parent_path(&cur)?;
+            if let Some(d) = self.device(&cur) {
+                return Some(d);
+            }
+        }
+    }
+
     /// Kernel events for a device, limited to those since it attached.
     ///
     /// A socket outlives its occupants: the log spans the whole boot while the
@@ -193,6 +217,20 @@ impl Snapshot {
         }
         h.finish()
     }
+}
+
+/// One step up a USB device path.
+///
+/// `3-5.2.1` → `3-5.2` → `3-5` → `usb3` → `None`. A root hub has no parent, so
+/// the walk terminates there rather than running forever.
+fn parent_path(sysfs_name: &str) -> Option<String> {
+    if let Some((head, _)) = sysfs_name.rsplit_once('.') {
+        return Some(head.to_string());
+    }
+    // `3-5` hangs off root hub `usb3`. Anything with no bus separator — `usb3`
+    // itself — is already at the top.
+    let (bus, _) = sysfs_name.split_once('-')?;
+    Some(format!("usb{bus}"))
 }
 
 fn hash_device(d: &UsbDevice, h: &mut DefaultHasher) {
@@ -1592,6 +1630,36 @@ mod tests {
 
         a.kernel_log = ts::reset_log("1-1", 3);
         assert_ne!(before, a.fingerprint());
+    }
+
+    #[test]
+    fn the_ancestor_walk_climbs_to_the_root_hub_and_stops() {
+        let mut snap = ts::empty_snapshot();
+        let mut bus = ts::root_hub("usb6", 10_000.0);
+        bus.children
+            .push(ts::device("6-1", " 3.20", 5000.0, Some("usb6")));
+        snap.buses.push(bus);
+
+        let name = |d: Option<&UsbDevice>| d.map(|d| d.sysfs_name.clone());
+
+        // 6-1 is in the tree, so it answers for everything beneath it.
+        assert_eq!(
+            name(snap.nearest_existing_ancestor("6-1.2")),
+            Some("6-1".to_string())
+        );
+        assert_eq!(
+            name(snap.nearest_existing_ancestor("6-1.2.4")),
+            Some("6-1".to_string())
+        );
+        // 6-2 was never there, so the walk carries on up to the root hub.
+        assert_eq!(
+            name(snap.nearest_existing_ancestor("6-2.1")),
+            Some("usb6".to_string())
+        );
+        // A root hub has no parent, and an unknown bus has no ancestor at all —
+        // both must terminate rather than loop.
+        assert!(snap.nearest_existing_ancestor("usb6").is_none());
+        assert!(snap.nearest_existing_ancestor("9-1").is_none());
     }
 
     /// Orphan PD objects are part of the state, so a change in them counts.
