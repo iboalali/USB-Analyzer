@@ -161,6 +161,64 @@ pub fn read_power_supplies_from(class: &Path) -> Vec<RawPowerSupply> {
     out
 }
 
+/// Read every battery, plus whether a mains supply is online.
+///
+/// Batteries report either `energy_*` (µWh) or `charge_*` (µAh) depending on the
+/// firmware; the second form is converted using the design voltage so callers
+/// get watt-hours either way.
+pub fn read_batteries() -> (Vec<crate::model::Battery>, Option<bool>) {
+    read_batteries_from(Path::new(POWER_SUPPLY_CLASS))
+}
+
+pub fn read_batteries_from(class: &Path) -> (Vec<crate::model::Battery>, Option<bool>) {
+    let mut batteries = Vec::new();
+    let mut mains = None;
+
+    for entry in fsx::list_dir(class) {
+        if !entry.is_dir() {
+            continue;
+        }
+        match fsx::read_attr(&entry, "type").as_deref() {
+            Some("Mains") => {
+                // Any online mains supply counts.
+                let online = fsx::read_bool(&entry, "online");
+                mains = match (mains, online) {
+                    (Some(true), _) => Some(true),
+                    (_, Some(v)) => Some(v),
+                    (m, None) => m,
+                };
+            }
+            Some("Battery") => {
+                let uv = |n: &str| fsx::read_u64(&entry, n).map(|v| v as f64 / 1e6);
+                let design_v = fsx::read_u64(&entry, "voltage_min_design")
+                    .map(|v| v as f64 / 1e6)
+                    .filter(|v| *v > 0.0);
+                // charge_* is in µAh; multiplying by the design voltage yields Wh.
+                let via_charge = |n: &str| match (uv(n), design_v) {
+                    (Some(ah), Some(v)) => Some(ah * v),
+                    _ => None,
+                };
+
+                batteries.push(crate::model::Battery {
+                    name: fsx::file_name(&entry),
+                    status: fsx::read_attr(&entry, "status"),
+                    capacity_pct: fsx::read_u32(&entry, "capacity"),
+                    energy_now_wh: uv("energy_now").or_else(|| via_charge("charge_now")),
+                    energy_full_wh: uv("energy_full").or_else(|| via_charge("charge_full")),
+                    energy_full_design_wh: uv("energy_full_design")
+                        .or_else(|| via_charge("charge_full_design")),
+                    power_now_w: uv("power_now"),
+                    voltage_now_v: uv("voltage_now"),
+                    cycle_count: fsx::read_u32(&entry, "cycle_count"),
+                });
+            }
+            _ => {}
+        }
+    }
+    batteries.sort_by(|a, b| a.name.cmp(&b.name));
+    (batteries, mains)
+}
+
 /// Associate a power supply with a Type-C port.
 ///
 /// The UCSI driver names its supplies `ucsi-source-psy-<devname><connector>`

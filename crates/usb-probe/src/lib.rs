@@ -27,6 +27,7 @@
 //! unreadable on systems with `kernel.dmesg_restrict=1`, which disables the
 //! reset-history rules; that is reported as a finding rather than hidden.
 
+pub mod block;
 pub mod diag;
 pub mod kernel;
 pub mod model;
@@ -49,11 +50,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Options {
     pub kernel: kernel::Options,
+    /// Milliseconds to sample block I/O for a live throughput figure. 0 skips
+    /// it — the measurement costs exactly this much wall-clock, since a rate
+    /// cannot be derived from cumulative counters without a time base.
+    pub storage_sample_ms: u64,
 }
 
 /// Read the current state of the system.
 pub fn capture(opts: Options) -> Snapshot {
     let ports = typec::read_ports();
+    let (batteries, mains_online) = pd::read_batteries();
 
     // Any PD object not already reachable from a port, so nothing is lost.
     let referenced: BTreeSet<String> = ports
@@ -81,6 +87,13 @@ pub fn capture(opts: Options) -> Snapshot {
         buses: usb::read_buses(),
         ports,
         thunderbolt: thunderbolt::read(),
+        block_devices: if opts.storage_sample_ms > 0 {
+            block::sample(std::time::Duration::from_millis(opts.storage_sample_ms))
+        } else {
+            block::read()
+        },
+        batteries,
+        mains_online,
         orphan_pd,
         kernel_log: kernel::collect(opts.kernel),
     }

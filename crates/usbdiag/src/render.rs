@@ -173,6 +173,22 @@ pub fn ports(out: &mut String, snap: &Snapshot, t: &Theme) {
                         row(out, t, "", &line);
                     }
                 }
+                // What the attached device will accept. Relevant whenever this
+                // machine is the one supplying — then *it* is the sink.
+                if !pd.sink_capabilities.is_empty() {
+                    row(
+                        out,
+                        t,
+                        "device accepts",
+                        &format!(
+                            "up to {}   {}",
+                            pd.max_sink_power_mw()
+                                .map(watts)
+                                .unwrap_or_else(|| "?".into()),
+                            t.dim(&pdo_line(&pd.sink_capabilities))
+                        ),
+                    );
+                }
             }
         }
         // The machine's own appetite, shown whenever something is attached so
@@ -502,6 +518,269 @@ fn pdo_line(pdos: &[Pdo]) -> String {
         .map(|p| p.describe())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+// ---------------------------------------------------------------------------
+// Storage
+// ---------------------------------------------------------------------------
+
+/// Per-storage-device view: what speed the link got, why it is what it is, and
+/// what is actually moving through it.
+pub fn storage(out: &mut String, report: &Report, t: &Theme) {
+    let snap = &report.snapshot;
+    let devices = snap.storage_devices();
+    if devices.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "{}", t.heading("storage"));
+
+    for (usb, blocks) in devices {
+        for b in blocks {
+            let _ = writeln!(
+                out,
+                "  {} {}  {}",
+                t.bold(&b.name),
+                b.label(),
+                t.dim(&format!(
+                    "{}  {}  via {}",
+                    b.size_bytes.map(bytes_human).unwrap_or_else(|| "?".into()),
+                    match b.rotational {
+                        Some(true) => "spinning disk",
+                        Some(false) => "solid state",
+                        None => "unknown media",
+                    },
+                    usb.sysfs_name
+                ))
+            );
+
+            // Link speed, and the practical ceiling it implies.
+            let speed = usb.speed.as_ref();
+            let link = speed.map(|s| s.label.clone()).unwrap_or_else(|| "?".into());
+            let bus_ceiling = speed.map(|s| practical_bps(s.mbps));
+            row(
+                out,
+                t,
+                "link",
+                &format!(
+                    "{}{}",
+                    t.speed(speed),
+                    t.dim(&format!(
+                        "  {link}{}",
+                        bus_ceiling
+                            .map(|c| format!("  — up to ~{}/s in practice", bytes_human(c as u64)))
+                            .unwrap_or_default()
+                    ))
+                ),
+            );
+
+            // The binding constraint: bus or platter.
+            if let (Some(bus), Some(media)) = (bus_ceiling, b.media_ceiling_bps()) {
+                let (limiter, note) = if media < bus {
+                    ("media", "the drive is slower than the link, so the bus is not the limit")
+                } else {
+                    ("link", "the link is slower than the drive can go")
+                };
+                row(
+                    out,
+                    t,
+                    "limited by",
+                    &format!(
+                        "{}  {}",
+                        t.bold(limiter),
+                        t.dim(&format!(
+                            "drive ~{}/s vs link ~{}/s — {note}",
+                            bytes_human(media as u64),
+                            bytes_human(bus as u64)
+                        ))
+                    ),
+                );
+            }
+
+            // Why the link is not faster, taken from the findings for this
+            // device rather than re-derived here.
+            let reasons: Vec<&Finding> = report
+                .findings
+                .iter()
+                .filter(|f| {
+                    matches!(&f.subject, Subject::Device(d) if *d == usb.sysfs_name)
+                        || matches!(&f.code[..], "SS_HALF_FAILED" | "SS_HALF_IDLE")
+                })
+                .filter(|f| f.code.starts_with("SS_") || f.code.starts_with("LINK_"))
+                .collect();
+            for f in &reasons {
+                row(out, t, "why", &format!("{} {}", t.yellow("▸"), f.title));
+            }
+            if reasons.is_empty() && usb.linked_below_superspeed() {
+                row(
+                    out,
+                    t,
+                    "why",
+                    &t.dim(
+                        "no cause identified — the device may genuinely be USB 2.0, which its \
+                         descriptors cannot distinguish from a fallback",
+                    ),
+                );
+            }
+
+            // What is actually moving.
+            match (&b.throughput, &b.stats) {
+                (Some(tp), _) if !tp.is_idle() => row(
+                    out,
+                    t,
+                    "now",
+                    &format!(
+                        "{}  {}",
+                        t.green(&format!("{}/s", bytes_human(tp.total_bps() as u64))),
+                        t.dim(&format!(
+                            "read {}/s  write {}/s  over {} ms",
+                            bytes_human(tp.read_bps as u64),
+                            bytes_human(tp.write_bps as u64),
+                            tp.interval_ms
+                        ))
+                    ),
+                ),
+                (Some(tp), _) => row(
+                    out,
+                    t,
+                    "now",
+                    &t.dim(&format!("idle (sampled {} ms)", tp.interval_ms)),
+                ),
+                (None, Some(_)) => row(
+                    out,
+                    t,
+                    "now",
+                    &t.dim("not sampled — pass --sample 1000 to measure live throughput"),
+                ),
+                _ => {}
+            }
+            if let Some(s) = &b.stats {
+                row(
+                    out,
+                    t,
+                    "since boot",
+                    &t.dim(&format!(
+                        "read {}  written {}  ({} in flight)",
+                        bytes_human(s.total_read_bytes()),
+                        bytes_human(s.total_written_bytes()),
+                        s.ios_in_flight
+                    )),
+                );
+            }
+            let _ = writeln!(out);
+        }
+    }
+}
+
+/// Realistic sustained throughput for a link rate, after protocol overhead.
+/// USB 2.0 bulk tops out near 40 MB/s; USB 3 gen 1 near 450 MB/s.
+fn practical_bps(mbps: f64) -> f64 {
+    match mbps {
+        m if m <= 12.0 => 1.0e6,
+        m if m <= 480.0 => 40.0e6,
+        m if m <= 5000.0 => 450.0e6,
+        m if m <= 10_000.0 => 950.0e6,
+        m if m <= 20_000.0 => 1900.0e6,
+        _ => 3500.0e6,
+    }
+}
+
+fn bytes_human(b: u64) -> String {
+    const U: [(f64, &str); 4] = [(1e12, "TB"), (1e9, "GB"), (1e6, "MB"), (1e3, "kB")];
+    let f = b as f64;
+    for (scale, unit) in U {
+        if f >= scale {
+            let v = f / scale;
+            return if v >= 100.0 {
+                format!("{v:.0} {unit}")
+            } else {
+                format!("{v:.1} {unit}")
+            };
+        }
+    }
+    format!("{b} B")
+}
+
+// ---------------------------------------------------------------------------
+// Battery
+// ---------------------------------------------------------------------------
+
+pub fn battery(out: &mut String, snap: &Snapshot, t: &Theme) {
+    if snap.batteries.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "{}", t.heading("battery"));
+    let mains = snap.mains_online.unwrap_or(false);
+
+    for b in &snap.batteries {
+        let state = match b.status.as_deref() {
+            Some("Charging") => t.green("charging"),
+            Some("Discharging") if mains => t.red("discharging on mains"),
+            Some("Discharging") => "discharging".to_string(),
+            Some(s) => s.to_string(),
+            None => "?".into(),
+        };
+        let _ = writeln!(
+            out,
+            "  {} {}  {}",
+            t.bold(&b.name),
+            state,
+            t.dim(&format!(
+                "mains {}",
+                if mains { "online" } else { "offline" }
+            ))
+        );
+
+        row(
+            out,
+            t,
+            "charge",
+            &format!(
+                "{}%  {}",
+                b.capacity_pct.unwrap_or(0),
+                t.dim(&format!(
+                    "{:.1} Wh of {:.1} Wh",
+                    b.energy_now_wh.unwrap_or(0.0),
+                    b.energy_full_wh.unwrap_or(0.0)
+                ))
+            ),
+        );
+
+        // The number that says whether the supply is keeping up.
+        let flow = match b.power_now_w {
+            Some(p) if p > 0.1 && b.is_charging() => t.green(&format!("+{p:.1} W into the pack")),
+            Some(p) if p > 0.1 => t.red(&format!("-{p:.1} W out of the pack")),
+            Some(_) if b.not_keeping_up(mains) => {
+                t.red("0 W — plugged in but the pack is not gaining")
+            }
+            Some(_) => t.dim("0 W"),
+            None => t.dim("not reported"),
+        };
+        let eta = b
+            .hours_to_full()
+            .map(|h| t.dim(&format!("  ~{h:.1} h to full")))
+            .unwrap_or_default();
+        row(out, t, "flow", &format!("{flow}{eta}"));
+
+        if let Some(h) = b.health_pct() {
+            row(
+                out,
+                t,
+                "health",
+                &format!(
+                    "{h:.0}%  {}",
+                    t.dim(&format!(
+                        "{:.1} Wh of {:.1} Wh design{}",
+                        b.energy_full_wh.unwrap_or(0.0),
+                        b.energy_full_design_wh.unwrap_or(0.0),
+                        b.cycle_count
+                            .map(|c| format!(", {c} cycles"))
+                            .unwrap_or_default()
+                    ))
+                ),
+            );
+        }
+    }
+    let _ = writeln!(out);
 }
 
 // ---------------------------------------------------------------------------

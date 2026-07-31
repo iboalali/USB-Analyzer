@@ -33,6 +33,7 @@ struct Args {
     color: Option<bool>,
     raw_log: bool,
     interval_ms: u64,
+    sample_ms: u64,
 }
 
 impl Default for Args {
@@ -44,6 +45,7 @@ impl Default for Args {
             color: None,
             raw_log: false,
             interval_ms: 2000,
+            sample_ms: 0,
         }
     }
 }
@@ -65,6 +67,7 @@ fn main() -> ExitCode {
             include_unclassified: args.raw_log,
             ..Default::default()
         },
+        storage_sample_ms: args.sample_ms,
     };
 
     if args.command == Command::Watch {
@@ -111,17 +114,23 @@ fn format_report(report: &Report, args: &Args) -> String {
     match args.command {
         Command::Ports => {
             render::ports(&mut out, &report.snapshot, &theme);
+            render::battery(&mut out, &report.snapshot, &theme);
             render::thunderbolt(&mut out, &report.snapshot, &theme);
         }
-        Command::Devices => render::devices(&mut out, &report.snapshot, &theme),
+        Command::Devices => {
+            render::devices(&mut out, &report.snapshot, &theme);
+            render::storage(&mut out, report, &theme);
+        }
         Command::Diag => {
             render::findings(&mut out, report, &theme);
             render::summary(&mut out, report, &theme);
         }
         Command::All | Command::Watch => {
             render::ports(&mut out, &report.snapshot, &theme);
+            render::battery(&mut out, &report.snapshot, &theme);
             render::thunderbolt(&mut out, &report.snapshot, &theme);
             render::devices(&mut out, &report.snapshot, &theme);
+            render::storage(&mut out, report, &theme);
             render::findings(&mut out, report, &theme);
             render::summary(&mut out, report, &theme);
             render::caveat(&mut out, &theme);
@@ -205,6 +214,16 @@ fn parse(argv: &[String]) -> Result<Option<Args>, String> {
             "--no-color" => args.color = Some(false),
             "--color" => args.color = Some(true),
             "--raw-log" => args.raw_log = true,
+            "--sample" => {
+                i += 1;
+                let v = argv.get(i).ok_or("--sample needs a value in milliseconds")?;
+                args.sample_ms = v
+                    .parse()
+                    .map_err(|_| format!("not a number of milliseconds: {v}"))?;
+                if args.sample_ms < 100 {
+                    return Err("--sample must be at least 100 ms to measure anything".into());
+                }
+            }
             "--interval" => {
                 i += 1;
                 let v = argv.get(i).ok_or("--interval needs a value in milliseconds")?;
@@ -252,7 +271,7 @@ USAGE
 COMMANDS
     all        Ports, topology and findings (default)
     ports      Type-C ports: roles, PD contract, cable e-marker, alt modes
-    devices    USB topology with the link speed each device negotiated
+    devices    USB topology, plus storage speed, why, and live throughput
     diag       Findings only
     watch      Re-render on change — plug a cable in and watch it negotiate
     json       Full snapshot and findings as JSON
@@ -264,6 +283,8 @@ OPTIONS
         --color         Force ANSI colour
         --no-color      Disable ANSI colour (also honours NO_COLOR)
         --interval MS   Poll interval for watch, default 2000
+        --sample MS     Measure live storage throughput over this window
+                        (costs exactly this much wall-clock; off by default)
     -h, --help          This text
     -V, --version       Version
 

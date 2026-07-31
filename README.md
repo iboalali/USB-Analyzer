@@ -58,13 +58,14 @@ usbdiag [OPTIONS] [COMMAND]
 COMMANDS
     all        Ports, topology and findings (default)
     ports      Type-C ports: roles, PD contract, cable e-marker, alt modes
-    devices    USB topology with the link speed each device negotiated
+    devices    USB topology, plus storage speed, why, and live throughput
     diag       Findings only
     watch      Re-render on change — plug a cable in and watch it negotiate
     json       Full snapshot and findings as JSON
 
 OPTIONS
     -j --json   -v --verbose   --raw-log   --color/--no-color   --interval MS
+    --sample MS    measure live storage throughput over this window
 ```
 
 Exit status is `0` when nothing actionable was found and `1` when there is a
@@ -84,7 +85,8 @@ Everything is read-only. Nothing requires root.
 | `/sys/class/typec/*` | Port roles, PD/Type-C revisions, alt modes, the attached partner, and the **cable e-marker** |
 | `/sys/bus/thunderbolt/*` | USB4/Thunderbolt routers, domain security, and **active-cable retimers** — a second, independent source of cable identity |
 | `/sys/class/usb_power_delivery/*` | PDO lists: what each side *advertises* it can supply or accept |
-| `/sys/class/power_supply/*` | The negotiated contract: `voltage_now` x `current_now` |
+| `/sys/class/power_supply/*` | The negotiated contract (`voltage_now` x `current_now`), plus batteries and mains |
+| `/sys/block/*/stat` | Live storage throughput — two reads and the time between them, no privileges |
 | `/dev/kmsg`, else `journalctl -k`, else `dmesg` | Resets, enumeration failures, link-training failures, over-current |
 
 Capabilities and the live contract are kept strictly apart, because a charging
@@ -211,6 +213,7 @@ failing hub controller, or a marginal port produce identical evidence.
 | `CABLE_EMARKER_NOT_REPORTED` | inferred | Controller reports no e-marker, but a >3 A contract proves the cable is 5 A rated. |
 | `PD_NO_CONTRACT` | inferred | PD-capable device attached but no contract in effect. |
 | `SINK_UNDERPOWERED_NO_PD` | measured | This machine is drawing 5 V with no PD contract while advertising far higher sink capability — the "why is my laptop barely charging" case. |
+| `BATTERY_DRAINING_ON_AC` | measured | Mains present but the pack is not gaining — the supply is not keeping up with the load. |
 | `PARTNER_NO_PD` | measured | Attached device speaks no PD at all, so the link is capped at 5 V. Info-level: normal for a watch charger or accessory being powered. |
 | `PD_CONTRACT_BELOW_OFFER` | measured | Took much less power than the source offered. |
 | `PD_SOURCE_BELOW_SINK_CAPABILITY` | measured | Charger smaller than the port can accept. |
@@ -230,7 +233,7 @@ failing hub controller, or a marginal port produce identical evidence.
 
 ```sh
 cargo build --release        # ./target/release/usbdiag
-cargo test                   # 109 tests
+cargo test                   # 118 tests
 ```
 
 No non-Rust dependencies. Dependencies are `serde` and `serde_json` only; sysfs

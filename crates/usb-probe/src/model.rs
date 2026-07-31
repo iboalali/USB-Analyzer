@@ -24,6 +24,11 @@ pub struct Snapshot {
     pub ports: Vec<TypecPort>,
     /// USB4 / Thunderbolt routers and active-cable retimers.
     pub thunderbolt: ThunderboltTopology,
+    /// Block devices, for mapping storage back to the USB device carrying it.
+    pub block_devices: Vec<BlockDevice>,
+    /// Batteries, so an attached supply can be judged on whether it keeps up.
+    pub batteries: Vec<Battery>,
+    pub mains_online: Option<bool>,
     /// PD objects not reachable from a port (kept so nothing is silently dropped).
     pub orphan_pd: Vec<PowerDelivery>,
     pub kernel_log: KernelLog,
@@ -43,6 +48,23 @@ impl Snapshot {
         self.devices()
             .into_iter()
             .find(|d| d.sysfs_name == sysfs_name)
+    }
+
+    /// Block devices attached through a given USB device.
+    pub fn storage_on(&self, dev: &UsbDevice) -> Vec<&BlockDevice> {
+        self.block_devices
+            .iter()
+            .filter(|b| b.sysfs_path.starts_with(&dev.sysfs_path))
+            .collect()
+    }
+
+    /// USB devices that carry storage, paired with it.
+    pub fn storage_devices(&self) -> Vec<(&UsbDevice, Vec<&BlockDevice>)> {
+        self.devices()
+            .into_iter()
+            .map(|d| (d, self.storage_on(d)))
+            .filter(|(_, b)| !b.is_empty())
+            .collect()
     }
 }
 
@@ -832,6 +854,144 @@ impl PortPowerSupply {
     /// even when the controller never reports its e-marker.
     pub fn contract_requires_5a_cable(&self) -> bool {
         self.contract_current_ma().is_some_and(|i| i > 3000)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Storage
+// ---------------------------------------------------------------------------
+
+/// A block device and its I/O counters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockDevice {
+    pub name: String,
+    /// Canonical sysfs path. A block device sitting under a USB device's path is
+    /// attached through it — exact attribution, not a guess.
+    pub sysfs_path: PathBuf,
+    pub model: Option<String>,
+    pub vendor: Option<String>,
+    pub size_bytes: Option<u64>,
+    /// `true` for spinning media. Decisive when judging throughput: a 5400 rpm
+    /// disk sustains ~100-120 MB/s no matter how fast the link is.
+    pub rotational: Option<bool>,
+    pub removable: Option<bool>,
+    pub stats: Option<BlockStats>,
+    /// Live rate, present only when the caller sampled over a time window.
+    pub throughput: Option<Throughput>,
+}
+
+impl BlockDevice {
+    pub fn label(&self) -> String {
+        match (&self.vendor, &self.model) {
+            (Some(v), Some(m)) if !v.trim().is_empty() => format!("{} {}", v.trim(), m.trim()),
+            (_, Some(m)) => m.trim().to_string(),
+            _ => self.name.clone(),
+        }
+    }
+
+    /// Practical sustained ceiling for this medium, in bytes/sec, when known.
+    /// Spinning disks are limited by the platter, not the bus.
+    pub fn media_ceiling_bps(&self) -> Option<f64> {
+        match self.rotational {
+            // ~120 MB/s is a generous figure for a 2.5" 5400 rpm drive.
+            Some(true) => Some(120e6),
+            _ => None,
+        }
+    }
+}
+
+/// Cumulative I/O counters from `/sys/block/*/stat`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockStats {
+    pub read_ios: u64,
+    pub sectors_read: u64,
+    pub ms_reading: u64,
+    pub write_ios: u64,
+    pub sectors_written: u64,
+    pub ms_writing: u64,
+    pub ios_in_flight: u64,
+    pub sampled_at_unix_ms: u64,
+}
+
+/// A measured transfer rate over a known interval.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Throughput {
+    pub read_bps: f64,
+    pub write_bps: f64,
+    pub interval_ms: u64,
+}
+
+impl Throughput {
+    pub fn total_bps(&self) -> f64 {
+        self.read_bps + self.write_bps
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.total_bps() < 1024.0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Batteries and mains
+// ---------------------------------------------------------------------------
+
+/// A battery, so the tool can say whether an attached supply is actually keeping
+/// up. The PD contract says what is *permitted*; this says what is *happening*.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Battery {
+    pub name: String,
+    /// `Charging` | `Discharging` | `Full` | `Not charging` | `Unknown`.
+    pub status: Option<String>,
+    pub capacity_pct: Option<u32>,
+    pub energy_now_wh: Option<f64>,
+    pub energy_full_wh: Option<f64>,
+    pub energy_full_design_wh: Option<f64>,
+    /// Positive while charging or discharging; the sign is not meaningful, the
+    /// direction comes from `status`.
+    pub power_now_w: Option<f64>,
+    pub voltage_now_v: Option<f64>,
+    pub cycle_count: Option<u32>,
+}
+
+impl Battery {
+    /// Capacity retained versus design, as a percentage.
+    pub fn health_pct(&self) -> Option<f64> {
+        let full = self.energy_full_wh?;
+        let design = self.energy_full_design_wh.filter(|d| *d > 0.0)?;
+        Some(full / design * 100.0)
+    }
+
+    pub fn is_charging(&self) -> bool {
+        self.status.as_deref() == Some("Charging")
+    }
+
+    pub fn is_discharging(&self) -> bool {
+        self.status.as_deref() == Some("Discharging")
+    }
+
+    /// Energy still needed to reach full, in Wh.
+    pub fn deficit_wh(&self) -> Option<f64> {
+        Some((self.energy_full_wh? - self.energy_now_wh?).max(0.0))
+    }
+
+    /// Hours to full at the current rate, when it is actually gaining.
+    pub fn hours_to_full(&self) -> Option<f64> {
+        let rate = self.power_now_w.filter(|p| *p > 0.1)?;
+        if !self.is_charging() {
+            return None;
+        }
+        Some(self.deficit_wh()? / rate)
+    }
+
+    /// True when mains power is present and the battery is still not gaining.
+    ///
+    /// Deliberately does not trust `status` alone: a real reading had
+    /// `status = Charging` with `power_now = 0` while the pack lost 13 Wh.
+    pub fn not_keeping_up(&self, mains_online: bool) -> bool {
+        if !mains_online {
+            return false;
+        }
+        self.is_discharging() || (self.is_charging() && self.power_now_w == Some(0.0))
     }
 }
 

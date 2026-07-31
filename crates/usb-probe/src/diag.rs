@@ -45,6 +45,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Finding> {
     phantom_device_rules(snap, &mut f);
     billboard_rules(snap, &mut f);
     thunderbolt_rules(snap, &mut f);
+    battery_rules(snap, &mut f);
     hub_port_rules(snap, &mut f);
 
     // One physical fault should read as one finding. Without this, a single
@@ -334,9 +335,14 @@ fn port_rules(snap: &Snapshot, port: &TypecPort, out: &mut Vec<Finding>) {
     // own sink capabilities are irrelevant to what the attached device offers.
     if let (Some(offered), Some(wanted)) = (offered_mw, wanted_mw) {
         if port.is_sinking() && offered * 100 < wanted * POWER_GAP_PCT {
+            // Stop hedging when the battery proves the gap matters.
+            let draining = snap
+                .batteries
+                .iter()
+                .any(|b| b.not_keeping_up(snap.mains_online.unwrap_or(false)));
             out.push(Finding {
                 code: "PD_SOURCE_BELOW_SINK_CAPABILITY".into(),
-                severity: Severity::Low,
+                severity: if draining { Severity::Medium } else { Severity::Low },
                 confidence: Confidence::Measured,
                 subject: Subject::Port(port.name.clone()),
                 title: format!(
@@ -344,9 +350,16 @@ fn port_rules(snap: &Snapshot, port: &TypecPort, out: &mut Vec<Finding>) {
                     watts(offered),
                     watts(wanted)
                 ),
-                detail: "Not a fault — the supply is simply smaller than the port's maximum. \
-                         Expect slower charging, and possible battery drain under heavy load."
-                    .into(),
+                detail: if draining {
+                    "The supply is smaller than this port can accept, and the battery is \
+                     measurably failing to gain as a result — so this is not merely a slower \
+                     charge, the machine is running down while plugged in."
+                        .to_string()
+                } else {
+                    "Not a fault — the supply is simply smaller than the port's maximum. Expect \
+                     slower charging, and possible battery drain under heavy load."
+                        .to_string()
+                },
                 evidence: vec![
                     format!("best source PDO: {}", best_pdo_desc(partner.pd.as_ref(), true)),
                     format!("best local sink PDO: {}", best_pdo_desc(port.local_pd.as_ref(), false)),
@@ -1502,6 +1515,86 @@ fn thunderbolt_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
     }
 }
 
+/// Is the attached supply actually keeping up?
+///
+/// The PD contract states what is *permitted*; the battery states what is
+/// *happening*. Without this the tool can only say "possible drain" — with it,
+/// it can say the pack is losing ground and name the supply responsible.
+fn battery_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
+    let mains = snap.mains_online.unwrap_or(false);
+    if !mains {
+        return;
+    }
+    for bat in &snap.batteries {
+        if !bat.not_keeping_up(mains) {
+            continue;
+        }
+        // Name the supply, since that is the thing to change.
+        let contract = snap
+            .ports
+            .iter()
+            .find(|p| p.is_sinking() && p.power_supply.as_ref().is_some_and(|s| s.is_drawing_power()))
+            .and_then(|p| {
+                p.power_supply
+                    .as_ref()
+                    .and_then(|s| s.contract_power_mw())
+                    .map(|mw| (p.name.clone(), mw))
+            });
+
+        let mut evidence = vec![
+            format!(
+                "{}: status={}, power_now={}",
+                bat.name,
+                bat.status.as_deref().unwrap_or("?"),
+                bat.power_now_w
+                    .map(|p| format!("{p:.1} W"))
+                    .unwrap_or_else(|| "not reported".into())
+            ),
+            "a mains supply is online".to_string(),
+        ];
+        if let (Some(now), Some(full)) = (bat.energy_now_wh, bat.energy_full_wh) {
+            evidence.push(format!(
+                "charge {:.1} Wh of {:.1} Wh ({}%)",
+                now,
+                full,
+                bat.capacity_pct.unwrap_or(0)
+            ));
+        }
+        if let Some((port, mw)) = &contract {
+            evidence.push(format!("{port} contract: {}", watts(*mw)));
+        }
+
+        out.push(Finding {
+            code: "BATTERY_DRAINING_ON_AC".into(),
+            severity: Severity::Medium,
+            confidence: Confidence::Measured,
+            subject: Subject::Host,
+            title: match &contract {
+                Some((_, mw)) => format!(
+                    "Battery is not gaining despite {} from the attached supply",
+                    watts(*mw)
+                ),
+                None => "Battery is not gaining although mains power is present".to_string(),
+            },
+            detail: "The system is drawing at least as much as the supply provides, so the \
+                     shortfall comes out of the battery. Under sustained load the machine will \
+                     run down even while plugged in. The usual causes are a supply rated below \
+                     what this machine can accept, a hub or dock passing through only part of \
+                     what it receives, or peripherals being powered from the same budget. Note \
+                     that a status of \"Charging\" with zero flow is not a contradiction — it is \
+                     what the driver reports when the contract covers the load exactly and \
+                     nothing is left over."
+                .into(),
+            evidence,
+            suggestion: Some(
+                "Use a supply closer to what this machine accepts, or connect the charger \
+                 directly rather than through a hub that reserves part of the budget."
+                    .into(),
+            ),
+        });
+    }
+}
+
 fn hub_port_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
     for dev in snap.devices() {
         for p in &dev.ports {
@@ -2535,6 +2628,100 @@ mod tests {
         let mut snap = empty_snapshot();
         snap.ports.push(official_charger_port_65w());
         assert!(!codes(&analyze(&snap)).contains(&"SINK_UNDERPOWERED_NO_PD"));
+    }
+
+    // --- BATTERY_DRAINING_ON_AC --------------------------------------------
+
+    fn battery(status: &str, power_w: f64, pct: u32) -> Battery {
+        Battery {
+            name: "BAT0".into(),
+            status: Some(status.into()),
+            capacity_pct: Some(pct),
+            energy_now_wh: Some(19.2),
+            energy_full_wh: Some(77.2),
+            energy_full_design_wh: Some(86.0),
+            power_now_w: Some(power_w),
+            voltage_now_v: Some(15.2),
+            cycle_count: Some(133),
+        }
+    }
+
+    /// The observed case: plugged in, "Charging", zero flow, pack losing ground.
+    /// The driver reports Charging when the contract exactly covers the load, so
+    /// status alone cannot be trusted.
+    #[test]
+    fn charging_with_zero_flow_on_mains_is_reported() {
+        let mut snap = empty_snapshot();
+        snap.mains_online = Some(true);
+        snap.batteries.push(battery("Charging", 0.0, 25));
+
+        let hit = analyze(&snap)
+            .into_iter()
+            .find(|x| x.code == "BATTERY_DRAINING_ON_AC")
+            .unwrap();
+        assert_eq!(hit.severity, Severity::Medium);
+        assert_eq!(hit.confidence, Confidence::Measured);
+        assert!(hit.detail.contains("not a contradiction"));
+    }
+
+    #[test]
+    fn discharging_on_mains_is_reported() {
+        let mut snap = empty_snapshot();
+        snap.mains_online = Some(true);
+        snap.batteries.push(battery("Discharging", 12.0, 25));
+        assert!(codes(&analyze(&snap)).contains(&"BATTERY_DRAINING_ON_AC"));
+    }
+
+    /// On battery power, discharging is simply what a battery does.
+    #[test]
+    fn discharging_off_mains_is_not_a_finding() {
+        let mut snap = empty_snapshot();
+        snap.mains_online = Some(false);
+        snap.batteries.push(battery("Discharging", 12.0, 25));
+        assert!(!codes(&analyze(&snap)).contains(&"BATTERY_DRAINING_ON_AC"));
+    }
+
+    #[test]
+    fn a_battery_that_is_gaining_is_not_a_finding() {
+        let mut snap = empty_snapshot();
+        snap.mains_online = Some(true);
+        snap.batteries.push(battery("Charging", 20.1, 25));
+        assert!(!codes(&analyze(&snap)).contains(&"BATTERY_DRAINING_ON_AC"));
+    }
+
+    /// The power-gap finding stops hedging once the battery proves it matters.
+    #[test]
+    fn the_power_gap_escalates_when_the_battery_is_losing() {
+        let mut snap = empty_snapshot();
+        snap.mains_online = Some(true);
+        snap.ports.push(official_charger_port_65w());
+
+        let quiet = analyze(&snap)
+            .into_iter()
+            .find(|x| x.code == "PD_SOURCE_BELOW_SINK_CAPABILITY")
+            .unwrap();
+        assert_eq!(quiet.severity, Severity::Low);
+        assert!(quiet.detail.contains("Not a fault"));
+
+        snap.batteries.push(battery("Charging", 0.0, 25));
+        let loud = analyze(&snap)
+            .into_iter()
+            .find(|x| x.code == "PD_SOURCE_BELOW_SINK_CAPABILITY")
+            .unwrap();
+        assert_eq!(loud.severity, Severity::Medium);
+        assert!(loud.detail.contains("running down while plugged in"));
+    }
+
+    #[test]
+    fn battery_health_and_eta_are_derived_correctly() {
+        let b = battery("Charging", 20.0, 25);
+        // 77.2 of 86.0 Wh design.
+        assert!((b.health_pct().unwrap() - 89.77).abs() < 0.1);
+        // (77.2 - 19.2) / 20 W = 2.9 h.
+        assert!((b.hours_to_full().unwrap() - 2.9).abs() < 0.05);
+        // Not charging -> no ETA.
+        let d = battery("Discharging", 20.0, 25);
+        assert!(d.hours_to_full().is_none());
     }
 
     #[test]

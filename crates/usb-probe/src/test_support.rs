@@ -22,6 +22,9 @@ pub fn empty_snapshot() -> Snapshot {
         buses: Vec::new(),
         ports: Vec::new(),
         thunderbolt: ThunderboltTopology::default(),
+        block_devices: Vec::new(),
+        batteries: Vec::new(),
+        mains_online: None,
         orphan_pd: Vec::new(),
         kernel_log: KernelLog {
             source: KernelLogSource::Journalctl,
