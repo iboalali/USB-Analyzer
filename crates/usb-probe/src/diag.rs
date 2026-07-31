@@ -771,7 +771,11 @@ fn link_speed_rules(snap: &Snapshot, dev: &UsbDevice, out: &mut Vec<Finding>) {
 }
 
 fn kernel_history_rules(snap: &Snapshot, dev: &UsbDevice, out: &mut Vec<Finding>) {
-    let events = snap.kernel_log.for_device(&dev.sysfs_name);
+    // Only events since this device attached: a path like `5-1` is a socket
+    // address, not a device identity, so the previous occupant's history must
+    // not be charged to the current one.
+    let (events, excluded_stale) = snap.events_since_attach(dev);
+    let _ = excluded_stale;
     if events.is_empty() {
         return;
     }
@@ -1117,8 +1121,8 @@ fn ss_half_failed_rules(snap: &Snapshot, out: &mut Vec<Finding>) -> BTreeSet<Str
     let mut covered = BTreeSet::new();
 
     for rec in receptacles(snap) {
-        let errors = ss_errors_on(snap, rec.fast.hub_name);
-        if errors.is_empty() {
+        let all_errors = ss_errors_on(snap, rec.fast.hub_name);
+        if all_errors.is_empty() {
             continue;
         }
         // Only meaningful when the companion half actually carries something —
@@ -1129,12 +1133,23 @@ fn ss_half_failed_rules(snap: &Snapshot, out: &mut Vec<Finding>) -> BTreeSet<Str
         let Some(dev) = snap.device(child_name) else {
             continue;
         };
+        // A socket outlives its occupants. Errors from whatever was plugged in
+        // twenty minutes ago say nothing about what is plugged in now, and
+        // blaming the current device's cable for them is simply wrong.
+        let (errors, excluded) = snap.filter_since_attach(all_errors, dev);
+        if errors.is_empty() {
+            continue;
+        }
 
-        let trained = snap
-            .kernel_log
-            .events
-            .iter()
-            .any(|e| e.is_superspeed_train() && e.bus().as_deref() == Some(rec.fast.hub_name));
+        let attached_at = snap.uptime_s.and_then(|u| dev.attached_at_s(u));
+        let trained = snap.kernel_log.events.iter().any(|e| {
+            e.is_superspeed_train()
+                && e.bus().as_deref() == Some(rec.fast.hub_name)
+                && match (attached_at, e.monotonic_s) {
+                    (Some(a), Some(t)) => t >= a,
+                    _ => true,
+                }
+        });
         let gave_up = rec.fast.port.state.as_deref() == Some("not attached");
         // Did the SuperSpeed half come back? An intermittent fault is most
         // dangerous exactly when it currently looks fine, so this is reported —
@@ -1201,6 +1216,12 @@ fn ss_half_failed_rules(snap: &Snapshot, out: &mut Vec<Finding>) -> BTreeSet<Str
             evidence.push(format!(
                 "{} has since given up (state: not attached)",
                 rec.fast.port.name
+            ));
+        }
+        if excluded > 0 {
+            evidence.push(format!(
+                "{excluded} older error(s) on this socket predate the current device and were \
+                 excluded — they belonged to whatever was plugged in before"
             ));
         }
         // The errno is the actual diagnosis, so surface it in plain language.
@@ -1304,24 +1325,36 @@ fn phantom_device_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
     }
 
     let sockets = receptacles(snap);
-    for (name, events) in by_device {
-        // Where is this bus physically, and what else is on that socket?
+    for (name, mut events) in by_device {
         let bus = events.first().and_then(|e| e.bus());
-        let context = bus.as_deref().and_then(|b| {
-            sockets.iter().find_map(|r| {
-                if r.fast.hub_name != b {
-                    return None;
-                }
-                let sibling = r.slow.port.child.as_deref().and_then(|c| snap.device(c));
-                Some(match sibling {
-                    Some(d) => format!(
-                        "the SuperSpeed half of the {} socket, whose USB 2.0 half is running {}",
-                        r.where_is(),
-                        d.label()
-                    ),
-                    None => format!("the SuperSpeed half of the {} socket", r.where_is()),
-                })
-            })
+        // The socket's current occupant, if any, and where it is.
+        let socket = bus.as_deref().and_then(|b| {
+            sockets.iter().find(|r| r.fast.hub_name == b)
+        });
+        let sibling = socket
+            .and_then(|r| r.slow.port.child.as_deref())
+            .and_then(|c| snap.device(c));
+
+        // A failure that predates the socket's current occupant belonged to
+        // whatever was plugged in before, and must not be reported against what
+        // is there now.
+        let mut excluded = 0;
+        if let Some(sib) = sibling {
+            let (kept, dropped) = snap.filter_since_attach(events, sib);
+            events = kept;
+            excluded = dropped;
+        }
+        if events.is_empty() {
+            continue;
+        }
+
+        let context = socket.map(|r| match sibling {
+            Some(d) => format!(
+                "the SuperSpeed half of the {} socket, whose USB 2.0 half is running {}",
+                r.where_is(),
+                d.label()
+            ),
+            None => format!("the SuperSpeed half of the {} socket", r.where_is()),
         });
 
         let worst = events
@@ -1340,7 +1373,12 @@ fn phantom_device_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
         if let Some(c) = &context {
             evidence.push(format!("this is {c}"));
         }
-        evidence.push(format!("{} relevant event(s) this boot", events.len()));
+        evidence.push(format!("{} relevant event(s)", events.len()));
+        if excluded > 0 {
+            evidence.push(format!(
+                "{excluded} older event(s) excluded — they predate the device now on this socket"
+            ));
+        }
         for e in events.iter().rev().take(3) {
             match e.errno.and_then(errno_meaning) {
                 Some(m) => evidence.push(format!("{}  [{}]", e.text, m)),
@@ -1348,17 +1386,18 @@ fn phantom_device_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
             }
         }
 
-        let where_ = context
-            .as_deref()
-            .map(|c| format!(" at {c}"))
-            .unwrap_or_default();
-
         out.push(Finding {
             code: "DEVICE_FAILED_TO_ENUMERATE".into(),
             severity: Severity::High,
             confidence: Confidence::Measured,
             subject: Subject::Device(name.to_string()),
-            title: format!("{name} tried to attach{where_} and never enumerated"),
+            title: match socket {
+                Some(r) => format!(
+                    "{name} never enumerated on the SuperSpeed half of the {} socket",
+                    r.where_is()
+                ),
+                None => format!("{name} tried to attach and never enumerated"),
+            },
             detail: match worst {
                 EventKind::CableSuspect =>
                     "The hub driver could not enable the port and logged its bad-cable warning. \
@@ -2357,6 +2396,86 @@ mod tests {
         assert!(!codes(&f).contains(&"SS_HALF_IDLE"));
     }
 
+    /// A socket outlives its occupants. Errors logged by a hub that has since
+    /// been unplugged must not be charged to whatever is in that socket now.
+    ///
+    /// Live false positive this reproduces: a Pixel plugged into the socket a
+    /// defective hub had occupied was reported as having a defective cable,
+    /// using errors from 20 minutes before it was attached.
+    #[test]
+    fn errors_predating_the_current_occupant_are_not_charged_to_it() {
+        let mut snap = empty_snapshot();
+        snap.uptime_s = Some(64_095.0);
+
+        let (mut slow, fast) = receptacle("0x80000001", Some("5-1"), None);
+        // Attached 82 s ago, long after the errors below.
+        let mut phone = device_with_class("5-1", " 2.10", 480.0, Some("usb5"), 0x06);
+        phone.connected_duration_ms = Some(82_000);
+        phone.product = Some("Pixel 9 Pro XL".into());
+        slow.children.push(phone);
+        snap.buses.push(slow);
+        snap.buses.push(fast);
+
+        // The previous occupant's failures, ~1200 s before the phone arrived.
+        let mut events = ss_uplink_failure_events(6, 85, true);
+        for (i, e) in events.iter_mut().enumerate() {
+            e.monotonic_s = Some(62_700.0 + i as f64);
+        }
+        snap.kernel_log.events = events;
+
+        let f = analyze(&snap);
+        assert!(
+            !codes(&f).contains(&"SS_HALF_FAILED"),
+            "stale errors must not implicate the current device: {:?}",
+            codes(&f)
+        );
+        assert!(!codes(&f).contains(&"KERNEL_BLAMED_CABLE"));
+        assert!(!codes(&f).contains(&"DEVICE_FAILED_TO_ENUMERATE"));
+    }
+
+    /// The same evidence, but the device was already there when it was logged —
+    /// so it genuinely is about this device and must still be reported.
+    #[test]
+    fn errors_after_the_device_attached_are_still_reported() {
+        let mut snap = empty_snapshot();
+        snap.uptime_s = Some(64_095.0);
+
+        let (mut slow, fast) = receptacle("0x80000001", Some("5-1"), None);
+        // Attached two hours ago, well before the errors.
+        let mut hub = device_with_class("5-1", " 2.10", 480.0, Some("usb5"), 0x09);
+        hub.connected_duration_ms = Some(7_200_000);
+        slow.children.push(hub);
+        snap.buses.push(slow);
+        snap.buses.push(fast);
+
+        let mut events = ss_uplink_failure_events(6, 85, true);
+        for (i, e) in events.iter_mut().enumerate() {
+            e.monotonic_s = Some(62_700.0 + i as f64);
+        }
+        snap.kernel_log.events = events;
+
+        let hit = analyze(&snap)
+            .into_iter()
+            .find(|x| x.code == "SS_HALF_FAILED")
+            .expect("errors during this device's attachment are its own");
+        assert!(hit.title.contains("likely defective"));
+    }
+
+    /// Without a time base, evidence is kept rather than silently discarded —
+    /// losing a real fault is worse than an occasional stale one.
+    #[test]
+    fn missing_timestamps_keep_the_evidence() {
+        let mut snap = empty_snapshot();
+        snap.uptime_s = None;
+        let (mut slow, fast) = receptacle("0x80000001", Some("5-1"), None);
+        slow.children
+            .push(device_with_class("5-1", " 2.10", 480.0, Some("usb5"), 0x09));
+        snap.buses.push(slow);
+        snap.buses.push(fast);
+        snap.kernel_log.events = ss_uplink_failure_events(6, 85, true);
+        assert!(codes(&analyze(&snap)).contains(&"SS_HALF_FAILED"));
+    }
+
     /// Errors with nothing plugged into the socket are stale history, not a
     /// live problem. Reporting them every boot would be noise.
     #[test]
@@ -2453,6 +2572,8 @@ mod tests {
             kind: EventKind::EnumerationFailure,
             severity: Severity::High,
             device: Some("3-4".into()),
+            port: None,
+            monotonic_s: None,
             errno: Some(-71),
             timestamp: None,
             text: "usb 3-4: device descriptor read/64, error -71".into(),
@@ -2519,6 +2640,8 @@ mod tests {
             kind: EventKind::EnumerationFailure,
             severity: Severity::High,
             device: Some("3-4".into()),
+            port: None,
+            monotonic_s: None,
             errno: Some(-71),
             timestamp: None,
             text: "usb 3-4: device descriptor read/64, error -71".into(),
@@ -2778,6 +2901,8 @@ mod tests {
                 kind,
                 severity: Severity::Medium,
                 device: Some("1-1".into()),
+                port: None,
+                monotonic_s: None,
                 errno: None,
                 timestamp: None,
                 text: "usb 1-1: synthetic fault".into(),

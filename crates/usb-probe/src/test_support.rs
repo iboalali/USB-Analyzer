@@ -25,6 +25,7 @@ pub fn empty_snapshot() -> Snapshot {
         block_devices: Vec::new(),
         batteries: Vec::new(),
         mains_online: None,
+        uptime_s: None,
         orphan_pd: Vec::new(),
         kernel_log: KernelLog {
             source: KernelLogSource::Journalctl,
@@ -132,7 +133,9 @@ pub fn reset_log(device: &str, count: usize) -> KernelLog {
                 kind: EventKind::DeviceReset,
                 severity: Severity::Low,
                 device: Some(device.to_string()),
+                port: None,
                 errno: None,
+                monotonic_s: None,
                 timestamp: Some(format!("[{i:>6}.000000]")),
                 text: format!("usb {device}: reset full-speed USB device number 2 using xhci_hcd"),
             })
@@ -543,7 +546,9 @@ pub fn ss_uplink_failure_events(bus_num: u32, retries: usize, trained: bool) -> 
             kind: EventKind::CableSuspect,
             severity: Severity::High,
             device: Some(bus.clone()),
+            port: Some(format!("{bus}-port1")),
             errno: None,
+            monotonic_s: Some(1000.0 + i as f64),
             timestamp: Some(format!("[{i:>6}.000000]")),
             text: format!("usb {bus}-port1: Cannot enable. Maybe the USB cable is bad?"),
         })
@@ -554,7 +559,9 @@ pub fn ss_uplink_failure_events(bus_num: u32, retries: usize, trained: bool) -> 
             kind: EventKind::DeviceEnumerating,
             severity: Severity::Info,
             device: Some(format!("{bus_num}-1")),
+            port: None,
             errno: None,
+            monotonic_s: Some(1100.0),
             timestamp: None,
             text: format!(
                 "usb {bus_num}-1: new SuperSpeed Plus Gen 2x1 USB device number 7 using xhci_hcd"
@@ -564,7 +571,9 @@ pub fn ss_uplink_failure_events(bus_num: u32, retries: usize, trained: bool) -> 
             kind: EventKind::EnumerationFailure,
             severity: Severity::High,
             device: Some(format!("{bus_num}-1")),
+            port: None,
             errno: Some(-110),
+            monotonic_s: Some(1101.0),
             timestamp: None,
             text: format!("usb {bus_num}-1: device descriptor read/all, error -110"),
         });

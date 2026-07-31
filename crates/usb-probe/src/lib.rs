@@ -94,6 +94,7 @@ pub fn capture(opts: Options) -> Snapshot {
         },
         batteries,
         mains_online,
+        uptime_s: read_uptime_s(),
         orphan_pd,
         kernel_log: kernel::collect(opts.kernel),
     }
@@ -109,6 +110,15 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Seconds since boot, from `/proc/uptime`.
+fn read_uptime_s() -> Option<f64> {
+    sysfs::read_str("/proc/uptime")?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 fn read_host() -> Host {

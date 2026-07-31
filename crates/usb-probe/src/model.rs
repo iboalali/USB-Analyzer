@@ -29,6 +29,8 @@ pub struct Snapshot {
     /// Batteries, so an attached supply can be judged on whether it keeps up.
     pub batteries: Vec<Battery>,
     pub mains_online: Option<bool>,
+    /// Seconds since boot at capture time, for dating events against devices.
+    pub uptime_s: Option<f64>,
     /// PD objects not reachable from a port (kept so nothing is silently dropped).
     pub orphan_pd: Vec<PowerDelivery>,
     pub kernel_log: KernelLog,
@@ -48,6 +50,75 @@ impl Snapshot {
         self.devices()
             .into_iter()
             .find(|d| d.sysfs_name == sysfs_name)
+    }
+
+    /// Is this event still about what is plugged in now?
+    ///
+    /// A port is a location, not a device. An event naming a port is current
+    /// only if that port still holds something and that something was already
+    /// there when the event was logged. Otherwise it describes a device that has
+    /// since been unplugged, and reporting it against the current occupant — or
+    /// against an empty socket — is simply wrong.
+    pub fn event_is_current(&self, ev: &KernelEvent) -> bool {
+        let (Some(port_name), Some(uptime)) = (ev.port.as_deref(), self.uptime_s) else {
+            return true; // Not port-scoped, or no time base: leave it alone.
+        };
+        let Some(port) = self
+            .devices()
+            .into_iter()
+            .flat_map(|d| d.ports.iter())
+            .find(|p| p.name == port_name)
+        else {
+            return true;
+        };
+        let Some(child) = port.child.as_deref().and_then(|c| self.device(c)) else {
+            // The socket is empty now, so whatever complained has gone.
+            return false;
+        };
+        match (child.attached_at_s(uptime), ev.monotonic_s) {
+            (Some(attached), Some(t)) => t >= attached,
+            _ => true,
+        }
+    }
+
+    /// Kernel events for a device, limited to those since it attached.
+    ///
+    /// A socket outlives its occupants: the log spans the whole boot while the
+    /// device tree is a snapshot, so events matched by path alone can belong to
+    /// something that was unplugged long ago. Returns `(events, excluded)` so a
+    /// caller can say how much history it set aside — "85 errors this boot, none
+    /// since this device attached" is the opposite conclusion from "85 errors".
+    pub fn events_since_attach<'a>(&'a self, dev: &UsbDevice) -> (Vec<&'a KernelEvent>, usize) {
+        let all = self.kernel_log.for_device(&dev.sysfs_name);
+        let total = all.len();
+        // Drop anything about a socket whose occupant has changed since.
+        let live: Vec<&KernelEvent> = all
+            .into_iter()
+            .filter(|e| self.event_is_current(e))
+            .collect();
+        let (kept, mut excluded) = self.filter_since_attach(live, dev);
+        excluded += total - kept.len() - excluded;
+        (kept, excluded)
+    }
+
+    /// As above, for events selected some other way (e.g. by bus).
+    pub fn filter_since_attach<'a>(
+        &self,
+        events: Vec<&'a KernelEvent>,
+        dev: &UsbDevice,
+    ) -> (Vec<&'a KernelEvent>, usize) {
+        let Some(attached) = self.uptime_s.and_then(|u| dev.attached_at_s(u)) else {
+            // Without both timestamps, keep everything rather than silently
+            // discarding evidence — callers note the uncertainty instead.
+            return (events, 0);
+        };
+        let total = events.len();
+        let kept: Vec<&KernelEvent> = events
+            .into_iter()
+            .filter(|e| e.monotonic_s.is_none_or(|t| t >= attached))
+            .collect();
+        let excluded = total - kept.len();
+        (kept, excluded)
     }
 
     /// Block devices attached through a given USB device.
@@ -201,6 +272,13 @@ impl UsbDevice {
     /// cable exists is the safer error.
     pub fn is_internal(&self) -> bool {
         self.removable.as_deref() == Some("fixed")
+    }
+
+    /// Seconds since boot at which this device attached, derived from how long
+    /// it has been connected. Lets a rule ignore log events that predate it.
+    pub fn attached_at_s(&self, uptime_s: f64) -> Option<f64> {
+        let connected = self.connected_duration_ms? as f64 / 1000.0;
+        Some((uptime_s - connected).max(0.0))
     }
 
     /// Fraction of connected time spent runtime-suspended, 0.0..=1.0.
@@ -1132,7 +1210,14 @@ pub struct KernelEvent {
     pub severity: Severity,
     /// Device the line is about, normalized to a USB path like `3-4`.
     pub device: Option<String>,
+    /// Hub port the line names, e.g. `usb6-port1`. A port is a location that
+    /// outlives its occupants, which is what makes staleness decidable.
+    pub port: Option<String>,
     pub timestamp: Option<String>,
+    /// Seconds since boot. Shared base across /dev/kmsg, journalctl
+    /// (short-monotonic) and dmesg, so it can be compared against a device's
+    /// attach time to tell whether an event predates the current occupant.
+    pub monotonic_s: Option<f64>,
     pub text: String,
     /// Negative errno parsed out of the message, e.g. `-110` from
     /// "device descriptor read/all, error -110". This is usually the actual

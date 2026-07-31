@@ -132,6 +132,13 @@ Two limits worth knowing:
   advertises PPS as 3.3-21 V at 5 A, which multiplies out to 105 W it cannot
   deliver. APDOs flagged `pps_power_limited` are excluded from capability
   comparisons so the fixed PDOs decide the maximum.
+- **A socket is not a device.** The kernel log spans the whole boot while the
+  device tree is a snapshot, so an event naming `5-1` describes a *location*,
+  not whatever occupies it now. Events are dated against each device's attach
+  time (`/proc/uptime` minus `power/connected_duration`, compared to monotonic
+  log timestamps) and discarded when they predate the current occupant. Without
+  this, a phone plugged into a socket a faulty hub had used was reported as
+  having a defective cable, on evidence from 20 minutes before it arrived.
 - **Power direction changes what the readings mean.** While the machine is
   *sourcing* (charging a watch, powering an accessory), the `ucsi-source-psy`
   node describes power coming *in*, so it reports `online=0` and `current_now=0`
@@ -233,7 +240,7 @@ failing hub controller, or a marginal port produce identical evidence.
 
 ```sh
 cargo build --release        # ./target/release/usbdiag
-cargo test                   # 118 tests
+cargo test                   # 121 tests
 ```
 
 No non-Rust dependencies. Dependencies are `serde` and `serde_json` only; sysfs

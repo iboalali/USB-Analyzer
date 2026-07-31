@@ -85,8 +85,10 @@ pub fn collect(opts: Options) -> KernelLog {
     ))
 }
 
-/// A source-independent log line: optional timestamp plus the message body.
-type Line = (Option<String>, String);
+/// A source-independent log line: display timestamp, monotonic seconds since
+/// boot, and the message body. The monotonic value is what lets a rule tell
+/// whether an event predates the device currently in a socket.
+type Line = (Option<String>, Option<f64>, String);
 
 fn build(
     source: KernelLogSource,
@@ -96,9 +98,9 @@ fn build(
 ) -> KernelLog {
     let mut events: Vec<KernelEvent> = lines
         .into_iter()
-        .filter(|(_, text)| is_usb_related(text))
-        .filter_map(|(timestamp, text)| {
-            let (kind, device) = classify(&text);
+        .filter(|(_, _, text)| is_usb_related(text))
+        .filter_map(|(timestamp, monotonic_s, text)| {
+            let (kind, device, port) = classify(&text);
             if kind == EventKind::Other && !opts.include_unclassified {
                 return None;
             }
@@ -106,7 +108,9 @@ fn build(
                 severity: severity_of(kind),
                 kind,
                 device,
+                port,
                 errno: extract_errno(&text),
+                monotonic_s,
                 timestamp,
                 text,
             })
@@ -171,12 +175,18 @@ fn parse_kmsg_record(record: &str) -> Option<Line> {
     let usec: u64 = meta.split(',').nth(2)?.parse().ok()?;
     let secs = usec / 1_000_000;
     let frac = usec % 1_000_000;
-    Some((Some(format!("[{secs:>6}.{frac:06}]")), text))
+    Some((
+        Some(format!("[{secs:>6}.{frac:06}]")),
+        Some(usec as f64 / 1e6),
+        text,
+    ))
 }
 
 fn read_journalctl() -> Result<Vec<Line>, String> {
     let out = Command::new("journalctl")
-        .args(["-k", "-b", "0", "--no-pager", "-o", "short-precise"])
+        // short-monotonic prints seconds since boot, the same base /dev/kmsg
+        // uses — so events can be compared against a device's attach time.
+        .args(["-k", "-b", "0", "--no-pager", "-o", "short-monotonic"])
         .output()
         .map_err(|e| e.to_string())?;
     if !out.status.success() {
@@ -186,7 +196,7 @@ fn read_journalctl() -> Result<Vec<Line>, String> {
     Ok(text.lines().filter_map(parse_journal_line).collect())
 }
 
-/// `Jul 31 22:52:14.531674 hostname kernel: usb 3-4: reset ...`
+/// `[62786.165344] hostname kernel: usb 3-4: reset ...` (short-monotonic).
 fn parse_journal_line(line: &str) -> Option<Line> {
     let (head, text) = line.split_once(" kernel: ")?;
     let text = text.trim();
@@ -196,9 +206,15 @@ fn parse_journal_line(line: &str) -> Option<Line> {
     // Drop the trailing hostname token from the head to leave the timestamp.
     let timestamp = head
         .rsplit_once(' ')
-        .map(|(ts, _host)| ts.to_string())
-        .unwrap_or_else(|| head.to_string());
-    Some((Some(timestamp), text.to_string()))
+        .map(|(ts, _host)| ts.trim().to_string())
+        .unwrap_or_else(|| head.trim().to_string());
+    let monotonic_s = timestamp
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim()
+        .parse()
+        .ok();
+    Some((Some(timestamp), monotonic_s, text.to_string()))
 }
 
 fn read_dmesg() -> Result<Vec<Line>, String> {
@@ -220,14 +236,18 @@ fn parse_dmesg_line(line: &str) -> Option<Line> {
             if text.is_empty() {
                 return None;
             }
-            return Some((Some(format!("[{}]", ts.trim())), text.to_string()));
+            return Some((
+                Some(format!("[{}]", ts.trim())),
+                ts.trim().parse().ok(),
+                text.to_string(),
+            ));
         }
     }
     let t = line.trim();
     if t.is_empty() {
         None
     } else {
-        Some((None, t.to_string()))
+        Some((None, None, t.to_string()))
     }
 }
 
@@ -246,10 +266,11 @@ fn is_usb_related(text: &str) -> bool {
 }
 
 /// Map a message to an event kind and the device it concerns.
-fn classify(text: &str) -> (EventKind, Option<String>) {
+fn classify(text: &str) -> (EventKind, Option<String>, Option<String>) {
     let lower = text.to_ascii_lowercase();
     let (prefix, _) = text.split_once(": ").unwrap_or((text, ""));
     let device = extract_device(prefix);
+    let port = extract_port(prefix);
 
     // Order matters: the kernel's explicit cable blame wins over everything, and
     // enumeration failures are checked before resets because a failing
@@ -302,7 +323,7 @@ fn classify(text: &str) -> (EventKind, Option<String>) {
         EventKind::Other
     };
 
-    (kind, device)
+    (kind, device, port)
 }
 
 /// Pull a normalized USB device path out of a message prefix.
@@ -336,6 +357,15 @@ fn extract_device(prefix: &str) -> Option<String> {
         return Some(format!("usb{bus}"));
     }
     Some(token.to_string())
+}
+
+/// The hub port a message names, e.g. `usb usb6-port1: ...` -> `usb6-port1`.
+///
+/// Kept alongside the normalized device because a port is a *location* that
+/// outlives its occupants, and staleness can only be judged per location.
+fn extract_port(prefix: &str) -> Option<String> {
+    let token = prefix.split_whitespace().last()?;
+    token.contains("-port").then(|| token.to_string())
 }
 
 /// Pull a negative errno out of a message: "..., error -110" -> `-110`.
@@ -378,8 +408,9 @@ mod tests {
     #[test]
     fn parses_kmsg_record() {
         let rec = "6,1234,98765432,-;usb 3-4: reset full-speed USB device number 2 using xhci_hcd\n";
-        let (ts, text) = parse_kmsg_record(rec).unwrap();
+        let (ts, mono, text) = parse_kmsg_record(rec).unwrap();
         assert_eq!(ts.as_deref(), Some("[    98.765432]"));
+        assert!((mono.unwrap() - 98.765432).abs() < 1e-6);
         assert!(text.starts_with("usb 3-4: reset"));
     }
 
@@ -388,9 +419,10 @@ mod tests {
     /// between the timestamp and `kernel:` — the parser has to drop it.
     #[test]
     fn parses_journal_line() {
-        let line = "Jul 31 22:52:14.531674 host-with-a-long-name kernel: usb 3-4: reset full-speed USB device number 2 using xhci_hcd";
-        let (ts, text) = parse_journal_line(line).unwrap();
-        assert_eq!(ts.as_deref(), Some("Jul 31 22:52:14.531674"));
+        let line = "[62786.165344] host-with-a-long-name kernel: usb 3-4: reset full-speed USB device number 2 using xhci_hcd";
+        let (ts, mono, text) = parse_journal_line(line).unwrap();
+        assert_eq!(ts.as_deref(), Some("[62786.165344]"));
+        assert!((mono.unwrap() - 62786.165344).abs() < 1e-6, "monotonic base is what dates events");
         assert_eq!(
             text,
             "usb 3-4: reset full-speed USB device number 2 using xhci_hcd"
@@ -399,8 +431,10 @@ mod tests {
 
     #[test]
     fn parses_dmesg_line() {
-        let (ts, text) = parse_dmesg_line("[   12.345678] usb 1-1: USB disconnect, device number 2").unwrap();
+        let (ts, mono, text) =
+            parse_dmesg_line("[   12.345678] usb 1-1: USB disconnect, device number 2").unwrap();
         assert_eq!(ts.as_deref(), Some("[12.345678]"));
+        assert!((mono.unwrap() - 12.345678).abs() < 1e-6);
         assert!(text.contains("USB disconnect"));
     }
 
@@ -417,7 +451,7 @@ mod tests {
 
     #[test]
     fn classifies_the_reset_storm_seen_on_this_machine() {
-        let (kind, dev) = classify("usb 3-4: reset full-speed USB device number 2 using xhci_hcd");
+        let (kind, dev, _port) = classify("usb 3-4: reset full-speed USB device number 2 using xhci_hcd");
         assert_eq!(kind, EventKind::DeviceReset);
         assert_eq!(dev.as_deref(), Some("3-4"));
         assert_eq!(severity_of(kind), Severity::Low);
@@ -425,14 +459,14 @@ mod tests {
 
     #[test]
     fn classifies_enumeration_failure_before_reset() {
-        let (kind, dev) = classify("usb 2-1: device descriptor read/64, error -71");
+        let (kind, dev, _port) = classify("usb 2-1: device descriptor read/64, error -71");
         assert_eq!(kind, EventKind::EnumerationFailure);
         assert_eq!(dev.as_deref(), Some("2-1"));
     }
 
     #[test]
     fn classifies_explicit_cable_blame() {
-        let (kind, _) = classify(
+        let (kind, _, _) = classify(
             "usb usb2-port1: Cannot enable. Maybe the USB cable is bad?",
         );
         assert_eq!(kind, EventKind::CableSuspect);
@@ -441,7 +475,7 @@ mod tests {
 
     #[test]
     fn classifies_host_controller_death() {
-        let (kind, dev) =
+        let (kind, dev, _port) =
             classify("xhci_hcd 0000:c4:00.4: xHCI host controller not responding, assume dead");
         assert_eq!(kind, EventKind::HostControllerFailure);
         assert_eq!(dev, None);
@@ -469,8 +503,8 @@ mod tests {
     #[test]
     fn unclassified_lines_are_dropped_by_default() {
         let lines = vec![
-            (None, "usb 3-4: SerialNumber: ABC123".to_string()),
-            (None, "usb 3-4: reset full-speed USB device number 2".to_string()),
+            (None, None, "usb 3-4: SerialNumber: ABC123".to_string()),
+            (None, None, "usb 3-4: reset full-speed USB device number 2".to_string()),
         ];
         let log = build(KernelLogSource::Dmesg, lines.clone(), Options::default(), None);
         assert_eq!(log.events.len(), 1);
@@ -490,7 +524,7 @@ mod tests {
     #[test]
     fn limit_keeps_the_newest_events() {
         let lines: Vec<Line> = (0..10)
-            .map(|i| (None, format!("usb 3-{i}: reset full-speed USB device number {i}")))
+            .map(|i| (None, None, format!("usb 3-{i}: reset full-speed USB device number {i}")))
             .collect();
         let log = build(
             KernelLogSource::Dmesg,
