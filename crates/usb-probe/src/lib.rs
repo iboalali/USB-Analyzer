@@ -32,6 +32,7 @@ pub mod kernel;
 pub mod model;
 pub mod pd;
 pub mod sysfs;
+pub mod thunderbolt;
 pub mod typec;
 pub mod usb;
 pub mod vdo;
@@ -79,6 +80,7 @@ pub fn capture(opts: Options) -> Snapshot {
         host: read_host(),
         buses: usb::read_buses(),
         ports,
+        thunderbolt: thunderbolt::read(),
         orphan_pd,
         kernel_log: kernel::collect(opts.kernel),
     }

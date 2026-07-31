@@ -37,6 +37,10 @@ pub fn read_i64(dir: impl AsRef<Path>, name: &str) -> Option<i64> {
     read_attr(dir, name)?.parse().ok()
 }
 
+pub fn read_u64(dir: impl AsRef<Path>, name: &str) -> Option<u64> {
+    read_attr(dir, name)?.parse().ok()
+}
+
 /// Hex without a `0x` prefix, as USB descriptors are exposed (`idVendor`).
 pub fn read_hex_u16(dir: impl AsRef<Path>, name: &str) -> Option<u16> {
     u16::from_str_radix(read_attr(dir, name)?.trim_start_matches("0x"), 16).ok()

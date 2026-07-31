@@ -82,6 +82,7 @@ Everything is read-only. Nothing requires root.
 | `/sys/bus/usb/devices/*` | Descriptors, the **negotiated** link speed, lane count, requested bus power, driver bindings |
 | `/sys/bus/usb/devices/*/*:*/​*-port*` | Per-port state, `connect_type`, and `over_current_count` — a hardware fault counter |
 | `/sys/class/typec/*` | Port roles, PD/Type-C revisions, alt modes, the attached partner, and the **cable e-marker** |
+| `/sys/bus/thunderbolt/*` | USB4/Thunderbolt routers, domain security, and **active-cable retimers** — a second, independent source of cable identity |
 | `/sys/class/usb_power_delivery/*` | PDO lists: what each side *advertises* it can supply or accept |
 | `/sys/class/power_supply/*` | The negotiated contract: `voltage_now` x `current_now` |
 | `/dev/kmsg`, else `journalctl -k`, else `dmesg` | Resets, enumeration failures, link-training failures, over-current |
@@ -215,7 +216,9 @@ failing hub controller, or a marginal port produce identical evidence.
 | `PD_SOURCE_BELOW_SINK_CAPABILITY` | measured | Charger smaller than the port can accept. |
 | `DP_ALTMODE_NOT_ACTIVE` | measured | DisplayPort advertised but not engaged. |
 | `PORT_OVER_CURRENT_COUNT` | measured | The port's current limiter actually fired. |
-| `DEVICE_RESET_STORM` | heuristic | Repeated resets — marginal connection. Downgraded for internal devices. |
+| `DEVICE_RESET_STORM` | heuristic / measured | Repeated resets. Becomes *measured* when runtime-PM accounting shows autosuspend is the cause. |
+| `ACTIVE_CABLE_PRESENT` | measured | Retimers enumerated — cable identity read from the cable's own silicon, independent of PD SOP'. |
+| `USB4_LINK_BELOW_CAPABILITY` | inferred | A generation-4 router running single-lane instead of 40 Gbps. |
 | `KERNEL_BLAMED_CABLE` | measured | The kernel logged its own bad-cable warning. |
 | `ENUMERATION_FAILURE` | measured | Descriptor reads failed or no address accepted. |
 | `LINK_TRAINING_FAILURE` | measured | A port could not bring its link up cleanly. |
@@ -227,7 +230,7 @@ failing hub controller, or a marginal port produce identical evidence.
 
 ```sh
 cargo build --release        # ./target/release/usbdiag
-cargo test                   # 102 tests
+cargo test                   # 109 tests
 ```
 
 No non-Rust dependencies. Dependencies are `serde` and `serde_json` only; sysfs

@@ -106,6 +106,15 @@ fn read_device(name: &str, link: &Path, real: &Path) -> UsbDevice {
         removable: fsx::read_attr(link, "removable"),
         authorized: fsx::read_flag(link, "authorized"),
 
+        urbnum: fsx::read_u64(link, "urbnum"),
+        // Runtime-PM accounting lives in a power/ subdirectory and is already
+        // in milliseconds.
+        active_duration_ms: fsx::read_u64(link.join("power"), "active_duration"),
+        connected_duration_ms: fsx::read_u64(link.join("power"), "connected_duration"),
+        runtime_suspended_ms: fsx::read_u64(link.join("power"), "runtime_suspended_time"),
+        power_control: fsx::read_attr(link.join("power"), "control"),
+        autosuspend_delay_ms: fsx::read_i64(link.join("power"), "autosuspend_delay_ms"),
+
         interfaces: read_interfaces(name, real),
         ports: read_hub_ports(name, real),
         children: Vec::new(),

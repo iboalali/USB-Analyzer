@@ -109,7 +109,10 @@ fn format_report(report: &Report, args: &Args) -> String {
     let mut out = String::new();
     render::header(&mut out, &report.snapshot, &theme);
     match args.command {
-        Command::Ports => render::ports(&mut out, &report.snapshot, &theme),
+        Command::Ports => {
+            render::ports(&mut out, &report.snapshot, &theme);
+            render::thunderbolt(&mut out, &report.snapshot, &theme);
+        }
         Command::Devices => render::devices(&mut out, &report.snapshot, &theme),
         Command::Diag => {
             render::findings(&mut out, report, &theme);
@@ -117,6 +120,7 @@ fn format_report(report: &Report, args: &Args) -> String {
         }
         Command::All | Command::Watch => {
             render::ports(&mut out, &report.snapshot, &theme);
+            render::thunderbolt(&mut out, &report.snapshot, &theme);
             render::devices(&mut out, &report.snapshot, &theme);
             render::findings(&mut out, report, &theme);
             render::summary(&mut out, report, &theme);

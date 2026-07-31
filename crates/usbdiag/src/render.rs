@@ -163,20 +163,37 @@ pub fn ports(out: &mut String, snap: &Snapshot, t: &Theme) {
             if !pt.alt_modes.is_empty() {
                 row(out, t, "partner modes", &alt_modes_line(&pt.alt_modes));
             }
+            // What the attached supply can actually deliver, with the profile
+            // currently in use marked. Shown unconditionally: when charging is
+            // the question, this is the answer.
             if let Some(pd) = &pt.pd {
                 if !pd.source_capabilities.is_empty() {
-                    row(out, t, "source caps", &pdo_line(&pd.source_capabilities));
+                    row(out, t, "charger max", &supply_headline(pd, t));
+                    for line in pdo_lines(&pd.source_capabilities, p.power_supply.as_ref(), t) {
+                        row(out, t, "", &line);
+                    }
                 }
             }
         }
-        if t.verbose {
-            if let Some(pd) = &p.local_pd {
-                if !pd.sink_capabilities.is_empty() {
-                    row(out, t, "accepts", &pdo_line(&pd.sink_capabilities));
-                }
-                if !pd.source_capabilities.is_empty() {
-                    row(out, t, "offers", &pdo_line(&pd.source_capabilities));
-                }
+        // The machine's own appetite, shown whenever something is attached so
+        // the two numbers can be compared side by side.
+        if let Some(pd) = &p.local_pd {
+            if p.is_attached() && !pd.sink_capabilities.is_empty() {
+                row(
+                    out,
+                    t,
+                    "this machine",
+                    &format!(
+                        "accepts up to {}   {}",
+                        pd.max_sink_power_mw()
+                            .map(watts)
+                            .unwrap_or_else(|| "?".into()),
+                        t.dim(&pdo_line(&pd.sink_capabilities))
+                    ),
+                );
+            }
+            if t.verbose && !pd.source_capabilities.is_empty() {
+                row(out, t, "offers", &pdo_line(&pd.source_capabilities));
             }
         }
         let _ = writeln!(out);
@@ -426,11 +443,143 @@ fn alt_modes_line(modes: &[AltMode]) -> String {
         .join(" · ")
 }
 
+/// One-line summary of what an attached supply can deliver.
+fn supply_headline(pd: &PowerDelivery, t: &Theme) -> String {
+    let max = pd
+        .max_source_power_mw()
+        .map(watts)
+        .unwrap_or_else(|| "unknown".into());
+    let fixed = pd
+        .source_capabilities
+        .iter()
+        .filter(|p| p.kind == PdoKind::FixedSupply)
+        .count();
+    let pps = pd
+        .source_capabilities
+        .iter()
+        .filter(|p| p.kind == PdoKind::ProgrammableSupply)
+        .count();
+    let mut s = t.bold(&max);
+    s.push_str(&t.dim(&format!("  ({fixed} fixed profile{}", plural(fixed))));
+    if pps > 0 {
+        s.push_str(&t.dim(&format!(", {pps} PPS range{}", plural(pps))));
+    }
+    s.push_str(&t.dim(")"));
+    s
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+/// Each profile the supply advertises, one per line, with the one currently in
+/// effect marked. Knowing *which* profile is active is the difference between
+/// "the charger can do 100 W" and "you are getting 100 W".
+fn pdo_lines(pdos: &[Pdo], contract: Option<&PortPowerSupply>, t: &Theme) -> Vec<String> {
+    let active = contract.and_then(|c| Some((c.contract_voltage_mv()?, c.contract_current_ma()?)));
+    pdos.iter()
+        .map(|p| {
+            let is_active = matches!(
+                (active, p.voltage_mv, p.current_ma),
+                (Some((av, ai)), Some(v), Some(i)) if av == v && ai == i
+            );
+            let desc = p.describe();
+            if is_active {
+                format!("{} {}", t.green(&format!("{desc:<34}")), t.green("← in use"))
+            } else {
+                format!("{}{desc}", t.dim("  "))
+            }
+        })
+        .collect()
+}
+
 fn pdo_line(pdos: &[Pdo]) -> String {
     pdos.iter()
         .map(|p| p.describe())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+// ---------------------------------------------------------------------------
+// USB4 / Thunderbolt
+// ---------------------------------------------------------------------------
+
+pub fn thunderbolt(out: &mut String, snap: &Snapshot, t: &Theme) {
+    let tb = &snap.thunderbolt;
+    if tb.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "{}", t.heading("usb4 / thunderbolt"));
+
+    for d in &tb.domains {
+        let mut parts = Vec::new();
+        if let Some(s) = &d.security {
+            parts.push(format!("security={s}"));
+        }
+        if d.iommu_dma_protection == Some(true) {
+            parts.push("IOMMU DMA protection".into());
+        }
+        let _ = writeln!(out, "  {} {}", t.bold(&d.name), t.dim(&parts.join("  ")));
+    }
+
+    for r in &tb.routers {
+        let role = if r.is_host { "host" } else { "device" };
+        let mut line = format!(
+            "  {} {}  {}",
+            t.bold(&r.name),
+            t.dim(role),
+            r.label()
+        );
+        if let Some(g) = r.generation {
+            line.push_str(&t.dim(&format!("  gen {g}")));
+        }
+        if let Some(v) = &r.usb4_version {
+            line.push_str(&t.dim(&format!("  USB4 {v}")));
+        }
+        if let (Some(tx), Some(rx)) = (&r.tx_speed, &r.rx_speed) {
+            line.push_str(&format!("  {}", t.green(&format!("tx {tx} / rx {rx}"))));
+        }
+        if let (Some(tx), Some(rx)) = (r.tx_lanes, r.rx_lanes) {
+            line.push_str(&t.dim(&format!("  lanes tx{tx}/rx{rx}")));
+        }
+        let _ = writeln!(out, "{line}");
+        if t.verbose && !r.usb4_ports.is_empty() {
+            let _ = writeln!(out, "      {}", t.dim(&r.usb4_ports.join(" ")));
+        }
+    }
+
+    // The headline: a retimer only exists inside an active cable, so this is
+    // cable identity read from the cable itself.
+    if tb.has_active_cable() {
+        for r in &tb.retimers {
+            let _ = writeln!(
+                out,
+                "  {} {}  {}",
+                t.bold("active cable"),
+                t.green(&format!(
+                    "firmware {}",
+                    r.nvm_version.as_deref().unwrap_or("?")
+                )),
+                t.dim(&format!(
+                    "{}  vendor {}  device {}",
+                    r.name,
+                    r.vendor.map(|v| format!("{v:04x}")).unwrap_or_else(|| "?".into()),
+                    r.device.map(|d| format!("{d:04x}")).unwrap_or_else(|| "?".into())
+                ))
+            );
+        }
+    } else if !tb.routers.is_empty() {
+        let _ = writeln!(
+            out,
+            "  {}",
+            t.dim("no retimers — nothing attached over an active cable")
+        );
+    }
+    let _ = writeln!(out);
 }
 
 // ---------------------------------------------------------------------------

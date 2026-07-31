@@ -22,6 +22,8 @@ pub struct Snapshot {
     /// Root hubs, each with its device tree in `children`.
     pub buses: Vec<UsbDevice>,
     pub ports: Vec<TypecPort>,
+    /// USB4 / Thunderbolt routers and active-cable retimers.
+    pub thunderbolt: ThunderboltTopology,
     /// PD objects not reachable from a port (kept so nothing is silently dropped).
     pub orphan_pd: Vec<PowerDelivery>,
     pub kernel_log: KernelLog,
@@ -91,6 +93,18 @@ pub struct UsbDevice {
     pub max_children: Option<u32>,
     pub removable: Option<String>,
     pub authorized: Option<bool>,
+
+    /// Cumulative URBs submitted to this device — a rough activity level.
+    pub urbnum: Option<u64>,
+    /// Runtime-PM accounting, in milliseconds. The ratio between these is what
+    /// distinguishes a device being cycled by power management from one whose
+    /// link is genuinely marginal.
+    pub active_duration_ms: Option<u64>,
+    pub connected_duration_ms: Option<u64>,
+    pub runtime_suspended_ms: Option<u64>,
+    /// `auto` (runtime PM may suspend it) or `on` (kept awake).
+    pub power_control: Option<String>,
+    pub autosuspend_delay_ms: Option<i64>,
 
     pub interfaces: Vec<UsbInterface>,
     /// Downstream ports, for hubs and root hubs. Carries the per-port
@@ -165,6 +179,24 @@ impl UsbDevice {
     /// cable exists is the safer error.
     pub fn is_internal(&self) -> bool {
         self.removable.as_deref() == Some("fixed")
+    }
+
+    /// Fraction of connected time spent runtime-suspended, 0.0..=1.0.
+    pub fn suspend_ratio(&self) -> Option<f64> {
+        let connected = self.connected_duration_ms.filter(|c| *c > 0)? as f64;
+        Some((self.runtime_suspended_ms? as f64 / connected).clamp(0.0, 1.0))
+    }
+
+    /// True when runtime power management is free to suspend this device and is
+    /// in fact doing so nearly all the time.
+    ///
+    /// This is what separates a reset storm caused by power management from one
+    /// caused by a bad connection. A device suspended 99% of its connected life
+    /// with a short autosuspend delay is *expected* to log resets on every wake;
+    /// a device that never suspends and still resets has a real problem.
+    pub fn autosuspend_churn(&self) -> bool {
+        self.power_control.as_deref() == Some("auto")
+            && self.suspend_ratio().is_some_and(|r| r > 0.9)
     }
 }
 
@@ -801,6 +833,94 @@ impl PortPowerSupply {
     pub fn contract_requires_5a_cable(&self) -> bool {
         self.contract_current_ma().is_some_and(|i| i > 3000)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Thunderbolt / USB4
+// ---------------------------------------------------------------------------
+
+/// USB4 and Thunderbolt state from `/sys/bus/thunderbolt`.
+///
+/// A second cable-information path, independent of `/sys/class/typec`. Where a
+/// PD e-marker is often withheld by platform firmware, retimers are enumerated
+/// by the kernel directly — so on some hardware this is the only working source
+/// of genuine cable identity.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ThunderboltTopology {
+    pub domains: Vec<ThunderboltDomain>,
+    pub routers: Vec<ThunderboltRouter>,
+    /// Retimers are the signal-conditioning silicon inside an **active** cable.
+    pub retimers: Vec<Retimer>,
+}
+
+impl ThunderboltTopology {
+    pub fn is_empty(&self) -> bool {
+        self.domains.is_empty() && self.routers.is_empty() && self.retimers.is_empty()
+    }
+
+    /// True when an active cable is attached: retimers only exist inside one.
+    pub fn has_active_cable(&self) -> bool {
+        !self.retimers.is_empty()
+    }
+
+    /// Routers other than the host — i.e. attached devices.
+    pub fn attached(&self) -> impl Iterator<Item = &ThunderboltRouter> {
+        self.routers.iter().filter(|r| !r.is_host)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThunderboltDomain {
+    pub name: String,
+    /// `none` | `user` | `secure` | `dponly` | `usbonly` — the authorization
+    /// policy for attached devices.
+    pub security: Option<String>,
+    pub iommu_dma_protection: Option<bool>,
+    pub deauthorization: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThunderboltRouter {
+    /// e.g. `0-0` for a host router, `0-1` for the first attached device.
+    pub name: String,
+    pub is_host: bool,
+    /// Thunderbolt/USB4 generation: 3 = TB3/USB4 20G, 4 = TB4/USB4 40G.
+    pub generation: Option<u32>,
+    pub usb4_version: Option<String>,
+    pub vendor_name: Option<String>,
+    pub device_name: Option<String>,
+    pub unique_id: Option<String>,
+    pub authorized: Option<bool>,
+    pub rx_speed: Option<String>,
+    pub tx_speed: Option<String>,
+    pub rx_lanes: Option<u32>,
+    pub tx_lanes: Option<u32>,
+    pub nvm_version: Option<String>,
+    pub usb4_ports: Vec<String>,
+}
+
+impl ThunderboltRouter {
+    pub fn label(&self) -> String {
+        match (&self.vendor_name, &self.device_name) {
+            (Some(v), Some(d)) => format!("{v} {d}"),
+            (None, Some(d)) => d.clone(),
+            (Some(v), None) => v.clone(),
+            _ if self.is_host => "host router".to_string(),
+            _ => self.name.clone(),
+        }
+    }
+}
+
+/// Active-cable silicon. Its NVM version is the cable's own firmware version —
+/// the same value macOS surfaces as "Cable Firmware Version".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Retimer {
+    /// `<domain>-<route>:<port>.<index>`, e.g. `0-0:1.1`.
+    pub name: String,
+    pub vendor: Option<u16>,
+    pub device: Option<u16>,
+    pub nvm_version: Option<String>,
+    pub nvm_authenticate: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

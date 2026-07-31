@@ -21,6 +21,7 @@ pub fn empty_snapshot() -> Snapshot {
         },
         buses: Vec::new(),
         ports: Vec::new(),
+        thunderbolt: ThunderboltTopology::default(),
         orphan_pd: Vec::new(),
         kernel_log: KernelLog {
             source: KernelLogSource::Journalctl,
@@ -67,10 +68,39 @@ pub fn device(name: &str, version: &str, mbps: f64, parent: Option<&str>) -> Usb
         max_children: Some(0),
         removable: Some("removable".into()),
         authorized: Some(true),
+        // Runtime-PM accounting absent by default; with_runtime_pm() adds it.
+        urbnum: None,
+        active_duration_ms: None,
+        connected_duration_ms: None,
+        runtime_suspended_ms: None,
+        power_control: None,
+        autosuspend_delay_ms: None,
         interfaces: Vec::new(),
         ports: Vec::new(),
         children: Vec::new(),
     }
+}
+
+/// Attach runtime-PM accounting to a device.
+///
+/// Real values from a Goodix fingerprint reader: active 72 s of 12.3 h
+/// connected, 99.8% suspended, `control=auto`, 2000 ms delay — which is what
+/// manufactures its 21 "reset" log lines. Its Bluetooth neighbour, `control=on`
+/// and never suspended, logs none.
+pub fn with_runtime_pm(
+    mut d: UsbDevice,
+    control: &str,
+    suspended_fraction: f64,
+    delay_ms: i64,
+) -> UsbDevice {
+    let connected_ms = 44_392_551u64;
+    d.connected_duration_ms = Some(connected_ms);
+    d.runtime_suspended_ms = Some((connected_ms as f64 * suspended_fraction) as u64);
+    d.active_duration_ms = Some((connected_ms as f64 * (1.0 - suspended_fraction)) as u64);
+    d.power_control = Some(control.to_string());
+    d.autosuspend_delay_ms = Some(delay_ms);
+    d.urbnum = Some(567);
+    d
 }
 
 pub fn hub_port(name: &str, over_current_count: u32) -> HubPort {

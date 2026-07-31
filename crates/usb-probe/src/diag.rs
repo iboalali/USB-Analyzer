@@ -44,6 +44,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Finding> {
     ss_half_idle_rules(snap, &mut f);
     phantom_device_rules(snap, &mut f);
     billboard_rules(snap, &mut f);
+    thunderbolt_rules(snap, &mut f);
     hub_port_rules(snap, &mut f);
 
     // One physical fault should read as one finding. Without this, a single
@@ -767,12 +768,32 @@ fn kernel_history_rules(snap: &Snapshot, dev: &UsbDevice, out: &mut Vec<Finding>
         .filter(|e| e.kind == EventKind::DeviceReset)
         .count();
     if resets >= RESET_WARN {
-        // An internal device has no cable to blame, and its resets are usually
-        // just runtime power management cycling it. Reporting those at High
-        // would drown out the cases that matter.
-        let (severity, detail, suggestion) = if dev.is_internal() {
+        // Runtime power management explains most reset storms outright, and the
+        // accounting proves it rather than assuming it. A device suspended
+        // ~all of its connected life logs a reset on every wake; that is the
+        // designed behaviour, not a fault.
+        let (severity, confidence, detail, suggestion) = if dev.autosuspend_churn() {
+            let pct = dev.suspend_ratio().unwrap_or(0.0) * 100.0;
             (
                 Severity::Low,
+                Confidence::Measured,
+                format!(
+                    "Runtime power management accounts for this. The device has runtime PM \
+                     enabled and has spent {pct:.1}% of its connected life suspended, with a \
+                     {} ms autosuspend delay — so it is woken and re-suspended constantly, and \
+                     each wake logs a reset. This is the designed behaviour, not a bad connection.",
+                    dev.autosuspend_delay_ms.unwrap_or(0)
+                ),
+                Some(
+                    "Nothing to fix unless the device actually misbehaves. If it does, raise its \
+                     autosuspend delay or set power/control to 'on' — the cable is not involved."
+                        .to_string(),
+                ),
+            )
+        } else if dev.is_internal() {
+            (
+                Severity::Low,
+                Confidence::Heuristic,
                 "This is an internal device (`removable = fixed`), so no cable or connector is \
                  involved. Repeated resets on internal devices are usually runtime power \
                  management suspending and resuming them, which is normal."
@@ -790,6 +811,7 @@ fn kernel_history_rules(snap: &Snapshot, dev: &UsbDevice, out: &mut Vec<Finding>
                 } else {
                     Severity::Medium
                 },
+                Confidence::Heuristic,
                 "Repeated resets on a device that otherwise works are the classic signature of a \
                  marginal connection: the link drops, the kernel recovers it, and the cycle \
                  repeats. A worn cable, a loose plug, or aggressive autosuspend on a device that \
@@ -805,7 +827,7 @@ fn kernel_history_rules(snap: &Snapshot, dev: &UsbDevice, out: &mut Vec<Finding>
         out.push(Finding {
             code: "DEVICE_RESET_STORM".into(),
             severity,
-            confidence: Confidence::Heuristic,
+            confidence,
             subject: Subject::Device(dev.sysfs_name.clone()),
             title: format!("{} was reset {resets} times this boot", dev.label()),
             detail,
@@ -823,6 +845,15 @@ fn kernel_history_rules(snap: &Snapshot, dev: &UsbDevice, out: &mut Vec<Finding>
                     .trim()
                     .to_string()
                 })
+                .chain(dev.suspend_ratio().map(|r| {
+                    format!(
+                        "runtime PM: control={}, suspended {:.1}% of {} s connected, {} urbs",
+                        dev.power_control.as_deref().unwrap_or("?"),
+                        r * 100.0,
+                        dev.connected_duration_ms.unwrap_or(0) / 1000,
+                        dev.urbnum.unwrap_or(0)
+                    )
+                }))
                 .collect(),
             suggestion,
         });
@@ -1382,6 +1413,95 @@ fn billboard_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
     }
 }
 
+/// USB4 / Thunderbolt findings, including the one form of cable identity that
+/// works on platforms whose firmware never reports a PD e-marker.
+fn thunderbolt_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
+    let tb = &snap.thunderbolt;
+
+    // Retimers exist only inside an active cable, so their presence *is* the
+    // identification — no inference required.
+    if tb.has_active_cable() {
+        let mut evidence: Vec<String> = tb
+            .retimers
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}: vendor {} device {} firmware {}",
+                    r.name,
+                    r.vendor.map(|v| format!("{v:04x}")).unwrap_or_else(|| "?".into()),
+                    r.device.map(|d| format!("{d:04x}")).unwrap_or_else(|| "?".into()),
+                    r.nvm_version.as_deref().unwrap_or("?")
+                )
+            })
+            .collect();
+        evidence.push(
+            "retimers are the signal-conditioning silicon inside an active cable".into(),
+        );
+        out.push(Finding {
+            code: "ACTIVE_CABLE_PRESENT".into(),
+            severity: Severity::Info,
+            confidence: Confidence::Measured,
+            subject: Subject::Cable("thunderbolt".into()),
+            title: format!(
+                "Active cable detected — {} retimer(s), firmware {}",
+                tb.retimers.len(),
+                tb.retimers
+                    .iter()
+                    .find_map(|r| r.nvm_version.clone())
+                    .unwrap_or_else(|| "unknown".into())
+            ),
+            detail: "The kernel enumerated retimers on this link. Retimers only exist inside \
+                     active cables, which are required to be e-marked, so this is genuine cable \
+                     identity read from the cable's own silicon rather than inferred. This path \
+                     is independent of PD SOP', so it works even where platform firmware never \
+                     reports a cable e-marker."
+                .into(),
+            evidence,
+            suggestion: None,
+        });
+    }
+
+    // A generation-4 router is capable of 40 Gbps; report when it links slower.
+    for r in tb.attached() {
+        let gen = r.generation.unwrap_or(0);
+        let lanes_short = r.tx_lanes == Some(1);
+        if gen >= 4 && lanes_short {
+            out.push(Finding {
+                code: "USB4_LINK_BELOW_CAPABILITY".into(),
+                severity: Severity::Medium,
+                confidence: Confidence::Inferred,
+                subject: Subject::Device(r.name.clone()),
+                title: format!(
+                    "{} is a generation {gen} router but linked with one lane",
+                    r.label()
+                ),
+                detail: "A generation 4 router supports 40 Gbps over two lanes. Running on one \
+                         lane halves the available bandwidth, and the usual cause is a cable that \
+                         is not rated for the full link — Thunderbolt 4 and USB4 40 Gbps need a \
+                         certified cable, and passive ones are only rated to 0.8 m."
+                    .into(),
+                evidence: vec![
+                    format!(
+                        "tx_lanes={} rx_lanes={}",
+                        r.tx_lanes.unwrap_or(0),
+                        r.rx_lanes.unwrap_or(0)
+                    ),
+                    format!(
+                        "rx {} / tx {}",
+                        r.rx_speed.as_deref().unwrap_or("?"),
+                        r.tx_speed.as_deref().unwrap_or("?")
+                    ),
+                ],
+                suggestion: Some(
+                    "Use a certified Thunderbolt 4 or USB4 40 Gbps cable, keeping passive cables \
+                     under 0.8 m."
+                        .into(),
+                ),
+            });
+        }
+    }
+}
+
 fn hub_port_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
     for dev in snap.devices() {
         for p in &dev.ports {
@@ -1632,6 +1752,101 @@ mod tests {
             .unwrap();
         assert_eq!(hit.severity, Severity::Low);
         assert!(hit.detail.contains("no cable to swap"));
+    }
+
+    /// Runtime PM accounting turns the reset heuristic into a measurement. The
+    /// real Goodix reader: 21 resets, suspended 99.8% of 12.3 h, control=auto.
+    #[test]
+    fn autosuspend_churn_explains_a_reset_storm_as_measured() {
+        let mut snap = empty_snapshot();
+        let mut hub = root_hub("usb3", 480.0);
+        let dev = with_runtime_pm(
+            device("3-4", " 2.00", 12.0, Some("usb3")),
+            "auto",
+            0.998,
+            2000,
+        );
+        hub.children.push(dev);
+        snap.buses.push(hub);
+        snap.kernel_log = reset_log("3-4", 21);
+
+        let hit = analyze(&snap)
+            .into_iter()
+            .find(|x| x.code == "DEVICE_RESET_STORM")
+            .unwrap();
+        assert_eq!(hit.severity, Severity::Low);
+        assert_eq!(
+            hit.confidence,
+            Confidence::Measured,
+            "the accounting proves the cause rather than guessing it"
+        );
+        assert!(hit.detail.contains("99.8%"));
+        assert!(hit.detail.contains("2000 ms"));
+        assert!(hit.evidence.iter().any(|e| e.contains("control=auto")));
+    }
+
+    /// The genuinely suspicious case: power management is ruled out by the same
+    /// accounting, so frequent resets stay a real problem.
+    #[test]
+    fn resets_without_autosuspend_remain_suspicious() {
+        let mut snap = empty_snapshot();
+        let mut hub = root_hub("usb3", 480.0);
+        // control=on and never suspended, like the Bluetooth radio.
+        let dev = with_runtime_pm(
+            device("3-9", " 2.10", 480.0, Some("usb3")),
+            "on",
+            0.0,
+            2000,
+        );
+        hub.children.push(dev);
+        snap.buses.push(hub);
+        snap.kernel_log = reset_log("3-9", 21);
+
+        let hit = analyze(&snap)
+            .into_iter()
+            .find(|x| x.code == "DEVICE_RESET_STORM")
+            .unwrap();
+        assert_eq!(hit.severity, Severity::High);
+        assert!(hit.detail.contains("marginal connection"));
+    }
+
+    /// An internal device that also churns should report the churn, which is the
+    /// specific measured cause, rather than the generic internal-device note.
+    #[test]
+    fn measured_churn_outranks_the_internal_device_heuristic() {
+        let mut snap = empty_snapshot();
+        let mut hub = root_hub("usb3", 480.0);
+        let mut dev = with_runtime_pm(
+            device("3-4", " 2.00", 12.0, Some("usb3")),
+            "auto",
+            0.998,
+            2000,
+        );
+        dev.removable = Some("fixed".into());
+        hub.children.push(dev);
+        snap.buses.push(hub);
+        snap.kernel_log = reset_log("3-4", 21);
+
+        let hit = analyze(&snap)
+            .into_iter()
+            .find(|x| x.code == "DEVICE_RESET_STORM")
+            .unwrap();
+        assert_eq!(hit.confidence, Confidence::Measured);
+        assert!(hit.detail.contains("Runtime power management accounts for this"));
+    }
+
+    #[test]
+    fn suspend_ratio_handles_missing_and_zero_values() {
+        let d = device("3-1", " 2.00", 480.0, None);
+        assert!(d.suspend_ratio().is_none(), "no accounting read");
+        assert!(!d.autosuspend_churn());
+
+        let mut d = with_runtime_pm(device("3-1", " 2.00", 480.0, None), "auto", 0.5, 2000);
+        assert!((d.suspend_ratio().unwrap() - 0.5).abs() < 0.01);
+        assert!(!d.autosuspend_churn(), "50% is not churn");
+
+        d.connected_duration_ms = Some(0);
+        assert!(d.suspend_ratio().is_none(), "must not divide by zero");
     }
 
     #[test]
