@@ -860,17 +860,23 @@ pub struct KernelEvent {
     pub errno: Option<i32>,
 }
 
-impl KernelEvent {
-    /// Bus name owning this event's device: `6-1` -> `usb6`, `usb6` -> `usb6`.
-    pub fn bus(&self) -> Option<String> {
-        let d = self.device.as_deref()?;
-        if let Some(rest) = d.strip_prefix("usb") {
-            return rest.chars().all(|c| c.is_ascii_digit()).then(|| d.to_string());
-        }
-        let num = d.split('-').next()?;
-        num.chars()
+/// Bus owning a USB device path: `6-1` -> `usb6`, `usb6` -> `usb6`.
+pub fn bus_of(device: &str) -> Option<String> {
+    if let Some(rest) = device.strip_prefix("usb") {
+        return rest
+            .chars()
             .all(|c| c.is_ascii_digit())
-            .then(|| format!("usb{num}"))
+            .then(|| device.to_string());
+    }
+    let num = device.split('-').next()?;
+    (!num.is_empty() && num.chars().all(|c| c.is_ascii_digit()))
+        .then(|| format!("usb{num}"))
+}
+
+impl KernelEvent {
+    /// Bus name owning this event's device.
+    pub fn bus(&self) -> Option<String> {
+        bus_of(self.device.as_deref()?)
     }
 
     /// True when this line reports a SuperSpeed link training successfully.

@@ -10,7 +10,7 @@
 //! Findings carry a [`Confidence`] so a UI can distinguish a register read from
 //! a symptom match, and they always carry the readings they rest on.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::model::*;
 use crate::vdo;
@@ -40,11 +40,28 @@ pub fn analyze(snap: &Snapshot) -> Vec<Finding> {
     for dev in snap.devices() {
         device_rules(snap, dev, &mut f);
     }
-    ss_half_failed_rules(snap, &mut f);
+    let ss_failed_buses = ss_half_failed_rules(snap, &mut f);
     ss_half_idle_rules(snap, &mut f);
     phantom_device_rules(snap, &mut f);
     billboard_rules(snap, &mut f);
     hub_port_rules(snap, &mut f);
+
+    // One physical fault should read as one finding. Without this, a single
+    // loose cable produced four — three of them High, two giving contradictory
+    // advice about whether to replace a cable that may be captive.
+    if !ss_failed_buses.is_empty() {
+        f.retain(|x| {
+            if !SUPERSEDED_BY_SS_HALF_FAILED.contains(&x.code.as_str()) {
+                return true;
+            }
+            match &x.subject {
+                Subject::Device(d) => {
+                    bus_of(d).is_none_or(|b| !ss_failed_buses.contains(&b))
+                }
+                _ => true,
+            }
+        });
+    }
 
     // Strongest first, then by confidence, then stable by code for determinism.
     f.sort_by(|a, b| {
@@ -623,9 +640,16 @@ fn device_rules(snap: &Snapshot, dev: &UsbDevice, out: &mut Vec<Finding>) {
 fn link_speed_rules(snap: &Snapshot, dev: &UsbDevice, out: &mut Vec<Finding>) {
     if !(dev.claims_superspeed() && dev.linked_below_superspeed()) {
         // Not a downshift. Check the narrower dual-lane case instead.
+        // Gen 2x2 needs device, host, port and cable to support it together and
+        // is genuinely rare, so single-lane at 10 Gbps is the normal case, not a
+        // problem. Hubs in particular are almost never dual-lane — reporting
+        // every USB 3.1 hub as "single-lane" is pure noise. Restrict to devices
+        // where two lanes are plausible and the payoff would be real.
         if dev.usb_version_num.is_some_and(|v| v >= 3.2)
             && dev.tx_lanes == Some(1)
             && dev.speed.as_ref().is_some_and(|s| s.mbps <= 10_000.0)
+            && !dev.has_interface_class(CLASS_HUB)
+            && dev.has_interface_class(CLASS_MASS_STORAGE)
         {
             out.push(Finding {
                 code: "LINK_SINGLE_LANE".into(),
@@ -848,6 +872,8 @@ fn kernel_history_rules(snap: &Snapshot, dev: &UsbDevice, out: &mut Vec<Finding>
 const CLASS_MASS_STORAGE: u8 = 0x08;
 /// USB Billboard class code — a device announcing a failed Alternate Mode.
 const CLASS_BILLBOARD: u8 = 0x11;
+/// USB hub class code.
+const CLASS_HUB: u8 = 0x09;
 
 /// A downstream port together with the hub it belongs to.
 struct PortSite<'a> {
@@ -1043,7 +1069,9 @@ fn ss_errors_on<'a>(snap: &'a Snapshot, hub_name: &str) -> Vec<&'a KernelEvent> 
 ///   likely **defective**
 /// * never trained at all — the path has no SuperSpeed wiring, so it is simply
 ///   the **wrong cable** and nothing is broken
-fn ss_half_failed_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
+fn ss_half_failed_rules(snap: &Snapshot, out: &mut Vec<Finding>) -> BTreeSet<String> {
+    let mut covered = BTreeSet::new();
+
     for rec in receptacles(snap) {
         let errors = ss_errors_on(snap, rec.fast.hub_name);
         if errors.is_empty() {
@@ -1064,6 +1092,16 @@ fn ss_half_failed_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
             .iter()
             .any(|e| e.is_superspeed_train() && e.bus().as_deref() == Some(rec.fast.hub_name));
         let gave_up = rec.fast.port.state.as_deref() == Some("not attached");
+        // Did the SuperSpeed half come back? An intermittent fault is most
+        // dangerous exactly when it currently looks fine, so this is reported —
+        // but the tense has to be honest about it.
+        let up_now = rec
+            .fast
+            .port
+            .child
+            .as_deref()
+            .and_then(|c| snap.device(c))
+            .map(|d| (d.sysfs_name.clone(), d.label(), d.speed.as_ref().map(|s| s.short())));
 
         let (verdict, detail, suggestion) = if trained {
             (
@@ -1129,22 +1167,70 @@ fn ss_half_failed_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
             }
         }
 
+        // Tense matters: claiming a link is down while it is carrying traffic
+        // would discredit everything else the tool says.
+        let (title, mut detail) = match &up_now {
+            Some((name, label, speed)) => {
+                evidence.push(format!(
+                    "SuperSpeed is up right now: {name} is {label} at {}",
+                    speed.clone().unwrap_or_else(|| "?".into())
+                ));
+                (
+                    format!(
+                        "SuperSpeed at the {} socket is up now, but failed {} times earlier this \
+                         boot — intermittent",
+                        rec.where_is(),
+                        errors.len()
+                    ),
+                    format!(
+                        "The link is working at this moment, which is what makes this worth \
+                         reporting: an intermittent fault is most misleading exactly when it looks \
+                         fine. {detail}"
+                    ),
+                )
+            }
+            None => (
+                format!(
+                    "SuperSpeed failed at the {} socket — {}",
+                    rec.where_is(),
+                    verdict
+                ),
+                detail.to_string(),
+            ),
+        };
+
+        // Absorb the narrower findings for this bus so one fault reads as one
+        // finding rather than three with conflicting advice.
+        covered.insert(rec.fast.hub_name.to_string());
+        detail.push_str(
+            "\n\nThis supersedes the individual kernel-log findings for this bus, which describe \
+             the same fault one message at a time.",
+        );
+
         out.push(Finding {
             code: "SS_HALF_FAILED".into(),
             severity: Severity::High,
             confidence: Confidence::Inferred,
             subject: Subject::Cable(rec.where_is()),
-            title: format!(
-                "SuperSpeed failed at the {} socket — {}",
-                rec.where_is(),
-                verdict
-            ),
-            detail: detail.into(),
+            title,
+            detail,
             evidence,
             suggestion: Some(suggestion.into()),
         });
     }
+
+    covered
 }
+
+/// Findings that [`ss_half_failed_rules`] supersedes: each describes one message
+/// from the same underlying fault, and two of them give advice that contradicts
+/// the combined diagnosis.
+const SUPERSEDED_BY_SS_HALF_FAILED: [&str; 4] = [
+    "KERNEL_BLAMED_CABLE",
+    "ENUMERATION_FAILURE",
+    "DEVICE_FAILED_TO_ENUMERATE",
+    "LINK_TRAINING_FAILURE",
+];
 
 /// Findings for devices that appear only in the kernel log, never in sysfs.
 ///
@@ -1979,13 +2065,12 @@ mod tests {
 
     /// The structural bug: rules iterate devices in the tree, so a device that
     /// failed to enumerate was skipped — the only case the rule applies to.
+    /// Nothing on the USB 2.0 half, so SS_HALF_FAILED stays out of the way and
+    /// the phantom rule is exercised alone.
     #[test]
     fn reports_a_device_that_never_reached_sysfs() {
         let mut snap = empty_snapshot();
-        let (slow, fast) = receptacle("0x80000001", Some("5-1"), None);
-        let mut slow = slow;
-        slow.children
-            .push(device_with_class("5-1", " 2.10", 480.0, Some("usb5"), 0x09));
+        let (slow, fast) = receptacle("0x80000001", None, None);
         snap.buses.push(slow);
         snap.buses.push(fast);
         snap.kernel_log.events = ss_uplink_failure_events(6, 3, true);
@@ -1996,13 +2081,121 @@ mod tests {
             .expect("6-1 is in the log but not the tree");
         assert_eq!(hit.severity, Severity::High);
         assert_eq!(hit.subject, Subject::Device("6-1".into()));
-        // Must locate it physically and say what else shares the socket.
+        // Must locate it physically rather than print a bare device path.
         assert!(
             hit.title.contains("SuperSpeed half"),
             "bare device paths are not actionable: {}",
             hit.title
         );
         assert!(hit.evidence.iter().any(|e| e.contains("ETIMEDOUT")));
+    }
+
+    /// One physical fault must read as one finding. On real hardware a single
+    /// loose hub cable produced four — three High — with two of them giving
+    /// advice that contradicted the combined diagnosis.
+    #[test]
+    fn ss_half_failed_absorbs_the_narrower_findings_for_its_bus() {
+        let mut snap = empty_snapshot();
+        let (mut slow, fast) = receptacle("0x80000001", Some("5-1"), None);
+        slow.children
+            .push(device_with_class("5-1", " 2.10", 480.0, Some("usb5"), 0x09));
+        snap.buses.push(slow);
+        snap.buses.push(fast);
+        snap.kernel_log.events = ss_uplink_failure_events(6, 85, true);
+
+        let f = analyze(&snap);
+        assert!(codes(&f).contains(&"SS_HALF_FAILED"));
+        for absorbed in [
+            "KERNEL_BLAMED_CABLE",
+            "ENUMERATION_FAILURE",
+            "DEVICE_FAILED_TO_ENUMERATE",
+        ] {
+            assert!(
+                !codes(&f).contains(&absorbed),
+                "{absorbed} duplicates SS_HALF_FAILED for the same bus"
+            );
+        }
+        assert_eq!(
+            f.iter().filter(|x| x.severity >= Severity::High).count(),
+            1,
+            "one fault, one High finding: {:?}",
+            codes(&f)
+        );
+    }
+
+    /// Absorption is scoped to the affected bus — an unrelated fault elsewhere
+    /// must still be reported.
+    #[test]
+    fn absorption_does_not_swallow_other_buses() {
+        let mut snap = empty_snapshot();
+        let (mut slow, fast) = receptacle("0x80000001", Some("5-1"), None);
+        slow.children
+            .push(device_with_class("5-1", " 2.10", 480.0, Some("usb5"), 0x09));
+        snap.buses.push(slow);
+        snap.buses.push(fast);
+
+        let mut other = root_hub("usb3", 480.0);
+        other
+            .children
+            .push(device("3-4", " 2.00", 12.0, Some("usb3")));
+        snap.buses.push(other);
+
+        snap.kernel_log.events = ss_uplink_failure_events(6, 85, true);
+        snap.kernel_log.events.push(KernelEvent {
+            kind: EventKind::EnumerationFailure,
+            severity: Severity::High,
+            device: Some("3-4".into()),
+            errno: Some(-71),
+            timestamp: None,
+            text: "usb 3-4: device descriptor read/64, error -71".into(),
+        });
+
+        let f = analyze(&snap);
+        assert!(codes(&f).contains(&"SS_HALF_FAILED"));
+        assert!(
+            codes(&f).contains(&"ENUMERATION_FAILURE"),
+            "bus 3's fault is unrelated and must survive"
+        );
+    }
+
+    /// An intermittent link that is currently up is the most valuable thing the
+    /// tool can report — but it must not claim the link is down.
+    #[test]
+    fn an_intermittent_link_that_recovered_is_described_in_the_right_tense() {
+        let mut snap = empty_snapshot();
+        let (mut slow, mut fast) = receptacle("0x80000001", Some("5-1"), Some("6-1"));
+        slow.children
+            .push(device_with_class("5-1", " 2.10", 480.0, Some("usb5"), 0x09));
+        // The SuperSpeed half came back up, as the real hub did on reconnection.
+        fast.children
+            .push(device_with_class("6-1", " 3.20", 10_000.0, Some("usb6"), 0x09));
+        snap.buses.push(slow);
+        snap.buses.push(fast);
+        snap.kernel_log.events = ss_uplink_failure_events(6, 85, true);
+
+        let hit = analyze(&snap)
+            .into_iter()
+            .find(|x| x.code == "SS_HALF_FAILED")
+            .unwrap();
+        assert!(
+            hit.title.contains("up now") && hit.title.contains("intermittent"),
+            "must not claim a working link is down: {}",
+            hit.title
+        );
+        assert!(hit.title.contains("86 times"));
+        assert!(hit.evidence.iter().any(|e| e.contains("up right now")));
+    }
+
+    /// A single-lane USB 3.1 hub at 10 Gbps is entirely normal; Gen 2x2 needs
+    /// device, host, port and cable together and is rare.
+    #[test]
+    fn single_lane_hubs_are_not_reported() {
+        let mut snap = empty_snapshot();
+        let mut bus = root_hub("usb6", 10_000.0);
+        bus.children
+            .push(device_with_class("6-1", " 3.20", 10_000.0, Some("usb6"), 0x09));
+        snap.buses.push(bus);
+        assert!(!codes(&analyze(&snap)).contains(&"LINK_SINGLE_LANE"));
     }
 
     /// Devices present in sysfs are already covered by the per-device pass.

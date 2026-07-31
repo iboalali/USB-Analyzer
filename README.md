@@ -227,7 +227,7 @@ failing hub controller, or a marginal port produce identical evidence.
 
 ```sh
 cargo build --release        # ./target/release/usbdiag
-cargo test                   # 98 tests
+cargo test                   # 102 tests
 ```
 
 No non-Rust dependencies. Dependencies are `serde` and `serde_json` only; sysfs
