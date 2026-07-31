@@ -40,7 +40,10 @@ pub fn analyze(snap: &Snapshot) -> Vec<Finding> {
     for dev in snap.devices() {
         device_rules(snap, dev, &mut f);
     }
+    ss_half_failed_rules(snap, &mut f);
     ss_half_idle_rules(snap, &mut f);
+    phantom_device_rules(snap, &mut f);
+    billboard_rules(snap, &mut f);
     hub_port_rules(snap, &mut f);
 
     // Strongest first, then by confidence, then stable by code for determinism.
@@ -843,11 +846,81 @@ fn kernel_history_rules(snap: &Snapshot, dev: &UsbDevice, out: &mut Vec<Finding>
 
 /// USB mass storage class code.
 const CLASS_MASS_STORAGE: u8 = 0x08;
+/// USB Billboard class code — a device announcing a failed Alternate Mode.
+const CLASS_BILLBOARD: u8 = 0x11;
 
-/// A downstream port together with the speed of the hub it belongs to.
+/// A downstream port together with the hub it belongs to.
 struct PortSite<'a> {
     port: &'a HubPort,
+    hub_name: &'a str,
     hub_speed_mbps: f64,
+}
+
+/// One physical socket: a USB 2.0 half and a SuperSpeed half on different buses,
+/// sharing an ACPI `_PLD` location token.
+struct Receptacle<'a> {
+    location: &'a str,
+    slow: PortSite<'a>,
+    fast: PortSite<'a>,
+}
+
+impl<'a> Receptacle<'a> {
+    /// Human description of where the socket physically is.
+    fn where_is(&self) -> String {
+        self.slow
+            .port
+            .physical_location
+            .as_ref()
+            .map(|l| l.display())
+            .unwrap_or_else(|| format!("location {}", self.location))
+    }
+}
+
+/// Group downstream ports into physical receptacles.
+///
+/// Only clean two-port groups count. Firmware emits a catch-all location token
+/// shared by many unrelated ports — six of them on the machine this was built
+/// against — and pairing those would attach findings to the wrong socket.
+fn receptacles(snap: &Snapshot) -> Vec<Receptacle<'_>> {
+    let mut groups: BTreeMap<&str, Vec<PortSite>> = BTreeMap::new();
+    for dev in snap.devices() {
+        let Some(speed) = dev.speed.as_ref().map(|s| s.mbps) else {
+            continue;
+        };
+        for port in &dev.ports {
+            if let Some(loc) = port.location.as_deref() {
+                groups.entry(loc).or_default().push(PortSite {
+                    port,
+                    hub_name: &dev.sysfs_name,
+                    hub_speed_mbps: speed,
+                });
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for (location, sites) in groups {
+        if sites.len() != 2 {
+            continue;
+        }
+        let (mut slow, mut fast) = (None, None);
+        for site in sites {
+            if site.hub_speed_mbps <= 480.0 {
+                slow.get_or_insert(site);
+            } else if site.hub_speed_mbps >= 5000.0 {
+                fast.get_or_insert(site);
+            }
+        }
+        // A pair of two USB 2.0 ports has no SuperSpeed half to be missing.
+        if let (Some(slow), Some(fast)) = (slow, fast) {
+            out.push(Receptacle {
+                location,
+                slow,
+                fast,
+            });
+        }
+    }
+    out
 }
 
 /// A device on the USB 2.0 half of a receptacle whose SuperSpeed half is idle.
@@ -870,44 +943,21 @@ struct PortSite<'a> {
 /// firing for every device class would bury the signal. Storage is the class
 /// where SuperSpeed is both expected and worth having.
 fn ss_half_idle_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
-    let mut groups: BTreeMap<&str, Vec<PortSite>> = BTreeMap::new();
-    for dev in snap.devices() {
-        let Some(speed) = dev.speed.as_ref().map(|s| s.mbps) else {
-            continue;
-        };
-        for port in &dev.ports {
-            if let Some(loc) = port.location.as_deref() {
-                groups.entry(loc).or_default().push(PortSite {
-                    port,
-                    hub_speed_mbps: speed,
-                });
-            }
-        }
-    }
-
-    for (location, sites) in groups {
-        // Only a clean two-port group is a real receptacle. Firmware emits a
-        // catch-all token shared by many unrelated ports — six of them on the
-        // machine this was developed against — and grouping those would pair
-        // ports that have no physical relationship.
-        if sites.len() != 2 {
-            continue;
-        }
-        let Some(slow) = sites.iter().find(|s| s.hub_speed_mbps <= 480.0) else {
-            continue;
-        };
-        let Some(fast) = sites.iter().find(|s| s.hub_speed_mbps >= 5000.0) else {
-            continue;
-        };
-
+    for rec in receptacles(snap) {
         // The slow half is occupied and the fast half is empty.
-        let (Some(child_name), None) = (slow.port.child.as_deref(), fast.port.child.as_deref())
+        let (Some(child_name), None) = (rec.slow.port.child.as_deref(), rec.fast.port.child.as_deref())
         else {
             continue;
         };
         let Some(dev) = snap.device(child_name) else {
             continue;
         };
+
+        // When the SuperSpeed half is actively erroring, SS_HALF_FAILED says
+        // something stronger and for every device class. Don't double-report.
+        if !ss_errors_on(snap, rec.fast.hub_name).is_empty() {
+            continue;
+        }
         if !dev.has_interface_class(CLASS_MASS_STORAGE) {
             continue;
         }
@@ -915,22 +965,22 @@ fn ss_half_idle_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
         let mut evidence = vec![
             format!(
                 "{} (hub at {}) has {}",
-                slow.port.name,
-                LinkSpeed::from_mbps(slow.hub_speed_mbps).short(),
+                rec.slow.port.name,
+                LinkSpeed::from_mbps(rec.slow.hub_speed_mbps).short(),
                 child_name
             ),
             format!(
                 "{} (hub at {}) is idle — same receptacle, location {}",
-                fast.port.name,
-                LinkSpeed::from_mbps(fast.hub_speed_mbps).short(),
-                location
+                rec.fast.port.name,
+                LinkSpeed::from_mbps(rec.fast.hub_speed_mbps).short(),
+                rec.location
             ),
             format!(
                 "device reports USB {} — which a USB 3 device in fallback also does",
                 dev.usb_version.as_deref().unwrap_or("?")
             ),
         ];
-        if let Some(loc) = slow.port.physical_location.as_ref() {
+        if let Some(loc) = rec.slow.port.physical_location.as_ref() {
             evidence.push(format!("physical location: {}", loc.display()));
         }
 
@@ -954,6 +1004,292 @@ fn ss_half_idle_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
             suggestion: Some(
                 "If this is a USB 3 device, replace the cable or adapter with one rated for USB 3 \
                  data. If it is genuinely a USB 2.0 device, nothing is wrong."
+                    .into(),
+            ),
+        });
+    }
+}
+
+/// Kernel events on a bus that indicate a SuperSpeed link failing to come up.
+fn ss_errors_on<'a>(snap: &'a Snapshot, hub_name: &str) -> Vec<&'a KernelEvent> {
+    snap.kernel_log
+        .events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.kind,
+                EventKind::LinkTrainingFailure
+                    | EventKind::CableSuspect
+                    | EventKind::EnumerationFailure
+            ) && e.bus().as_deref() == Some(hub_name)
+        })
+        .collect()
+}
+
+/// A device on the USB 2.0 half of a receptacle whose SuperSpeed half is
+/// *actively failing* — the strongest form of the fallback signal.
+///
+/// [`ss_half_idle_rules`] is restricted to mass storage because a quiet, idle
+/// SuperSpeed half is perfectly normal beside a USB 2.0 keyboard. That
+/// restriction is right there and wrong here: when the SuperSpeed half is
+/// throwing errors, something *tried* to train at this socket and failed, so
+/// the device on the slow half is a USB 3 device running degraded whatever its
+/// class. The error events supply the evidence the class filter stood in for.
+///
+/// Distinguishes two causes that call for opposite actions:
+///
+/// * trained at least once, then failed — the SuperSpeed pairs are physically
+///   present but the connection is intermittent, so the cable or connector is
+///   likely **defective**
+/// * never trained at all — the path has no SuperSpeed wiring, so it is simply
+///   the **wrong cable** and nothing is broken
+fn ss_half_failed_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
+    for rec in receptacles(snap) {
+        let errors = ss_errors_on(snap, rec.fast.hub_name);
+        if errors.is_empty() {
+            continue;
+        }
+        // Only meaningful when the companion half actually carries something —
+        // otherwise the socket is simply empty and errors are stale.
+        let Some(child_name) = rec.slow.port.child.as_deref() else {
+            continue;
+        };
+        let Some(dev) = snap.device(child_name) else {
+            continue;
+        };
+
+        let trained = snap
+            .kernel_log
+            .events
+            .iter()
+            .any(|e| e.is_superspeed_train() && e.bus().as_deref() == Some(rec.fast.hub_name));
+        let gave_up = rec.fast.port.state.as_deref() == Some("not attached");
+
+        let (verdict, detail, suggestion) = if trained {
+            (
+                "the cable or connector is likely defective",
+                "The SuperSpeed link trained at least once and then failed, so the SuperSpeed \
+                 pairs are physically present and wired — they just will not hold a connection. \
+                 That points at an intermittent contact: a loose or damaged connector, a worn \
+                 plug, or a cable failing internally. A cable that merely lacked SuperSpeed \
+                 wiring could never have trained at all. Note that USB 2.0 keeps working through \
+                 this: it uses one differential pair with generous margins, while SuperSpeed adds \
+                 two pairs at multi-gigabit rates where signal integrity is unforgiving — so the \
+                 SuperSpeed half fails long before anything else shows symptoms.",
+                "Reseat both ends and inspect the connectors. If the device is a hub or dock with \
+                 a built-in cable, the uplink cannot be replaced and the unit needs repair or \
+                 replacement.",
+            )
+        } else {
+            (
+                "the path has no SuperSpeed wiring",
+                "The SuperSpeed link never trained even once, which means the SuperSpeed pairs \
+                 are not reaching this socket at all. A USB 2.0-only cable or adapter does \
+                 exactly this — nothing is damaged, the wiring is simply absent.",
+                "Replace the cable or adapter with one rated for USB 3 data. Charge-only cables \
+                 and USB 2.0 adapters cannot carry SuperSpeed however good they are.",
+            )
+        };
+
+        let mut evidence = vec![
+            format!(
+                "{} on the SuperSpeed half: {} error event(s) this boot",
+                rec.fast.port.name,
+                errors.len()
+            ),
+            format!(
+                "{} on the USB 2.0 half of the same socket is running {} ({})",
+                rec.slow.port.name,
+                dev.label(),
+                dev.speed
+                    .as_ref()
+                    .map(|s| s.short())
+                    .unwrap_or_else(|| "?".into())
+            ),
+            format!(
+                "SuperSpeed {} this boot",
+                if trained {
+                    "trained at least once, then failed"
+                } else {
+                    "never trained"
+                }
+            ),
+        ];
+        if gave_up {
+            evidence.push(format!(
+                "{} has since given up (state: not attached)",
+                rec.fast.port.name
+            ));
+        }
+        // The errno is the actual diagnosis, so surface it in plain language.
+        for e in errors.iter().rev().take(3) {
+            match e.errno.and_then(errno_meaning) {
+                Some(m) => evidence.push(format!("{}  [{}]", e.text, m)),
+                None => evidence.push(e.text.clone()),
+            }
+        }
+
+        out.push(Finding {
+            code: "SS_HALF_FAILED".into(),
+            severity: Severity::High,
+            confidence: Confidence::Inferred,
+            subject: Subject::Cable(rec.where_is()),
+            title: format!(
+                "SuperSpeed failed at the {} socket — {}",
+                rec.where_is(),
+                verdict
+            ),
+            detail: detail.into(),
+            evidence,
+            suggestion: Some(suggestion.into()),
+        });
+    }
+}
+
+/// Findings for devices that appear only in the kernel log, never in sysfs.
+///
+/// The per-device rules iterate `snap.devices()`, so a device that failed to
+/// enumerate is skipped entirely — meaning `ENUMERATION_FAILURE` could never
+/// fire for a device that failed to enumerate, the only case it applies to.
+/// This sweeps up what that pass leaves behind.
+///
+/// A device absent from sysfs is arguably worse than a degraded one: it is not
+/// slow, it is unusable.
+fn phantom_device_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
+    let mut by_device: BTreeMap<&str, Vec<&KernelEvent>> = BTreeMap::new();
+    for e in &snap.kernel_log.events {
+        let Some(name) = e.device.as_deref() else {
+            continue;
+        };
+        // Present in sysfs, so the per-device pass already handled it.
+        if snap.device(name).is_some() {
+            continue;
+        }
+        if matches!(
+            e.kind,
+            EventKind::EnumerationFailure | EventKind::LinkTrainingFailure | EventKind::CableSuspect
+        ) {
+            by_device.entry(name).or_default().push(e);
+        }
+    }
+
+    let sockets = receptacles(snap);
+    for (name, events) in by_device {
+        // Where is this bus physically, and what else is on that socket?
+        let bus = events.first().and_then(|e| e.bus());
+        let context = bus.as_deref().and_then(|b| {
+            sockets.iter().find_map(|r| {
+                if r.fast.hub_name != b {
+                    return None;
+                }
+                let sibling = r.slow.port.child.as_deref().and_then(|c| snap.device(c));
+                Some(match sibling {
+                    Some(d) => format!(
+                        "the SuperSpeed half of the {} socket, whose USB 2.0 half is running {}",
+                        r.where_is(),
+                        d.label()
+                    ),
+                    None => format!("the SuperSpeed half of the {} socket", r.where_is()),
+                })
+            })
+        });
+
+        let worst = events
+            .iter()
+            .map(|e| e.kind)
+            .max_by_key(|k| match k {
+                EventKind::EnumerationFailure => 2,
+                EventKind::CableSuspect => 1,
+                _ => 0,
+            })
+            .unwrap_or(EventKind::EnumerationFailure);
+
+        let mut evidence = vec![format!(
+            "{name} appears in the kernel log but not in sysfs — it never finished enumerating"
+        )];
+        if let Some(c) = &context {
+            evidence.push(format!("this is {c}"));
+        }
+        evidence.push(format!("{} relevant event(s) this boot", events.len()));
+        for e in events.iter().rev().take(3) {
+            match e.errno.and_then(errno_meaning) {
+                Some(m) => evidence.push(format!("{}  [{}]", e.text, m)),
+                None => evidence.push(e.text.clone()),
+            }
+        }
+
+        let where_ = context
+            .as_deref()
+            .map(|c| format!(" at {c}"))
+            .unwrap_or_default();
+
+        out.push(Finding {
+            code: "DEVICE_FAILED_TO_ENUMERATE".into(),
+            severity: Severity::High,
+            confidence: Confidence::Measured,
+            subject: Subject::Device(name.to_string()),
+            title: format!("{name} tried to attach{where_} and never enumerated"),
+            detail: match worst {
+                EventKind::CableSuspect =>
+                    "The hub driver could not enable the port and logged its bad-cable warning. \
+                     The device is not merely degraded — it is absent, so nothing behind it is \
+                     usable."
+                        .to_string(),
+                _ => "Descriptor reads failed or the device never accepted an address, so it does \
+                      not exist as far as the rest of the system is concerned. Signal integrity, \
+                      insufficient power, and failing device hardware all produce this."
+                    .to_string(),
+            },
+            evidence,
+            suggestion: Some(
+                "Reseat the connection and try a different cable and port. If the device is \
+                 behind a hub, test it directly on the machine to tell the two apart."
+                    .into(),
+            ),
+        });
+    }
+}
+
+/// USB Billboard: a device's own declaration that an Alternate Mode failed.
+///
+/// The class exists for exactly one purpose. A USB-C device that asked for an
+/// Alternate Mode and could not enter it presents a Billboard interface to tell
+/// the host so. Its presence is therefore a machine-readable failure report,
+/// not an ordinary device.
+fn billboard_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
+    for dev in snap.devices() {
+        if !dev.has_interface_class(CLASS_BILLBOARD) {
+            continue;
+        }
+        out.push(Finding {
+            code: "BILLBOARD_ALT_MODE_FAILED".into(),
+            severity: Severity::Medium,
+            confidence: Confidence::Measured,
+            subject: Subject::Device(dev.sysfs_name.clone()),
+            title: format!(
+                "{} reports an Alternate Mode it could not enter",
+                dev.label()
+            ),
+            detail: "A USB Billboard device exists only to announce a failure: the attached \
+                     USB-C device requested an Alternate Mode — DisplayPort, Thunderbolt, or a \
+                     vendor mode — and the negotiation did not succeed, so it fell back to \
+                     presenting this instead. Common causes are a cable without the required \
+                     wiring, a port that does not support the mode, or a link that could not \
+                     train. The specific modes it wanted live in a Billboard capability \
+                     descriptor, which sysfs does not expose."
+                .into(),
+            evidence: vec![
+                format!("{} exposes interface class 0x11 (billboard)", dev.sysfs_name),
+                format!(
+                    "{}:{} at {}",
+                    dev.vid_pid().unwrap_or_default(),
+                    dev.usb_version.as_deref().unwrap_or("?"),
+                    dev.speed.as_ref().map(|s| s.short()).unwrap_or_default()
+                ),
+            ],
+            suggestion: Some(
+                "If you expected video or a docking mode from this device, the cable is the \
+                 usual cause — it must carry the SuperSpeed pairs, not just power and USB 2.0."
                     .into(),
             ),
         });
@@ -1554,6 +1890,173 @@ mod tests {
         assert!(!codes(&analyze(&snap)).contains(&"SS_HALF_IDLE"));
     }
 
+    // --- SS_HALF_FAILED -----------------------------------------------------
+
+    /// The confirmed-defective case: a hub whose built-in cable had a loose
+    /// connection. SuperSpeed trained once then timed out, while USB 2.0 ran
+    /// perfectly throughout.
+    #[test]
+    fn a_superspeed_half_that_trained_then_failed_reads_as_defective() {
+        let mut snap = empty_snapshot();
+        let (mut slow, fast) = receptacle("0x80000001", Some("5-1"), None);
+        // A hub, not storage — SS_HALF_IDLE would ignore this entirely.
+        slow.children
+            .push(device_with_class("5-1", " 2.10", 480.0, Some("usb5"), 0x09));
+        snap.buses.push(slow);
+        snap.buses.push(fast);
+        snap.kernel_log.events = ss_uplink_failure_events(6, 85, true);
+
+        let f = analyze(&snap);
+        let hit = f.iter().find(|x| x.code == "SS_HALF_FAILED").unwrap();
+        assert_eq!(hit.severity, Severity::High);
+        assert_eq!(hit.confidence, Confidence::Inferred);
+        assert!(
+            hit.title.contains("likely defective"),
+            "trained-then-failed means the wiring exists: {}",
+            hit.title
+        );
+        assert!(hit.detail.contains("intermittent"));
+        // Advice must cover a captive uplink, which cannot be swapped.
+        assert!(hit.suggestion.as_deref().unwrap().contains("built-in cable"));
+        // The errno is the diagnosis, so it must be spelled out.
+        assert!(hit.evidence.iter().any(|e| e.contains("ETIMEDOUT")));
+        // 85 "Cannot enable" retries plus the -110 descriptor timeout, all of
+        // which are errors on that bus.
+        assert!(hit.evidence.iter().any(|e| e.contains("86 error event")));
+    }
+
+    /// The other cause, needing opposite advice: a USB 2.0-only adapter. It can
+    /// never train, so "defective" would be wrong and expensive.
+    #[test]
+    fn a_superspeed_half_that_never_trained_reads_as_wrong_cable() {
+        let mut snap = empty_snapshot();
+        let (mut slow, fast) = receptacle("0x80000001", Some("5-1"), None);
+        slow.children
+            .push(device_with_class("5-1", " 2.10", 480.0, Some("usb5"), 0x08));
+        snap.buses.push(slow);
+        snap.buses.push(fast);
+        snap.kernel_log.events = ss_uplink_failure_events(6, 12, false);
+
+        let hit = analyze(&snap)
+            .into_iter()
+            .find(|x| x.code == "SS_HALF_FAILED")
+            .unwrap();
+        assert!(hit.title.contains("no SuperSpeed wiring"), "{}", hit.title);
+        assert!(!hit.detail.contains("intermittent"));
+        assert!(hit.suggestion.as_deref().unwrap().contains("Replace the cable"));
+    }
+
+    /// SS_HALF_FAILED says everything SS_HALF_IDLE would, with evidence. Firing
+    /// both would be two alarms for one event.
+    #[test]
+    fn ss_half_failed_supersedes_ss_half_idle() {
+        let mut snap = empty_snapshot();
+        let (mut slow, fast) = receptacle("0x80000001", Some("5-1"), None);
+        slow.children
+            .push(device_with_class("5-1", " 2.10", 480.0, Some("usb5"), 0x08));
+        snap.buses.push(slow);
+        snap.buses.push(fast);
+        snap.kernel_log.events = ss_uplink_failure_events(6, 85, true);
+
+        let f = analyze(&snap);
+        assert!(codes(&f).contains(&"SS_HALF_FAILED"));
+        assert!(!codes(&f).contains(&"SS_HALF_IDLE"));
+    }
+
+    /// Errors with nothing plugged into the socket are stale history, not a
+    /// live problem. Reporting them every boot would be noise.
+    #[test]
+    fn stale_errors_on_an_empty_socket_do_not_fire() {
+        let mut snap = empty_snapshot();
+        let (slow, fast) = receptacle("0x80000001", None, None);
+        snap.buses.push(slow);
+        snap.buses.push(fast);
+        snap.kernel_log.events = ss_uplink_failure_events(6, 85, true);
+        assert!(!codes(&analyze(&snap)).contains(&"SS_HALF_FAILED"));
+    }
+
+    // --- DEVICE_FAILED_TO_ENUMERATE ----------------------------------------
+
+    /// The structural bug: rules iterate devices in the tree, so a device that
+    /// failed to enumerate was skipped — the only case the rule applies to.
+    #[test]
+    fn reports_a_device_that_never_reached_sysfs() {
+        let mut snap = empty_snapshot();
+        let (slow, fast) = receptacle("0x80000001", Some("5-1"), None);
+        let mut slow = slow;
+        slow.children
+            .push(device_with_class("5-1", " 2.10", 480.0, Some("usb5"), 0x09));
+        snap.buses.push(slow);
+        snap.buses.push(fast);
+        snap.kernel_log.events = ss_uplink_failure_events(6, 3, true);
+
+        let hit = analyze(&snap)
+            .into_iter()
+            .find(|x| x.code == "DEVICE_FAILED_TO_ENUMERATE")
+            .expect("6-1 is in the log but not the tree");
+        assert_eq!(hit.severity, Severity::High);
+        assert_eq!(hit.subject, Subject::Device("6-1".into()));
+        // Must locate it physically and say what else shares the socket.
+        assert!(
+            hit.title.contains("SuperSpeed half"),
+            "bare device paths are not actionable: {}",
+            hit.title
+        );
+        assert!(hit.evidence.iter().any(|e| e.contains("ETIMEDOUT")));
+    }
+
+    /// Devices present in sysfs are already covered by the per-device pass.
+    #[test]
+    fn present_devices_are_not_reported_as_phantoms() {
+        let mut snap = empty_snapshot();
+        let mut hub = root_hub("usb3", 480.0);
+        let mut d = device("3-4", " 2.00", 12.0, Some("usb3"));
+        d.removable = Some("removable".into());
+        hub.children.push(d);
+        snap.buses.push(hub);
+        snap.kernel_log.events.push(KernelEvent {
+            kind: EventKind::EnumerationFailure,
+            severity: Severity::High,
+            device: Some("3-4".into()),
+            errno: Some(-71),
+            timestamp: None,
+            text: "usb 3-4: device descriptor read/64, error -71".into(),
+        });
+
+        let f = analyze(&snap);
+        assert!(!codes(&f).contains(&"DEVICE_FAILED_TO_ENUMERATE"));
+        assert!(codes(&f).contains(&"ENUMERATION_FAILURE"));
+    }
+
+    // --- BILLBOARD_ALT_MODE_FAILED -----------------------------------------
+
+    #[test]
+    fn reports_a_billboard_device_as_a_failed_alt_mode() {
+        let mut snap = empty_snapshot();
+        let mut hub = root_hub("usb5", 480.0);
+        hub.children.push(billboard_device("5-1.5", Some("usb5")));
+        snap.buses.push(hub);
+
+        let hit = analyze(&snap)
+            .into_iter()
+            .find(|x| x.code == "BILLBOARD_ALT_MODE_FAILED")
+            .unwrap();
+        assert_eq!(hit.severity, Severity::Medium);
+        assert_eq!(hit.confidence, Confidence::Measured);
+        assert!(hit.detail.contains("Alternate Mode"));
+        assert!(hit.evidence.iter().any(|e| e.contains("0x11")));
+    }
+
+    #[test]
+    fn ordinary_devices_are_not_billboards() {
+        let mut snap = empty_snapshot();
+        let mut hub = root_hub("usb5", 480.0);
+        hub.children
+            .push(device_with_class("5-1", " 2.10", 480.0, Some("usb5"), 0x08));
+        snap.buses.push(hub);
+        assert!(!codes(&analyze(&snap)).contains(&"BILLBOARD_ALT_MODE_FAILED"));
+    }
+
     // --- SINK_UNDERPOWERED_NO_PD -------------------------------------------
 
     /// A 100 W-capable laptop reduced to a 15 W Type-C advertisement. Reported at
@@ -1680,6 +2183,7 @@ mod tests {
                 kind,
                 severity: Severity::Medium,
                 device: Some("1-1".into()),
+                errno: None,
                 timestamp: None,
                 text: "usb 1-1: synthetic fault".into(),
             });

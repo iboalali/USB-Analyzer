@@ -99,6 +99,7 @@ pub fn reset_log(device: &str, count: usize) -> KernelLog {
                 kind: EventKind::DeviceReset,
                 severity: Severity::Low,
                 device: Some(device.to_string()),
+                errno: None,
                 timestamp: Some(format!("[{i:>6}.000000]")),
                 text: format!("usb {device}: reset full-speed USB device number 2 using xhci_hcd"),
             })
@@ -491,6 +492,64 @@ pub fn sinking_port_no_pd(mode: &str) -> TypecPort {
         usb_type: Some(RoleField::parse("C [PD] PD_PPS")),
     });
     port
+}
+
+/// Kernel events from a SuperSpeed uplink failing, transcribed from a real
+/// Anker USB-C hub whose built-in cable had a loose connection — the one case in
+/// this project with an independently confirmed physical cause.
+///
+/// `trained` selects the two outcomes that call for opposite advice:
+/// * `true`  — retries, then a successful Gen 2x1 train, then a `-110` timeout.
+///   The SuperSpeed pairs exist; the connection is intermittent. Defective.
+/// * `false` — retries and nothing else. No SuperSpeed wiring in the path.
+///   Wrong cable, nothing broken.
+pub fn ss_uplink_failure_events(bus_num: u32, retries: usize, trained: bool) -> Vec<KernelEvent> {
+    let bus = format!("usb{bus_num}");
+    let mut events: Vec<KernelEvent> = (0..retries)
+        .map(|i| KernelEvent {
+            kind: EventKind::CableSuspect,
+            severity: Severity::High,
+            device: Some(bus.clone()),
+            errno: None,
+            timestamp: Some(format!("[{i:>6}.000000]")),
+            text: format!("usb {bus}-port1: Cannot enable. Maybe the USB cable is bad?"),
+        })
+        .collect();
+
+    if trained {
+        events.push(KernelEvent {
+            kind: EventKind::DeviceEnumerating,
+            severity: Severity::Info,
+            device: Some(format!("{bus_num}-1")),
+            errno: None,
+            timestamp: None,
+            text: format!(
+                "usb {bus_num}-1: new SuperSpeed Plus Gen 2x1 USB device number 7 using xhci_hcd"
+            ),
+        });
+        events.push(KernelEvent {
+            kind: EventKind::EnumerationFailure,
+            severity: Severity::High,
+            device: Some(format!("{bus_num}-1")),
+            errno: Some(-110),
+            timestamp: None,
+            text: format!("usb {bus_num}-1: device descriptor read/all, error -110"),
+        });
+    }
+    events
+}
+
+/// A device presenting a USB Billboard interface — a USB-C device's own
+/// declaration that an Alternate Mode it requested could not be entered.
+/// Modelled on the Anker hub's `291a:8383`.
+pub fn billboard_device(name: &str, parent: Option<&str>) -> UsbDevice {
+    let mut d = device_with_class(name, " 2.01", 480.0, parent, 0x11);
+    d.manufacturer = Some("Anker".into());
+    d.product = Some("Anker USB-C HUB Device".into());
+    d.id_vendor = Some(0x291a);
+    d.id_product = Some(0x8383);
+    d.interfaces[0].driver = None;
+    d
 }
 
 /// A passive Type-C cable VDO1: 10 Gbps, ~1 m, 20 V, with the given current

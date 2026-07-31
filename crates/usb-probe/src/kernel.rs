@@ -106,6 +106,7 @@ fn build(
                 severity: severity_of(kind),
                 kind,
                 device,
+                errno: extract_errno(&text),
                 timestamp,
                 text,
             })
@@ -288,6 +289,11 @@ fn classify(text: &str) -> (EventKind, Option<String>) {
         EventKind::LinkTrainingFailure
     } else if lower.contains("reset") && lower.contains("usb device") {
         EventKind::DeviceReset
+    } else if lower.contains("new ") && lower.contains("usb device number") {
+        // "new SuperSpeed Plus Gen 2x1 USB device number 7 using xhci_hcd".
+        // Benign by itself; kept because a link that trains once and then fails
+        // is diagnostically different from one that never trains at all.
+        EventKind::DeviceEnumerating
     } else if lower.contains("usb disconnect") {
         EventKind::Disconnect
     } else if lower.starts_with("typec") || lower.starts_with("ucsi") || lower.starts_with("tcpm") {
@@ -332,6 +338,23 @@ fn extract_device(prefix: &str) -> Option<String> {
     Some(token.to_string())
 }
 
+/// Pull a negative errno out of a message: "..., error -110" -> `-110`.
+///
+/// The errno is usually the actual diagnosis — `-110` says the device never
+/// answered, `-71` points at signal integrity — so it is worth lifting out of
+/// the text rather than leaving callers to re-parse it.
+fn extract_errno(text: &str) -> Option<i32> {
+    let idx = text.find("error -")?;
+    let digits: String = text[idx + "error -".len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<i32>().ok().map(|n| -n)
+}
+
 fn severity_of(kind: EventKind) -> Severity {
     match kind {
         EventKind::CableSuspect | EventKind::EnumerationFailure => Severity::High,
@@ -341,7 +364,10 @@ fn severity_of(kind: EventKind) -> Severity {
         | EventKind::InsufficientBandwidth => Severity::Medium,
         // A single reset is normal; the rule engine escalates on repetition.
         EventKind::DeviceReset => Severity::Low,
-        EventKind::Disconnect | EventKind::TypecEvent | EventKind::Other => Severity::Info,
+        EventKind::Disconnect
+        | EventKind::TypecEvent
+        | EventKind::DeviceEnumerating
+        | EventKind::Other => Severity::Info,
     }
 }
 

@@ -165,11 +165,41 @@ sits empty means SuperSpeed never trained, whatever the device says about itself
 That is `SS_HALF_IDLE`, and it is restricted to mass storage on purpose: a USB 2.0
 keyboard produces identical topology and is entirely normal.
 
+### Defective cable, or just the wrong one?
+
+When the SuperSpeed half of a socket errors while its USB 2.0 half works, the log
+answers a question that matters more than "is something wrong":
+
+```
+retries → trained once → failed    the SuperSpeed pairs are wired but the contact
+                                   is intermittent → the cable is likely DEFECTIVE
+
+retries → never trained            the pairs are not in the path at all
+                                   → WRONG cable, nothing is broken
+```
+
+A cable lacking SuperSpeed wiring can never reach a trained state even once, so
+"trained then failed" is specific to a physical fault. Both were observed on the
+same machine: a hub with a loose built-in cable (defective — later confirmed by
+its owner) and a USB 2.0-only adapter (wrong cable, working exactly as designed).
+
+The asymmetry is why the symptom looks the way it does. USB 2.0 uses one
+differential pair at 480 Mbps with generous margins; SuperSpeed adds two pairs at
+multi-gigabit rates where signal integrity is unforgiving. A degrading connector
+kills SuperSpeed long before USB 2.0 notices — so "half the device works" is
+itself the diagnosis.
+
+`usbdiag` reports this as **might** be defective, never *is*. A dirty contact, a
+failing hub controller, or a marginal port produce identical evidence.
+
 ## Rules
 
 | Code | Confidence | Catches |
 |---|---|---|
-| `SS_HALF_IDLE` | heuristic | Storage on the USB 2.0 half of a receptacle whose SuperSpeed half is idle — the **only** detector that survives a USB 3 fallback (see below). |
+| `SS_HALF_FAILED` | inferred | A device on the USB 2.0 half while the SuperSpeed half of the same socket is **erroring**. Distinguishes a defective cable from a merely wrong one (see below). |
+| `SS_HALF_IDLE` | heuristic | Storage on the USB 2.0 half of a receptacle whose SuperSpeed half is idle and quiet — the only detector that survives a USB 3 fallback (see below). |
+| `DEVICE_FAILED_TO_ENUMERATE` | measured | A device that appears in the kernel log but never in sysfs, located to its physical socket, with the errno decoded. |
+| `BILLBOARD_ALT_MODE_FAILED` | measured | A USB-C device presenting a Billboard interface — its own declaration that an Alternate Mode could not be entered. |
 | `LINK_BELOW_DEVICE_CAPABILITY` | inferred | A device still reporting USB 3.x while linked at 480 Mbps. Distinguishes a USB 2.0 hub upstream from a suspect cable, and internal devices from cabled ones. Cannot see a true fallback. |
 | `LINK_SLOW_DESPITE_CAPABLE_CABLE` | inferred | Slow link where the e-marker already rules the cable out. |
 | `LINK_SINGLE_LANE` | measured | USB 3.2 device running one lane instead of two. |
@@ -197,7 +227,7 @@ keyboard produces identical topology and is entirely normal.
 
 ```sh
 cargo build --release        # ./target/release/usbdiag
-cargo test                   # 90 tests
+cargo test                   # 98 tests
 ```
 
 No non-Rust dependencies. Dependencies are `serde` and `serde_json` only; sysfs

@@ -854,6 +854,45 @@ pub struct KernelEvent {
     pub device: Option<String>,
     pub timestamp: Option<String>,
     pub text: String,
+    /// Negative errno parsed out of the message, e.g. `-110` from
+    /// "device descriptor read/all, error -110". This is usually the actual
+    /// diagnosis, so it is extracted rather than left buried in the text.
+    pub errno: Option<i32>,
+}
+
+impl KernelEvent {
+    /// Bus name owning this event's device: `6-1` -> `usb6`, `usb6` -> `usb6`.
+    pub fn bus(&self) -> Option<String> {
+        let d = self.device.as_deref()?;
+        if let Some(rest) = d.strip_prefix("usb") {
+            return rest.chars().all(|c| c.is_ascii_digit()).then(|| d.to_string());
+        }
+        let num = d.split('-').next()?;
+        num.chars()
+            .all(|c| c.is_ascii_digit())
+            .then(|| format!("usb{num}"))
+    }
+
+    /// True when this line reports a SuperSpeed link training successfully.
+    pub fn is_superspeed_train(&self) -> bool {
+        self.kind == EventKind::DeviceEnumerating
+            && self.text.to_ascii_lowercase().contains("superspeed")
+    }
+}
+
+/// Plain-language meaning of a USB errno. These are the diagnosis, not noise.
+pub fn errno_meaning(code: i32) -> Option<&'static str> {
+    Some(match code {
+        -110 => "ETIMEDOUT — the device never answered",
+        -71 => "EPROTO — protocol error, typically signal integrity",
+        -84 => "EILSEQ — CRC or framing error, typically signal integrity",
+        -32 => "EPIPE — the endpoint stalled",
+        -62 => "ETIME — the transfer timed out",
+        -75 => "EOVERFLOW — babble, more data than the endpoint expected",
+        -19 => "ENODEV — the device vanished mid-operation",
+        -22 => "EINVAL — the kernel rejected the request",
+        _ => return None,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -863,6 +902,11 @@ pub enum EventKind {
     EnumerationFailure,
     /// Kernel re-reset an already-working device — the classic marginal-link sign.
     DeviceReset,
+    /// A link trained and the kernel began enumerating: "new SuperSpeed USB
+    /// device number 7". Benign alone, but decisive in context — a path that
+    /// trains once and then fails has working wiring and a bad connection,
+    /// whereas one that never trains is simply missing the wiring.
+    DeviceEnumerating,
     /// Kernel explicitly blamed the cable.
     CableSuspect,
     /// A SuperSpeed link failed to train and fell back.
