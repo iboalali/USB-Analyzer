@@ -29,6 +29,7 @@
 
 pub mod block;
 pub mod diag;
+pub mod drm;
 pub mod kernel;
 pub mod model;
 pub mod monitor;
@@ -109,6 +110,7 @@ pub fn capture_with_log(opts: Options, log: Option<KernelLog>) -> Snapshot {
             block::read()
         },
         batteries,
+        displays: drm::read(),
         mains_online,
         uptime_s: read_uptime_s(),
         orphan_pd,

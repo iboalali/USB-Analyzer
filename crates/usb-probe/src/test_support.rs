@@ -24,6 +24,7 @@ pub fn empty_snapshot() -> Snapshot {
         thunderbolt: ThunderboltTopology::default(),
         block_devices: Vec::new(),
         batteries: Vec::new(),
+        displays: Vec::new(),
         mains_online: None,
         uptime_s: None,
         orphan_pd: Vec::new(),
@@ -619,6 +620,34 @@ pub fn phantom_failure_events(device: &str, at_s: f64) -> Vec<KernelEvent> {
 pub fn attached_ago(mut d: UsbDevice, seconds_ago: f64) -> UsbDevice {
     d.connected_duration_ms = Some((seconds_ago * 1000.0) as u64);
     d
+}
+
+/// A DRM connector, as `/sys/class/drm` would report it.
+pub fn connector(name: &str, status: &str, enabled: bool) -> DisplayConnector {
+    DisplayConnector {
+        name: format!("card1-{name}"),
+        connector: name.to_string(),
+        connector_id: Some(100),
+        status: Some(status.to_string()),
+        enabled: Some(enabled),
+        dpms: Some(if enabled { "On".into() } else { "Off".into() }),
+        modes: Vec::new(),
+        display: None,
+    }
+}
+
+/// An alternate mode as the partner reports it, with `active` meaning what it
+/// says — unlike a local port's copy.
+pub fn partner_alt_mode(svid: u16, active: bool) -> AltMode {
+    AltMode {
+        sysfs_name: format!("port0-partner.{svid:x}"),
+        svid: Some(svid),
+        svid_name: Some("DisplayPort Alt Mode (VESA)".into()),
+        mode: Some(1),
+        vdo: None,
+        active: Some(active),
+        description: None,
+    }
 }
 
 /// A device presenting a USB Billboard interface — a USB-C device's own

@@ -46,6 +46,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Finding> {
     billboard_rules(snap, &mut f);
     thunderbolt_rules(snap, &mut f);
     battery_rules(snap, &mut f);
+    display_rules(snap, &mut f);
     hub_port_rules(snap, &mut f);
 
     // One physical fault should read as one finding. Without this, a single
@@ -1431,6 +1432,96 @@ fn phantom_device_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
     }
 }
 
+/// The SVID VESA assigned to DisplayPort Alternate Mode.
+const SVID_DISPLAYPORT: u16 = 0xff01;
+
+/// Cross-check a DisplayPort Alt Mode against whether a picture came out.
+///
+/// The Type-C class can only describe a negotiation. DRM describes the result,
+/// and the two disagreeing is the signature of a cable carrying power and USB
+/// data but no DisplayPort lanes — a very common failure with charge-only or
+/// USB 2.0-era USB-C cables, and one the user experiences as "the monitor just
+/// doesn't come on".
+///
+/// Three guards, because a false accusation here would be easy to write:
+///
+/// * only the **partner's** alt modes count. A local port's own list says what
+///   the port supports, and UCSI firmware reports every entry of it as
+///   `active = yes` regardless of what is attached — on the machine this was
+///   written against, both ports claim DisplayPort mode is active while one
+///   holds a charger with zero alternate modes;
+/// * the machine must actually have a DisplayPort output, or there is nothing
+///   meaningful to have looked for;
+/// * DRM must be readable at all.
+///
+/// Untested against hardware: it needs a device that negotiates DP Alt Mode,
+/// which was not available when this was written. The guards are why it is
+/// Inferred rather than Measured.
+fn display_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
+    let dp_outputs: Vec<&DisplayConnector> = snap
+        .displays
+        .iter()
+        .filter(|d| d.is_displayport() && !d.is_internal())
+        .collect();
+    if dp_outputs.is_empty() {
+        return;
+    }
+    if dp_outputs.iter().any(|d| d.is_connected()) {
+        return;
+    }
+
+    for port in &snap.ports {
+        let Some(partner) = &port.partner else {
+            continue;
+        };
+        if !partner
+            .alt_modes
+            .iter()
+            .any(|m| m.svid == Some(SVID_DISPLAYPORT) && m.active == Some(true))
+        {
+            continue;
+        }
+
+        out.push(Finding {
+            code: "DP_ALT_MODE_NO_OUTPUT".into(),
+            severity: Severity::Medium,
+            confidence: Confidence::Inferred,
+            subject: Subject::Port(port.name.clone()),
+            title: format!(
+                "{} entered DisplayPort Alt Mode but no DisplayPort output is live",
+                partner.kind.as_deref().unwrap_or("The attached device")
+            ),
+            detail: format!(
+                "The attached device negotiated DisplayPort Alternate Mode, so both ends agreed \
+                 to carry video. The graphics driver still sees nothing on any of its {} \
+                 DisplayPort outputs. The usual cause is the cable: DisplayPort needs the \
+                 high-speed pairs, and a charge-only or USB 2.0-era USB-C cable has none of \
+                 them, while still carrying power and enough USB data to look fine.",
+                dp_outputs.len()
+            ),
+            evidence: vec![
+                format!(
+                    "{} reports SVID ff01 (DisplayPort) active",
+                    partner.sysfs_name
+                ),
+                format!(
+                    "DisplayPort connectors, all disconnected: {}",
+                    dp_outputs
+                        .iter()
+                        .map(|d| d.connector.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ],
+            suggestion: Some(
+                "Try a cable rated for USB 3.2 or Thunderbolt. If the display is behind a hub or \
+                 dock, connect it directly to tell the cable and the dock apart."
+                    .into(),
+            ),
+        });
+    }
+}
+
 /// USB Billboard: a device's own declaration that an Alternate Mode failed.
 ///
 /// The class exists for exactly one purpose. A USB-C device that asked for an
@@ -2581,6 +2672,87 @@ mod tests {
             .expect("6-1.2 failed while 6-1 was already attached");
         assert_eq!(hit.severity, Severity::High);
         assert!(hit.evidence.iter().any(|e| e.contains("EPROTO")));
+    }
+
+    // --- DP_ALT_MODE_NO_OUTPUT ---------------------------------------------
+
+    /// A dock that agreed to carry DisplayPort while the graphics driver sees
+    /// nothing on any DisplayPort output. Untested against hardware — no
+    /// DP Alt Mode device was available — so the guards below matter more than
+    /// this happy path.
+    #[test]
+    fn reports_dp_alt_mode_that_produced_no_picture() {
+        let mut snap = empty_snapshot();
+        let mut port = charging_port(100_000, Some(5000), 20_000, 5000);
+        if let Some(p) = port.partner.as_mut() {
+            p.alt_modes.push(partner_alt_mode(0xff01, true));
+        }
+        snap.ports.push(port);
+        snap.displays = vec![
+            connector("eDP-1", "connected", true),
+            connector("DP-1", "disconnected", false),
+            connector("DP-2", "disconnected", false),
+        ];
+
+        let hit = analyze(&snap)
+            .into_iter()
+            .find(|f| f.code == "DP_ALT_MODE_NO_OUTPUT")
+            .expect("DP mode entered, no DP output live");
+        assert_eq!(hit.severity, Severity::Medium);
+        assert_eq!(hit.confidence, Confidence::Inferred);
+        assert!(hit.evidence.iter().any(|e| e.contains("DP-1, DP-2")));
+    }
+
+    /// The false positive this rule was written around. Every local Type-C port
+    /// on the machine this was built against reports DisplayPort Alt Mode with
+    /// `active = yes` — on both ports, permanently, whatever is attached. Only
+    /// the partner's copy of the flag means anything.
+    #[test]
+    fn a_ports_own_alt_mode_list_does_not_accuse_anything() {
+        let mut snap = empty_snapshot();
+        let mut port = charging_port(100_000, Some(5000), 20_000, 5000);
+        // The port claims it; the attached charger reports no modes at all.
+        port.alt_modes.push(partner_alt_mode(0xff01, true));
+        snap.ports.push(port);
+        snap.displays = vec![
+            connector("eDP-1", "connected", true),
+            connector("DP-1", "disconnected", false),
+        ];
+
+        assert!(!codes(&analyze(&snap)).contains(&"DP_ALT_MODE_NO_OUTPUT"));
+    }
+
+    /// A picture did come out, so there is nothing to report.
+    #[test]
+    fn a_live_displayport_output_settles_the_question() {
+        let mut snap = empty_snapshot();
+        let mut port = charging_port(100_000, Some(5000), 20_000, 5000);
+        if let Some(p) = port.partner.as_mut() {
+            p.alt_modes.push(partner_alt_mode(0xff01, true));
+        }
+        snap.ports.push(port);
+        snap.displays = vec![connector("DP-1", "connected", true)];
+
+        assert!(!codes(&analyze(&snap)).contains(&"DP_ALT_MODE_NO_OUTPUT"));
+    }
+
+    /// With no DisplayPort output on the machine, and with DRM unreadable,
+    /// there is nothing to have looked for — silence rather than a guess.
+    #[test]
+    fn no_displayport_output_and_no_drm_stay_quiet() {
+        let mut base = empty_snapshot();
+        let mut port = charging_port(100_000, Some(5000), 20_000, 5000);
+        if let Some(p) = port.partner.as_mut() {
+            p.alt_modes.push(partner_alt_mode(0xff01, true));
+        }
+        base.ports.push(port);
+
+        let mut hdmi_only = base.clone();
+        hdmi_only.displays = vec![connector("HDMI-A-1", "disconnected", false)];
+        assert!(!codes(&analyze(&hdmi_only)).contains(&"DP_ALT_MODE_NO_OUTPUT"));
+
+        // displays empty = /sys/class/drm was not readable.
+        assert!(!codes(&analyze(&base)).contains(&"DP_ALT_MODE_NO_OUTPUT"));
     }
 
     /// One physical fault must read as one finding. On real hardware a single

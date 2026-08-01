@@ -119,6 +119,7 @@ fn format_report(report: &Report, args: &Args) -> String {
             render::orphan_pd(&mut out, &report.snapshot, &theme);
             render::battery(&mut out, &report.snapshot, &theme);
             render::thunderbolt(&mut out, &report.snapshot, &theme);
+            render::displays(&mut out, &report.snapshot, &theme);
         }
         Command::Devices => {
             render::devices(&mut out, &report.snapshot, &theme);
@@ -133,6 +134,7 @@ fn format_report(report: &Report, args: &Args) -> String {
             render::orphan_pd(&mut out, &report.snapshot, &theme);
             render::battery(&mut out, &report.snapshot, &theme);
             render::thunderbolt(&mut out, &report.snapshot, &theme);
+            render::displays(&mut out, &report.snapshot, &theme);
             render::devices(&mut out, &report.snapshot, &theme);
             render::storage(&mut out, report, &theme);
             render::findings(&mut out, report, &theme);

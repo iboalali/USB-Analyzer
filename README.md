@@ -21,7 +21,7 @@ USB-C PORTS
     attached       Source, PD 3.0, vid 04b4:0012
     contract       20 V at up to 5 A (100 W)  drawing 45 W  [usb_power_delivery]
     cable          passive, type-c, 5 A, max 20 V, USB 3.2 / USB4 Gen 2 (10 Gbps), <10 ns (~1 m)
-    alt modes      ff01.1 DisplayPort Alt Mode (VESA) active
+    port supports  ff01.1 DisplayPort Alt Mode (VESA)
 
 FINDINGS
 [MEDIUM] port0 Negotiated only 60 W from a supply offering 100 W
@@ -99,6 +99,7 @@ Everything is read-only. Nothing requires root.
 | `/sys/block/*/stat` | Live storage throughput — two reads and the time between them, no privileges |
 | `/dev/kmsg`, else `journalctl -k`, else `dmesg` | Resets, enumeration failures, link-training failures, over-current |
 | `udevadm monitor --udev` | Change notification for `watch`. Not data — just a reason to look again |
+| `/sys/class/drm/card*-*` | Display outputs: what is plugged in, whether it is being driven, and the monitor's EDID — the independent check on a DisplayPort Alt Mode claim |
 
 Capabilities and the live contract are kept strictly apart, because a charging
 complaint is almost always the gap between them.
@@ -126,7 +127,7 @@ traffic between two other devices. Those need hardware — a Total Phase Beagle,
 Cynthion/LUNA, or a USB-C PD analyzer. The tool says so in its own output rather
 than implying otherwise.
 
-Two limits worth knowing:
+A few limits worth knowing:
 
 - **Cable identity depends on firmware.** `port0-cable` appears only when the
   cable has an e-marker chip *and* the port controller reports SOP' data upward.
@@ -157,6 +158,19 @@ Two limits worth knowing:
   says outgoing draw is not measurable there, rather than claiming nothing is
   happening. The sink-side power rules are gated on direction for the same
   reason.
+- **A local port's alt-mode `active` flag means nothing.** `/sys/class/typec/portN/portN.M/active`
+  reads `yes` for every mode the *port* supports, whatever is attached — on this
+  ThinkPad both ports permanently claim Lenovo, Thunderbolt and DisplayPort modes
+  are all active while one holds a charger that reports zero alternate modes.
+  Only the **partner's** copy of the flag describes a mode that was entered, so
+  the port's list is rendered as "port supports" and no rule reads its `active`.
+- **DRM says whether a picture came out; it will not say what mode.**
+  `/sys/class/drm/card*-*` gives `connected`, `enabled`, `dpms`, the offered mode
+  list and the EDID — enough to check a DisplayPort Alt Mode claim against
+  reality. The mode actually being scanned out lives in the atomic KMS state,
+  which needs debugfs or a DRM master connection, so the tool never claims it.
+  Note too that a sleeping monitor still reads `connected`: attached and being
+  driven are reported separately.
 - **Type-C ports are not correlated to USB devices unless firmware says so.**
   Only the `connector` symlink is trusted. Matching by `physical_location` is
   tempting but ambiguous in practice — on this ThinkPad four USB receptacles
@@ -236,6 +250,7 @@ failing hub controller, or a marginal port produce identical evidence.
 | `PD_CONTRACT_BELOW_OFFER` | measured | Took much less power than the source offered. |
 | `PD_SOURCE_BELOW_SINK_CAPABILITY` | measured | Charger smaller than the port can accept. |
 | `DP_ALTMODE_NOT_ACTIVE` | measured | DisplayPort advertised but not engaged. |
+| `DP_ALT_MODE_NO_OUTPUT` | inferred | The partner *entered* DisplayPort Alt Mode and the graphics driver still sees nothing on any DisplayPort output — a cable carrying power and USB data but no high-speed pairs. Untested against hardware. |
 | `PORT_OVER_CURRENT_COUNT` | measured | The port's current limiter actually fired. |
 | `DEVICE_RESET_STORM` | heuristic / measured | Repeated resets. Becomes *measured* when runtime-PM accounting shows autosuspend is the cause. |
 | `ACTIVE_CABLE_PRESENT` | measured | Retimers enumerated — cable identity read from the cable's own silicon, independent of PD SOP'. |

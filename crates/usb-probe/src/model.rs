@@ -30,6 +30,9 @@ pub struct Snapshot {
     pub block_devices: Vec<BlockDevice>,
     /// Batteries, so an attached supply can be judged on whether it keeps up.
     pub batteries: Vec<Battery>,
+    /// Display outputs, so a DisplayPort Alt Mode claim can be checked against
+    /// whether a picture actually came out.
+    pub displays: Vec<DisplayConnector>,
     pub mains_online: Option<bool>,
     /// Seconds since boot at capture time, for dating events against devices.
     pub uptime_s: Option<f64>,
@@ -199,6 +202,11 @@ impl Snapshot {
             b.power_now_w.map(|w| (w * 2.0).round() as i64).hash(h);
         }
         self.mains_online.hash(h);
+
+        for d in &self.displays {
+            (&d.name, &d.status, d.enabled, &d.dpms, d.modes.len()).hash(h);
+            d.display.as_ref().map(|i| (&i.manufacturer, i.product_code, i.serial)).hash(h);
+        }
 
         let tb = &self.thunderbolt;
         for r in &tb.routers {
@@ -1319,6 +1327,117 @@ pub struct Retimer {
     pub device: Option<u16>,
     pub nvm_version: Option<String>,
     pub nvm_authenticate: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Displays
+// ---------------------------------------------------------------------------
+
+/// A display output, from `/sys/class/drm`.
+///
+/// The independent check on a DisplayPort Alternate Mode claim: the Type-C class
+/// describes a negotiation, this describes whether a picture came out.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisplayConnector {
+    /// Full sysfs name, e.g. `card1-HDMI-A-1`.
+    pub name: String,
+    /// Just the socket, e.g. `HDMI-A-1`, `DP-3`, `eDP-1`.
+    pub connector: String,
+    pub connector_id: Option<u32>,
+    /// `connected` | `disconnected` | `unknown`. "Unknown" is what a connector
+    /// that cannot detect presence reports, not an error.
+    pub status: Option<String>,
+    /// Whether the kernel has this output in its active configuration.
+    pub enabled: Option<bool>,
+    /// `On` | `Off` | `Standby` | `Suspend`.
+    pub dpms: Option<String>,
+    /// Modes the kernel is willing to drive, preferred first. Not the mode in
+    /// use — sysfs does not expose that.
+    pub modes: Vec<String>,
+    /// Decoded EDID, when the display provided a valid one.
+    pub display: Option<DisplayIdentity>,
+}
+
+impl DisplayConnector {
+    pub fn is_connected(&self) -> bool {
+        self.status.as_deref() == Some("connected")
+    }
+
+    /// Connected *and* being driven. A monitor that has gone to sleep still
+    /// reads `connected`, so the two are not the same question.
+    pub fn is_lit(&self) -> bool {
+        self.is_connected()
+            && self.enabled == Some(true)
+            && self.dpms.as_deref() != Some("Off")
+    }
+
+    /// True for the built-in panel, which is never what a cable question is
+    /// about.
+    pub fn is_internal(&self) -> bool {
+        self.connector.starts_with("eDP") || self.connector.starts_with("LVDS")
+    }
+
+    /// True for a DisplayPort output — including the ones a USB-C port drives
+    /// through DisplayPort Alt Mode, which appear as ordinary `DP-N`.
+    pub fn is_displayport(&self) -> bool {
+        self.connector.starts_with("DP") || self.connector.starts_with("DisplayPort")
+    }
+
+    /// The monitor's own name where it gave one, otherwise the socket.
+    pub fn label(&self) -> String {
+        self.display
+            .as_ref()
+            .and_then(|d| d.label())
+            .unwrap_or_else(|| self.connector.clone())
+    }
+}
+
+/// What a display says about itself in its EDID.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DisplayIdentity {
+    /// Three-letter PNP code, e.g. `GSM`.
+    pub manufacturer: Option<String>,
+    /// The name behind the code, for the common ones.
+    pub manufacturer_name: Option<String>,
+    pub product_code: Option<u16>,
+    pub serial: Option<u32>,
+    pub year: Option<u32>,
+    pub edid_version: Option<String>,
+    /// The monitor's own product name, from the 0xfc descriptor.
+    pub name: Option<String>,
+    /// Serial as text, from the 0xff descriptor.
+    pub serial_text: Option<String>,
+    /// The first detailed timing, which the standard defines as preferred —
+    /// in practice the panel's native mode.
+    pub preferred_mode: Option<DisplayMode>,
+}
+
+impl DisplayIdentity {
+    /// Best available human name: the product name, else the vendor, else the
+    /// raw PNP code.
+    pub fn label(&self) -> Option<String> {
+        self.name
+            .clone()
+            .or_else(|| self.manufacturer_name.clone())
+            .or_else(|| self.manufacturer.clone())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct DisplayMode {
+    pub width: u32,
+    pub height: u32,
+    pub refresh_hz: f64,
+    pub pixel_clock_khz: u32,
+}
+
+impl DisplayMode {
+    pub fn describe(&self) -> String {
+        format!(
+            "{}x{} @ {:.0} Hz",
+            self.width, self.height, self.refresh_hz
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

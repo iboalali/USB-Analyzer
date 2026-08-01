@@ -157,11 +157,11 @@ pub fn ports(out: &mut String, snap: &Snapshot, t: &Theme) {
         row(out, t, "cable", &cable_line(p, t));
 
         if !p.alt_modes.is_empty() {
-            row(out, t, "alt modes", &alt_modes_line(&p.alt_modes));
+            row(out, t, "port supports", &alt_modes_line(&p.alt_modes, false));
         }
         if let Some(pt) = &p.partner {
             if !pt.alt_modes.is_empty() {
-                row(out, t, "partner modes", &alt_modes_line(&pt.alt_modes));
+                row(out, t, "partner modes", &alt_modes_line(&pt.alt_modes, true));
             }
             // What the attached supply can actually deliver, with the profile
             // currently in use marked. Shown unconditionally: when charging is
@@ -498,7 +498,17 @@ fn cable_line(p: &TypecPort, t: &Theme) -> String {
     parts.join(", ")
 }
 
-fn alt_modes_line(modes: &[AltMode]) -> String {
+/// One line of alternate modes.
+///
+/// `show_state` exists because the `active` flag only means what it says on the
+/// **partner's** modes. A local port's alt-mode objects describe what the port
+/// is capable of, and on UCSI firmware they are reported `active = yes`
+/// unconditionally — this machine claims Lenovo, Thunderbolt and DisplayPort
+/// modes are all simultaneously active on both ports while a charger with zero
+/// alternate modes is attached to one and nothing to the other. Printing that
+/// as "active" would assert something the data does not support, so for the
+/// local port only the mode list is shown.
+fn alt_modes_line(modes: &[AltMode], show_state: bool) -> String {
     modes
         .iter()
         .map(|m| {
@@ -511,10 +521,10 @@ fn alt_modes_line(modes: &[AltMode]) -> String {
                 .as_deref()
                 .map(|n| format!(" {n}"))
                 .unwrap_or_default();
-            let state = match m.active {
-                Some(true) => " active",
-                Some(false) => " inactive",
-                None => "",
+            let state = match (show_state, m.active) {
+                (true, Some(true)) => " active",
+                (true, Some(false)) => " inactive",
+                _ => "",
             };
             format!("{svid}.{}{}{}", m.mode.unwrap_or(0), name, state)
         })
@@ -925,6 +935,133 @@ pub fn thunderbolt(out: &mut String, snap: &Snapshot, t: &Theme) {
 }
 
 // ---------------------------------------------------------------------------
+// Displays
+// ---------------------------------------------------------------------------
+
+/// What the GPU says is plugged in, which is the only independent check on a
+/// DisplayPort Alt Mode claim.
+///
+/// Connected and driven are separated deliberately. A monitor that has gone to
+/// sleep still reads `connected`, and reporting that as "in use" would make the
+/// tool wrong about the one thing this section exists to settle.
+pub fn displays(out: &mut String, snap: &Snapshot, t: &Theme) {
+    if snap.displays.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "{}", t.heading("displays"));
+
+    let (attached, empty): (Vec<_>, Vec<_>) =
+        snap.displays.iter().partition(|d| d.is_connected());
+
+    for d in &attached {
+        let state = if d.is_lit() {
+            t.green("driven")
+        } else {
+            t.dim("attached but not being driven")
+        };
+        let _ = writeln!(
+            out,
+            "  {} {}{}  {}",
+            t.bold(&format!("{:<12}", d.connector)),
+            d.label(),
+            if d.is_internal() {
+                t.dim("  built-in panel")
+            } else {
+                String::new()
+            },
+            state
+        );
+
+        if let Some(id) = &d.display {
+            if let Some(m) = &id.preferred_mode {
+                row(
+                    out,
+                    t,
+                    "native",
+                    &format!(
+                        "{}  {}",
+                        t.bold(&m.describe()),
+                        t.dim(&format!(
+                            "pixel clock {:.1} MHz",
+                            m.pixel_clock_khz as f64 / 1000.0
+                        ))
+                    ),
+                );
+            }
+            row(out, t, "identity", &t.dim(&identity_of(id)));
+        }
+        if !d.modes.is_empty() {
+            // `modes` lists one line per mode, so the same resolution repeats
+            // once per refresh rate it supports — and the file does not say
+            // which rate, so the repeats carry no information.
+            let mut sizes: Vec<&str> = Vec::new();
+            for m in &d.modes {
+                if !sizes.contains(&m.as_str()) {
+                    sizes.push(m);
+                }
+            }
+            let shown = sizes.iter().take(4).copied().collect::<Vec<_>>().join(", ");
+            let more = sizes.len().saturating_sub(4);
+            row(
+                out,
+                t,
+                "offers",
+                &t.dim(&if more > 0 {
+                    format!("{shown}, +{more} more")
+                } else {
+                    shown
+                }),
+            );
+        }
+    }
+
+    if attached.is_empty() {
+        let _ = writeln!(out, "  {}", t.dim("no display attached to any output"));
+    }
+    if !empty.is_empty() {
+        let names: Vec<&str> = empty.iter().map(|d| d.connector.as_str()).collect();
+        let _ = writeln!(
+            out,
+            "  {}",
+            t.dim(&if t.verbose {
+                format!("nothing attached: {}", names.join(", "))
+            } else {
+                format!("{} other output(s) with nothing attached", names.len())
+            })
+        );
+    }
+    // The one thing sysfs cannot answer, said once so it is never implied.
+    let _ = writeln!(
+        out,
+        "  {}",
+        t.dim("the mode being scanned out is not exposed by sysfs — only what is offered")
+    );
+    let _ = writeln!(out);
+}
+
+fn identity_of(id: &DisplayIdentity) -> String {
+    let mut parts = Vec::new();
+    match (&id.manufacturer_name, &id.manufacturer) {
+        (Some(n), Some(c)) => parts.push(format!("{n} ({c})")),
+        (None, Some(c)) => parts.push(c.clone()),
+        _ => {}
+    }
+    if let Some(p) = id.product_code {
+        parts.push(format!("product {p:04x}"));
+    }
+    if let Some(s) = &id.serial_text {
+        parts.push(format!("serial {s}"));
+    }
+    if let Some(y) = id.year {
+        parts.push(format!("made {y}"));
+    }
+    if let Some(v) = &id.edid_version {
+        parts.push(format!("EDID {v}"));
+    }
+    parts.join("  ")
+}
+
+// ---------------------------------------------------------------------------
 // USB device tree
 // ---------------------------------------------------------------------------
 
@@ -1236,6 +1373,64 @@ mod tests {
         assert!(out.contains("PD 3.0"), "{out}");
         // The headline capability must survive, not just the name.
         assert!(out.contains("100 W"), "{out}");
+    }
+
+    /// "Connected" and "being driven" must never be collapsed into one word: a
+    /// sleeping monitor reads connected, and calling that "in use" would make
+    /// the section wrong about the only thing it exists to settle.
+    #[test]
+    fn a_sleeping_monitor_is_not_reported_as_driven() {
+        let mut snap = Snapshot::default();
+        snap.displays.push(DisplayConnector {
+            name: "card1-HDMI-A-1".into(),
+            connector: "HDMI-A-1".into(),
+            connector_id: Some(108),
+            status: Some("connected".into()),
+            enabled: Some(false),
+            dpms: Some("Off".into()),
+            modes: vec!["2560x1440".into(), "2560x1440".into(), "1920x1080".into()],
+            display: Some(DisplayIdentity {
+                manufacturer: Some("GSM".into()),
+                manufacturer_name: Some("LG".into()),
+                name: Some("LG ULTRAGEAR".into()),
+                preferred_mode: Some(DisplayMode {
+                    width: 2560,
+                    height: 1440,
+                    refresh_hz: 120.0,
+                    pixel_clock_khz: 497_750,
+                }),
+                ..Default::default()
+            }),
+        });
+        snap.displays
+            .push(usb_probe::model::DisplayConnector {
+                name: "card1-DP-1".into(),
+                connector: "DP-1".into(),
+                connector_id: None,
+                status: Some("disconnected".into()),
+                enabled: Some(false),
+                dpms: None,
+                modes: Vec::new(),
+                display: None,
+            });
+
+        let mut out = String::new();
+        displays(
+            &mut out,
+            &snap,
+            &Theme {
+                color: false,
+                verbose: false,
+            },
+        );
+
+        assert!(out.contains("LG ULTRAGEAR"), "{out}");
+        assert!(out.contains("2560x1440 @ 120 Hz"), "{out}");
+        assert!(out.contains("attached but not being driven"), "{out}");
+        assert!(snap.displays[0].is_connected() && !snap.displays[0].is_lit());
+        // Repeated resolutions carry no information and are folded.
+        assert!(out.contains("2560x1440, 1920x1080"), "{out}");
+        assert!(out.contains("1 other output"), "{out}");
     }
 
     #[test]
