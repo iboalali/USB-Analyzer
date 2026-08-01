@@ -258,27 +258,28 @@ known to be sound.
 Every refusal path is verified against this machine, including the mounted-filesystem one
 firing for real on the SanDisk auto-mounted at `/media/iboalali/UNRAID`.
 
-### 6. Document the root-probe design in the README
+### 6. Document the root-probe design in the README — **done**
 
-Keeping the existing honesty about what software can and cannot know:
+Covered in a new **Active probing** section: the three-class split and why the default
+stays unprivileged, which probes need root and which of those are disruptive, the two
+refusals consent cannot lift and why an input device is one of them, the no-ioctl
+constraint and what it costs, the `O_DIRECT` trap, and the limit on restoring a port
+through a signal.
 
-- the Passive/Active split, and why the default stays unprivileged
-- which probes need root, and which are disruptive versus read-only
-- the confidence story, as built rather than as originally sketched: usbmon error counts
-  are measured, and they lift a Heuristic finding to Inferred — but no cable finding
-  reaches Measured, because attributing measured errors to the cable is still a
-  deduction, and a cable is only convicted by substitution
-- **what active probing still cannot reach, and why.** No userspace path exists to send
-  PD/SOP' messages: the PD state machine lives in the port controller firmware.
-  `CONFIG_UCSI_DEBUGFS` is not set on this kernel (6.17.0-1030-oem), and it is the one
-  interface that would let root issue raw UCSI commands such as `GET_CABLE_PROPERTY`, so
-  cable interrogation is closed here without a custom kernel build
-- the underlying reason: **you can only probe what is addressable, and a passive cable
-  has no address.** Its e-marker answers solely to the port controller over SOP'. Cable
-  probing is therefore always indirect — push traffic or power through it and observe
-  where it fails
-- out of reach at any privilege level: CC-line voltages, eye diagrams, jitter,
-  insertion loss
+Two sub-sections carry the parts that are easy to overstate. *What active probing still
+cannot reach* — root does not unlock the cable, because **you can only probe what is
+addressable and a passive cable has no address**; its e-marker answers solely to the port
+controller over SOP', `CONFIG_UCSI_DEBUGFS` is unset on this kernel, and CC voltages, eye
+diagrams, jitter and insertion loss are out of reach at any privilege. *What measurement
+buys, and what it does not* — measured errors lift heuristic to inferred and stop there,
+the three usbmon error classes and why conflating them would be the exact false accusation
+the tool exists to avoid, and why the throughput rule is judged against the slowest
+plausible medium rather than the link.
+
+The JSON surface is documented as an API rather than an output format, since that is now
+what it is. The rules table gained the five findings that only exist once a probe has run,
+and the data-source table gained usbmon, `/dev/sdX` and the port `disable` attribute,
+marked as the three that need root.
 
 ---
 

@@ -40,8 +40,7 @@ FINDINGS
 The split is deliberate: `usb-probe` returns a `Report` of plain serializable
 data with no borrows and no sysfs handles, so a native UI (egui, iced, GTK) can
 consume it directly and `crates/usbdiag/src/render.rs` is the only file a GUI
-replaces. `Report` also round-trips through JSON, so an out-of-process front end
-works too.
+replaces.
 
 ```rust
 let report = usb_probe::report(usb_probe::Options::default());
@@ -49,6 +48,47 @@ for f in &report.findings {
     println!("[{}] {} — {}", f.severity.label(), f.subject.display(), f.title);
 }
 ```
+
+Every decision lives in the library too, not in the CLI. `probe::plan` returns either a
+`Plan` or a `Refusal`; `Refusal::is_recoverable()` says whether to offer a confirmation or
+an error; and the mounted-filesystem and input-device refusals cannot be skipped by a
+front end that forgets to check them, because the check is inside the gate rather than in
+whatever called it.
+
+### The JSON surface is an API
+
+An out-of-process front end gets the same abilities, and the shapes are meant to be
+depended on:
+
+```console
+$ usbdiag json                                     # snapshot + findings
+$ usbdiag probe --json                             # {capabilities, probes[]}
+$ usbdiag probe NAME --dry-run --json              # the Plan, incl. side_effects
+$ usbdiag probe NAME --yes --force --json          # run it
+```
+
+A refusal is something to branch on rather than to read. It goes to **stdout** with exit
+code 2, carrying a stable `code`, a `recoverable` flag, and the details in fields:
+
+```json
+{
+  "code": "in_use",
+  "recoverable": false,
+  "message": "refusing to run a disruptive probe on 4-1: sda1 is mounted at /media/backup…",
+  "target": "4-1",
+  "holds": [{"via": "sda1", "kind": {"kind": "mounted", "where": "/media/backup"}}]
+}
+```
+
+That report is written by hand rather than derived from the `Refusal` enum. A derived
+shape would follow the enum, and the enum exists to make the *decision* clear — its
+variants get renamed as the rules sharpen. A wire format's job is to not move when they
+do.
+
+`--dry-run` is the step before a confirmation dialog: it decides, emits the plan including
+the `side_effects` list, and runs nothing. With `--json` the interactive prompt is skipped
+entirely, since it would otherwise hang a front end on a read of a stdin nobody is typing
+into.
 
 ## Usage
 
@@ -62,10 +102,19 @@ COMMANDS
     diag       Findings only
     watch      Re-render on change, driven by uevents
     json       Full snapshot and findings as JSON
+    probe      List the active probes; 'probe NAME' runs one
 
 OPTIONS
     -j --json   -v --verbose   --raw-log   --color/--no-color   --interval MS
     --sample MS    measure live storage throughput over this window
+
+PROBE OPTIONS
+    --target NAME   scope to one device: a sysfs name (6-1.2) or a disk (sdb)
+    --duration MS   how long a sampling probe runs
+    --cycles N      how many times 'reenumerate' cycles the port
+    -y --yes        consent to a disruptive probe
+    --force         accept the interruption without being asked
+    --dry-run       decide and print the decision, then stop
 ```
 
 Exit status is `0` when nothing actionable was found and `1` when there is a
@@ -84,9 +133,124 @@ missed event can never wedge the display. The kernel log is re-read on its own
 slower cadence, and immediately on any event, because reading it is a process
 spawn and everything else is a handful of sysfs reads.
 
+## Active probing
+
+Everything above reads state the kernel has already decided. That is enough for most
+questions and it is why the default needs no privileges — but it cannot answer the one
+that matters most about a marginal cable, which usually negotiates full speed and only
+fails under load. Seeing that means generating the load.
+
+So the tool is split in two, and the split is enforced in code rather than by convention.
+
+| Class | Runs | Needs |
+|---|---|---|
+| **passive** | always, by default | nothing |
+| **privileged, read-only** | when named | root, but changes nothing on the bus |
+| **disruptive** | only when asked twice | root, and takes the device off the bus |
+
+```console
+$ usbdiag probe                       # what exists, what is ready here, and why not
+$ usbdiag probe urb-errors            # named, so it runs — it only reads
+$ usbdiag probe reenumerate --target 6-1.2 --yes --force
+```
+
+| Probe | Class | What it does |
+|---|---|---|
+| `snapshot` | passive | The ordinary scan. |
+| `storage-sample` | passive | Two reads of `/sys/block/*/stat` over a window. |
+| `urb-errors` | privileged read | Counts URB completion errors per device from usbmon. |
+| `throughput` | privileged read | Reads a USB disk flat out with direct I/O. |
+| `reenumerate` | **disruptive** | Cycles the hub port and records what comes back, ~20 times. |
+
+**Consent is proportional to consequence.** A read-only probe runs when it is named —
+naming it *is* the request, and there is nothing to undo afterwards. Requiring a
+confirmation flag there would only teach the reflex of typing it, which is exactly what
+makes the flag worthless on the probe where it matters. A disruptive probe asks twice, for
+two different things: `--yes` to consent at all, then `--force` or a typed target name to
+accept the interruption.
+
+**Two refusals that consent cannot lift.** A disruptive probe is refused outright against
+a disk holding a mounted filesystem or an active swap area, and against a subtree
+containing an input device. The first is about data. The second is not — nothing is
+destroyed by cycling a keyboard's port, but it removes the means of stopping whatever
+happens next, which is not something anyone can agree to in advance. Everything else that
+drops and comes back — unmounted disks, network interfaces that may be carrying the
+session — is a warning printed in the confirmation instead.
+
+The mount check resolves the whole stack rather than comparing names, because the
+dangerous case looks nothing like the disk it endangers: a LUKS volume on a USB stick
+appears in `/proc/self/mounts` as `/dev/mapper/backup`, which shares no substring with
+`sdb`. Following `slaves/` links down to the physical disks is the only way to connect the
+two. It is read at the moment of the decision, never from the snapshot, since a filesystem
+can be mounted in between.
+
+**No ioctl, anywhere.** The obvious way to load a link is usbfs and raw SCSI over
+bulk-only transport; the obvious way to reset a device is `USBDEVFS_RESET`. Both need
+`ioctl`, which needs libc, and there is no portable pure-Rust substitute — inline assembly
+would work on x86_64 and break on aarch64, which is where a USB diagnostic tool earns its
+keep. So load is generated by reading the block device, and a port is cycled by writing to
+its `disable` attribute. The cost is that neither can touch a device that is not storage.
+
+`O_DIRECT` carries the throughput measurement, and it has a trap worth naming: its value
+differs between architectures, and Linux discards `open` flags it does not recognise
+**without an error**. A wrong constant does not fail — it silently reads the page cache
+and reports gigabytes per second over a USB cable. The value is therefore cfg-gated to
+architectures where it is known, anything else is unsupported at any privilege, and it is
+then proved at runtime by a deliberately misaligned read, which direct I/O rejects and
+buffered I/O serves. No proof, no number.
+
+**What restoring a port cannot promise.** The port is put back by a guard that runs on
+every return, every error path and on a panic. It does *not* run if the process is killed,
+because handling `SIGINT` needs a signal handler and therefore libc. The window is
+150 ms, and the command to re-enable a stuck port is printed *before* anything happens,
+since afterwards is precisely when it cannot be.
+
+### What active probing still cannot reach
+
+Root does not unlock the cable. **You can only probe what is addressable, and a passive
+cable has no address** — its e-marker answers solely to the port controller, over SOP',
+and the PD state machine lives in that controller's firmware where no userspace path
+reaches it. `CONFIG_UCSI_DEBUGFS` would allow raw UCSI commands such as
+`GET_CABLE_PROPERTY`; it is not set on the kernel this was built against
+(6.17.0-1030-oem), so cable interrogation is closed here without a custom kernel build.
+
+Cable probing is therefore always indirect: push traffic or power through it and observe
+where it fails. And the list of things no privilege level reaches is unchanged — CC-line
+voltages, eye diagrams, jitter, insertion loss.
+
+### What measurement buys, and what it does not
+
+Measured error counts **lift a heuristic finding to inferred, and stop there**. Nothing
+reaches `measured` on the strength of them. The counts are measured; blaming the cable for
+them is still a deduction, and a cable is only convicted by substitution. The suggestion on
+every such finding says so, because it is the actual next step: swap the cable, measure
+again, and see whether the number moves.
+
+usbmon's error classes are kept apart for the same reason. Conflating them would produce
+exactly the confident false accusation this tool exists to avoid:
+
+- **transport** — `EPROTO`, `EILSEQ`, `EOVERFLOW`, `ETIMEDOUT`. Implicates the wire.
+- **protocol** — `EPIPE`. On endpoint 0 this is a device declining a request, which is
+  routine; on a data endpoint it is a halt.
+- **cancelled** — `ENOENT`, `ECONNRESET`, `ESHUTDOWN`. A webcam stopping its stream
+  cancels URBs in bulk. Counting those would condemn every healthy camera on the machine.
+
+The throughput rule is careful in the same way, and for a reason specific to USB.
+Comparing achieved throughput against the *link* rate would condemn nearly every healthy
+drive — 110 MB/s over a 5 Gbps link that allows 450 is an ordinary flash drive. The media
+baseline that would fix that is mostly unavailable, because USB bridges do not implement
+the SCSI VPD page that reports whether a disk spins, and the kernel then defaults the flag
+to "rotating" for everything. So the yardstick is the slowest thing the medium could
+plausibly be: a known platter's ceiling; or, when the medium is unknown on a SuperSpeed
+link, only a collapse below what USB 2.0 itself would have delivered. Unknown medium on a
+High-Speed link is **not judged at all**, because a cheap flash drive and a bad cable are
+indistinguishable at those rates. The measurement is always shown; only the accusation is
+withheld.
+
 ## Where the data comes from
 
-Everything is read-only. Nothing requires root.
+The default run is read-only and needs no privileges. The three sources below the line are
+reached only by `usbdiag probe`.
 
 | Source | What it gives |
 |---|---|
@@ -100,6 +264,10 @@ Everything is read-only. Nothing requires root.
 | `/dev/kmsg`, else `journalctl -k`, else `dmesg` | Resets, enumeration failures, link-training failures, over-current |
 | `udevadm monitor --udev` | Change notification for `watch`. Not data — just a reason to look again |
 | `/sys/class/drm/card*-*` | Display outputs: what is plugged in, whether it is being driven, and the monitor's EDID — the independent check on a DisplayPort Alt Mode claim |
+| `/proc/self/mounts`, `/proc/swaps` | What is in use, resolved through `slaves/` links down to the physical disk. Not data — the check that stands between a disruptive probe and someone's filesystem |
+| **`/sys/kernel/debug/usb/usbmon/0u`** | *root.* Every URB and its completion status — the one source that observes behaviour rather than negotiated state |
+| **`/dev/sdX`** | *root.* Read with `O_DIRECT` to put the link under load and measure what it actually carries |
+| **`.../usbN-portM/disable`** | *root, disruptive.* Switches a hub port off and on, to see whether the link trains the same way twice |
 
 Capabilities and the live contract are kept strictly apart, because a charging
 complaint is almost always the gap between them.
@@ -120,6 +288,10 @@ Findings carry a confidence level, because the honest answer differs by field:
   between is the limit, and the cable is the usual suspect.
 - **`heuristic`** — a symptom pattern that could have another cause, such as a
   reset storm.
+
+Measured URB errors can lift a heuristic finding to inferred. Nothing lifts a cable
+finding to measured, at any privilege level, because attributing measured errors to the
+cable is still a deduction — see [what measurement buys](#what-measurement-buys-and-what-it-does-not).
 
 **Not possible in software, at all:** eye diagrams, jitter, insertion loss,
 CC-line voltages, the true rating of a cable with no e-marker, and sniffing
@@ -262,11 +434,21 @@ failing hub controller, or a marginal port produce identical evidence.
 | `BUS_OVER_CURRENT`, `BUS_POWER_INSUFFICIENT`, `BUS_BANDWIDTH_INSUFFICIENT` | measured | Power and bandwidth faults from the ring buffer. |
 | `KERNEL_LOG_UNAVAILABLE` | measured | Reset history could not be read, so those rules were skipped. |
 
+Findings that only exist once a probe has been run:
+
+| Code | Confidence | Catches |
+|---|---|---|
+| `LINK_ERROR_RATE` | measured | Transport errors counted from usbmon over a window. High above 1% of completions. Protocol errors and driver cancellations are excluded, not merely weighted. |
+| `THROUGHPUT_FAR_BELOW_LINK` | measured | A measured sequential read far below what both the link and the slowest plausible medium allow. Silent where a slow drive would explain it. |
+| `STORAGE_READ_FAILED` | measured | A read that began and then died. The drive answered and then stopped answering, which no amount of negotiated state would have revealed. |
+| `LINK_INTERMITTENT` | measured | The port was cycled and did not behave the same way twice. High when the device failed to re-appear at all, medium when it merely trained slower. |
+| `LINK_STABLE_UNDER_CYCLING` | measured | Info. Every cycle trained identically — which does not clear a cable, but does rule out intermittency, and a deliberate test should say something when it passes. |
+
 ## Build
 
 ```sh
 cargo build --release        # ./target/release/usbdiag
-cargo test                   # 121 tests
+cargo test                   # 224 tests
 ```
 
 No non-Rust dependencies. Dependencies are `serde` and `serde_json` only; sysfs
