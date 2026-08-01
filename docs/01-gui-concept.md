@@ -25,7 +25,7 @@ they carry no privilege risk while being proven.
 
 | | TempoUI | usb-analyzer |
 |---|---|---|
-| logic, no GTK, all tests | `crates/core` | **`crates/usb-probe`** — exists, 224 tests |
+| logic, no GTK, all tests | `crates/core` | **`crates/usb-probe`** — exists, 234 tests |
 | thin GTK layer, no tests | `crates/ui` | **`crates/gui`** → binary `usbdiag-gui` |
 | CLI | — | `crates/usbdiag` — unchanged |
 
@@ -123,23 +123,6 @@ could not settle, and the drawings did:
   and keep true. Ship the narrow window; take the popover only where a tray host
   exists and someone asks for it.
 
-```
-┌ usbdiag ──────────────────────────────────────────── ⟳  ● live ─┐
-│ ┌─────────────────┐│  port0 · left panel                        │
-│ │ PORTS           ││  Cable is limiting charging speed          │
-│ │ ● port0   60 W  ││  ┌──────────────────────────────────────┐  │
-│ │ ○ port1   empty ││  │ POWER                                │  │
-│ │                 ││  │  charger     cable      contract  in │  │
-│ │ DEVICES         ││  │  ▉▉▉▉▉▉▉▉ →  ▉▉▉▉▉  →  ▉▉▉▉▉  → ▉▉▉▉ │  │
-│ │ ▾ usb4    10 G  ││  │  100 W       3 A/60 W   60 W     100 │  │
-│ │   ● 4-1 SanDisk ││  │              ▲ the limit             │  │
-│ │ ▾ usb5   480 M  ││  └──────────────────────────────────────┘  │
-│ │   ● 5-1.1 stick ││                                            │
-│ │     via 1 hub   ││  ⚠  Negotiated only 60 W from a supply     │
-│ │   ▲ 5-1.2 DA20  ││     offering 100 W          ⟨measured⟩     │
-│ └─────────────────┘│     → Test with a 5 A e-marked cable       │
-└────────────────────┴────────────────────────────────────────────┘
-```
 
 **Findings lead, the chain supports.** Reversed after
 [`02-prior-art.md`](02-prior-art.md): the chain is what three other projects

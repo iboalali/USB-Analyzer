@@ -85,4 +85,4 @@ docs/mockups/shoot.sh                 # → docs/mockups/shots/
 ```
 
 Screenshots are kept out of git (`/captures` is ignored); the copies from the
-session that produced them are in `captures/claude/2026-08-01_bd64000a/`.
+session that produced them are in `captures/claude/2026-08-01_bd64000a/` and `2026-08-02_bd64000a/`.
