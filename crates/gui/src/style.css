@@ -1,0 +1,233 @@
+/* usbdiag-gui — loaded once at startup via `relm4::set_global_css`.
+ *
+ * Every colour here is a libadwaita named colour, or something derived from one
+ * with GTK's `alpha()` / `mix()`. That is deliberate: libadwaita swaps those
+ * values when the desktop switches between light and dark, and GTK CSS has no
+ * media queries, so a hardcoded hex would be a permanent light-mode bug. The
+ * one place the palette is written out in full is `chain.rs`, because cairo
+ * cannot see CSS — that copy is commented as such.
+ *
+ * Two hazards, both found by measuring the HTML mockups rather than by reading
+ * them (docs/mockups/README.md):
+ *
+ *   1. Class-name collisions. `.evidence` is the monospace block inside a
+ *      finding. Do not reuse it for a card; the chain card is `.supporting`.
+ *   2. Specificity ties. `.dot` sets its own background exactly once, below.
+ *      Restating it in `.finding .dot` would tie with `.dot.high` and let
+ *      source order silently grey out every severity dot. */
+
+/* ---------- shared ---------- */
+
+.dim {
+    color: alpha(currentColor, 0.65);
+}
+
+.mono {
+    font-family: monospace;
+    font-size: 0.85em;
+}
+
+/* The one place a dot's fill is declared. See hazard 2 above. */
+.dot {
+    background: alpha(currentColor, 0.25);
+    border-radius: 999px;
+    min-width: 9px;
+    min-height: 9px;
+    margin-top: 5px;
+}
+
+.dot.high    { background: @error_color; }
+.dot.medium  { background: mix(@warning_color, @error_color, 0.45); }
+.dot.low     { background: @warning_color; }
+.dot.ok      { background: @success_color; }
+.dot.info    { background: alpha(currentColor, 0.3); }
+/* Examined, nothing to cite: visibly not the same as a clean bill of health. */
+.dot.none    { background: transparent; box-shadow: inset 0 0 0 1.5px alpha(currentColor, 0.3); }
+
+.chip {
+    font-size: 0.75em;
+    font-weight: bold;
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: alpha(currentColor, 0.09);
+    color: alpha(currentColor, 0.7);
+}
+
+.chip.measured  { color: @success_color;  background: alpha(@success_color, 0.13); }
+.chip.inferred  { color: @accent_color;   background: alpha(@accent_color, 0.13); }
+.chip.heuristic { color: @warning_color;  background: alpha(@warning_color, 0.16); }
+.chip.subject   { font-weight: normal; font-family: monospace; }
+.chip.code      { font-family: monospace; font-weight: normal; font-size: 0.72em; }
+
+/* ---------- sidebar ---------- */
+
+.sidebar-list {
+    padding: 6px 8px 14px 8px;
+}
+
+.group-hd {
+    margin: 14px 4px 4px 4px;
+}
+
+.group-title {
+    font-size: 0.72em;
+    font-weight: bold;
+    color: alpha(currentColor, 0.5);
+}
+
+.bus {
+    margin: 10px 6px 2px 6px;
+    font-size: 0.8em;
+    color: alpha(currentColor, 0.55);
+}
+
+button.row {
+    padding: 7px 8px;
+    border-radius: 8px;
+}
+
+button.row.sel {
+    background: alpha(currentColor, 0.1);
+}
+
+.name {
+    font-weight: bold;
+}
+
+.meta {
+    font-size: 0.82em;
+    color: alpha(currentColor, 0.5);
+}
+
+.why {
+    font-size: 0.82em;
+    color: alpha(currentColor, 0.6);
+}
+
+.why.high   { color: @error_color; }
+.why.medium { color: mix(@warning_color, @error_color, 0.45); }
+.why.low    { color: @warning_color; }
+.why.ok     { color: @success_color; }
+
+.footnote {
+    margin: 12px 6px 0 6px;
+    font-size: 0.8em;
+    color: alpha(currentColor, 0.45);
+}
+
+/* ---------- detail pane ---------- */
+
+.detail {
+    padding: 18px;
+}
+
+.verdict {
+    padding: 4px 2px 8px 2px;
+}
+
+.verdict .glyph {
+    font-size: 1.5em;
+    font-weight: bold;
+    min-width: 34px;
+    min-height: 34px;
+    border-radius: 999px;
+}
+
+.verdict.clear .glyph { color: @success_color; background: alpha(@success_color, 0.15); }
+.verdict.minor .glyph { color: @warning_color; background: alpha(@warning_color, 0.18); }
+.verdict.fault .glyph { color: @error_color;   background: alpha(@error_color, 0.15); }
+
+.headline {
+    font-size: 1.35em;
+    font-weight: bold;
+}
+
+/* ---------- cards ---------- */
+
+.card {
+    background: @card_bg_color;
+    border-radius: 12px;
+    padding: 14px 16px;
+    box-shadow: 0 1px 2px alpha(@card_shade_color, 0.5);
+}
+
+.card-title {
+    font-weight: bold;
+}
+
+.rank {
+    font-size: 0.8em;
+    color: alpha(currentColor, 0.5);
+}
+
+/* On a healthy machine this card is the content, not a footnote to it. */
+.card.cleared {
+    background: alpha(@success_color, 0.07);
+    box-shadow: inset 0 0 0 1px alpha(@success_color, 0.2);
+}
+
+.card.silent {
+    background: alpha(currentColor, 0.04);
+    box-shadow: none;
+}
+
+/* The chain. Named `.supporting`, never `.evidence` — see hazard 1 above. */
+.card.supporting {
+    background: alpha(currentColor, 0.04);
+    box-shadow: none;
+}
+
+.chain-note {
+    font-size: 0.85em;
+}
+
+/* ---------- findings ---------- */
+
+.finding-title {
+    font-weight: bold;
+}
+
+/* §8: Heuristic is a different kind of card, not a lower severity. The dashed
+ * edge marks the claim as pattern-matched without touching the severity dot. */
+.finding.heuristic-card {
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: alpha(@warning_color, 0.07);
+    box-shadow: inset 0 0 0 1px alpha(@warning_color, 0.25);
+}
+
+.evidence {
+    font-family: monospace;
+    font-size: 0.8em;
+    padding: 6px 8px;
+    border-radius: 6px;
+    background: alpha(currentColor, 0.06);
+    color: alpha(currentColor, 0.75);
+}
+
+.suggestion {
+    font-size: 0.9em;
+    color: @accent_color;
+}
+
+.cleared-row .tick {
+    color: @success_color;
+    font-weight: bold;
+    margin-top: 1px;
+}
+
+/* ---------- header ---------- */
+
+.live {
+    font-size: 0.82em;
+    color: alpha(currentColor, 0.6);
+    padding: 2px 10px 2px 8px;
+    border-radius: 999px;
+    background: alpha(currentColor, 0.07);
+}
+
+.live .dot {
+    margin-top: 0;
+    min-width: 8px;
+    min-height: 8px;
+}

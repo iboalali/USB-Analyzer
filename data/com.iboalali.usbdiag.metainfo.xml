@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata, so GNOME Software can show the app and its changelog.
+     Validate locally with: appstreamcli validate data/com.iboalali.usbdiag.metainfo.xml -->
+<component type="desktop-application">
+  <id>com.iboalali.usbdiag</id>
+
+  <name>USB Diagnostics</name>
+  <summary>See what a USB-C cable, port, and charger actually negotiated</summary>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <description>
+    <p>
+      A native viewer for the state Linux already knows about your USB-C ports,
+      cables, chargers, and devices — and for the conclusions that state
+      supports. It reads sysfs and the kernel log, needs no privileges, and
+      updates live as things are plugged and unplugged.
+    </p>
+    <p>
+      Each port and device gets a one-sentence verdict, the checks that were
+      ruled out, the findings that fired, and a bottleneck chain showing where
+      power or speed stops. Every finding carries how much to trust it —
+      measured, inferred, or a heuristic — and where a question cannot be
+      answered on this hardware, the app says so instead of leaving a gap.
+    </p>
+    <p>
+      It cannot measure a cable electrically. Signal integrity, CC-line
+      voltages, and the true rating of an unmarked cable are invisible to
+      software and need a hardware analyzer.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">com.iboalali.usbdiag.desktop</launchable>
+  <provides>
+    <binary>usbdiag-gui</binary>
+  </provides>
+
+  <developer id="com.iboalali">
+    <name>iboalali</name>
+  </developer>
+
+  <url type="homepage">https://github.com/iboalali/USB-Analyzer</url>
+  <url type="bugtracker">https://github.com/iboalali/USB-Analyzer/issues</url>
+
+  <content_rating type="oars-1.1" />
+
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+  <recommends>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </recommends>
+
+  <!-- TODO: add <screenshots> before any store submission. -->
+
+  <releases>
+    <release version="0.1.0" date="2026-08-02">
+      <description>
+        <p>
+          First release of the graphical viewer: port and device tree, verdicts,
+          exonerations, findings, and the power and data bottleneck chains,
+          updating live from udev. Read-only; the privileged probes stay in the
+          command-line tool behind an explicit consent gate.
+        </p>
+      </description>
+    </release>
+  </releases>
+</component>

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=USB Diagnostics
+GenericName=USB & Power Delivery Inspector
+Comment=See what a USB-C cable, port, and charger actually negotiated
+Exec=usbdiag-gui
+Icon=com.iboalali.usbdiag
+Terminal=false
+Categories=System;Monitor;
+Keywords=USB;USB-C;Type-C;Cable;Charger;PowerDelivery;PD;Thunderbolt;Diagnostics;
+StartupNotify=true
+StartupWMClass=com.iboalali.usbdiag

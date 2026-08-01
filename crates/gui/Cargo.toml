@@ -1,0 +1,18 @@
+[package]
+name = "usbdiag-gui"
+description = "gtk4-rs + libadwaita (Relm4) viewer for usb-probe: ports, devices, findings and the bottleneck chain."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "usbdiag-gui"
+path = "src/main.rs"
+
+[dependencies]
+usb-probe = { workspace = true }
+gtk4 = { workspace = true }
+libadwaita = { workspace = true }
+relm4 = { workspace = true }

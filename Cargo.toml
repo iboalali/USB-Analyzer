@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/usb-probe", "crates/usbdiag"]
+members = ["crates/usb-probe", "crates/usbdiag", "crates/gui"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +13,17 @@ license = "MIT"
 usb-probe = { path = "crates/usb-probe" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# --- GUI only. `usb-probe` must never gain any of these; its 13-crate tree is
+# a stated design property that decided the shape of two probes, and the GTK
+# layer is where all that weight is allowed to live.
+#
+# Versions in lockstep, matching TempoUI-for-Linux: relm4 0.11 is the
+# generation that rides gtk4 0.11 + libadwaita 0.9. Mixing generations pulls
+# two gtk4-sys versions and collides on the `gtk-4` native `links` key.
+gtk4 = { version = "0.11", features = ["v4_14"] }      # Ubuntu 24.04 ships 4.14
+libadwaita = { version = "0.9", features = ["v1_5"] }  # imported as `adw`
+relm4 = { version = "0.11", features = ["libadwaita"] }
 
 [profile.release]
 lto = "thin"

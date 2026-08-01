@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Symbolic variant: single colour, 16px grid, no gradients or opacity tricks.
+     The shell recolours `fill`, so everything is one filled path set. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <g fill="currentColor">
+    <path d="M4.5 3.5h7a4.5 4.5 0 0 1 0 9h-7a4.5 4.5 0 0 1 0-9zm0 1.4a3.1 3.1 0 0 0 0 6.2h7a3.1 3.1 0 0 0 0-6.2z"/>
+    <rect x="4.6" y="6.05" width="6.8" height="1.1" rx="0.55"/>
+    <rect x="4.6" y="7.45" width="2.4" height="1.1" rx="0.55"/>
+    <rect x="4.6" y="8.85" width="6.8" height="1.1" rx="0.55"/>
+  </g>
+</svg>
