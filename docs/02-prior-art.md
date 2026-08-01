@@ -74,8 +74,17 @@ familiarity. The findings list is the differentiated surface, so it should lead
 nice-to-have. `usbeehive`'s `Bottleneck::Fine` is #24 for charging alone; ours
 should be per-subject across every rule.
 
-**Two things to take.** Bundle a vendor database. Port the `CableTrust`
-heuristics — MIT, and they fit our confidence model exactly.
+**Three things to take**, now tracked as tasks #25 and #26.
+
+Not a bundled vendor database — the *system* one. `/usr/share/hwdata/usb.ids` and
+`/usr/share/misc/usb.ids` are both present on this machine at 25 627 lines,
+shipped by packages any machine with `lsusb` already has. Reading at runtime
+cannot go stale, adds no data file, raises no licence question, and is better
+data: it names Goodix, where `usbeehive::vendor::lookup(0x27c6)` returns hex.
+
+Then the `CableTrust` heuristics (MIT), which need that database for one of
+their three signals. And the device taxonomy — but split, so that
+product-string guesses may only ever suppress a finding, never raise one.
 
 **One option worth naming rather than assuming away.** `usbeehive` is MIT, in
 Rust, with a D-Bus interface and a stable JSON surface. Contributing the

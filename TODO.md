@@ -396,6 +396,76 @@ every machine.
 - give it its own code (`STORAGE_IO_ERRORS`) rather than folding it into
   `LINK_ERROR_RATE`, so the two sources are never conflated in evidence
 
+### Name vendors from `usb.ids`, and flag e-markers that look counterfeit
+
+From [`docs/02-prior-art.md`](docs/02-prior-art.md). Two features, one item, because the
+second needs the first.
+
+**Vendor names.** Device names come from the sysfs `manufacturer` and `product` strings,
+which is fine for devices and useless for cables: an e-marker carries a vendor ID in its
+ID Header VDO and never a string. On hardware that exposes a cable at all — not this
+laptop, see below — we would print `0x2109` where a name exists.
+
+`usbeehive` solves this by bundling a USB-IF table. **Read the system database instead.**
+`/usr/share/hwdata/usb.ids` and `/usr/share/misc/usb.ids` are both present here, 25 627
+lines, shipped by `hwdata` and `usb.ids` respectively — packages already on any machine
+with `lsusb`. Reading at runtime beats bundling on every axis that matters: it cannot go
+stale, it adds no data file, and it raises no licence question. It is also simply better
+data — the system table names Goodix (`27c6  Shenzhen Goodix Technology Co.,Ltd.`) where
+`usbeehive::vendor::lookup(0x27c6)` falls back to hex. Absence must stay non-fatal: hex is
+the correct answer when the file is not installed, and the parse is two fields of a
+tab-indented text file, not a dependency.
+
+**Counterfeit signals**, after `usbeehive::cable::CableTrust` (MIT). Three, none
+conclusive: a zero vendor ID in the ID Header VDO, a VID the database does not know, and
+reserved bits set in the Cable VDO.
+
+Three traps, in order of how badly each would misfire:
+
+- **This must be Heuristic, and Info or Low.** "Your cable may be counterfeit" is the
+  most damaging sentence this tool could emit wrongly, and all three signals are weak.
+  A cheap-but-honest cable from an unregistered vendor trips two of them.
+- **The reserved-bits check must inherit our PD-revision uncertainty.** `vdo.rs` already
+  refuses to guess between the PD 2.0 and 3.0 product-type encodings, reporting *"Passive
+  or Active Cable (ambiguous without PD revision)"*. The Cable VDO layout differs between
+  passive and active, so where the revision is unknown the check cannot run — it would
+  read reserved bits at the wrong offsets and fire on healthy PD 2.0 cables.
+- **The unknown-VID signal is only as good as `usb.ids`.** Suppress it entirely when the
+  file is missing, or every cable becomes suspicious on a minimal system.
+
+Untestable here. UCSI exposes no cable node — `/sys/class/typec/` has ports and partners
+and no `port0-cable` — so every line of this is dead code on this machine and gets
+fixtures, not a live check. Same category as #12 and #23.
+
+### Classify devices, but only let a guess suppress a finding
+
+`usbeehive` carries a 28-kind taxonomy — Camera, Gamepad, Keyboard, SecurityKey,
+SmartcardReader, Phone, VideoCapture, Storage, Hub — built from class codes plus
+product-string heuristics. We classify by USB class code alone.
+
+This is not decoration. What a device *is* changes what an observation *means*: 480 Mbps
+is correct for a keyboard and a fault for an external SSD; 900 mA is a phone charging and
+a mouse malfunctioning. The taxonomy is a rule input, which is exactly why it is
+dangerous.
+
+**The constraint that makes it safe: a classification may suppress or soften a finding,
+never create one.** The asymmetry is not stylistic. A wrong guess that suppresses costs a
+missed detection — bad. A wrong guess that accuses costs a false accusation against
+hardware the user then replaces — the failure this whole project is built to avoid. Only
+one of those is recoverable, so guesses may only ever push toward silence.
+
+That splits the taxonomy in two, and the split should be in the type, not in a comment:
+
+- **Class-code derived** — from `bDeviceClass` / `bInterfaceClass`. Not a guess; the
+  device asserts it. May feed any rule.
+- **String-heuristic derived** — "this product string contains *webcam*". A guess, and it
+  must be marked as one so a rule cannot silently treat it as fact.
+
+Start with the class-code half only. It covers hubs, HID, storage, audio, video and
+Billboard, which is most of what the rules actually need, and it carries no risk. The
+string heuristics are worth having later, behind the suppress-only rule, and are worth
+nothing at all if that rule is not enforced by the types.
+
 ---
 
 ## Shipped but unverified against hardware
