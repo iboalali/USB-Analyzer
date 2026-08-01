@@ -1,0 +1,235 @@
+# GUI concept
+
+A native GTK4 front end for `usb-probe`, in the shape of
+[TempoUI-for-Linux](https://github.com/iboalali/TempoUI-for-Linux) — the same
+workspace split, the same toolkit versions, the same Relm4 idioms.
+
+This document is the design; the reasoning is here rather than in commit messages
+because most of it is about what the UI must *not* do.
+
+---
+
+## 1. Scope of v1
+
+**Viewer only.** Device tree, detail pane, findings, and the bottleneck chain,
+updating live from udev. No probes, no privilege, no consent dialogs, no
+`pkexec`. The window opens and is useful with zero privileges.
+
+Probes and the substitution workflow are designed for (§9) and deliberately not
+built yet: the layout and the chain widget are the parts worth proving first, and
+they carry no privilege risk while being proven.
+
+---
+
+## 2. Shape
+
+| | TempoUI | usb-analyzer |
+|---|---|---|
+| logic, no GTK, all tests | `crates/core` | **`crates/usb-probe`** — exists, 224 tests |
+| thin GTK layer, no tests | `crates/ui` | **`crates/gui`** → binary `usbdiag-gui` |
+| CLI | — | `crates/usbdiag` — unchanged |
+
+Versions in lockstep, matching TempoUI exactly: `gtk4` 0.11 (`v4_14`),
+`libadwaita` 0.9 (`v1_5`), `relm4` 0.11 (`libadwaita` feature). The development
+machine has GTK 4.14.5 and libadwaita 1.5.0, so the Ubuntu 24.04 baseline holds
+with no newer APIs.
+
+`usb-probe` gains **no** dependency from this. Its 13-crate tree is a stated
+design property that decided the shape of two probes; the GUI crate carries all
+the weight.
+
+Application ID `com.iboalali.usbdiag`, binary `usbdiag-gui`, CLI stays `usbdiag`.
+
+---
+
+## 3. Reading is in-process; probing is not
+
+These are different problems and get different answers.
+
+**Reading: link the library.** `usb_probe::capture()` on a worker thread. Typed
+data, no subprocess per refresh, no JSON round trip, no parsing. Reading needs no
+privilege, so the GUI process stays unprivileged — which is the whole point.
+
+**Probing: `pkexec usbdiag probe … --json`.** Only when §9 arrives. One polkit
+prompt showing the exact command — a better consent surface than anything drawn
+by hand — and the safety gate stays inside the privileged process where a front
+end cannot skip it. This is what the JSON API exists for.
+
+Running the whole GUI as root to reach the probes would be the obvious shortcut
+and is not acceptable for a window that sits open on a desktop.
+
+---
+
+## 4. Three ways this differs from TempoUI
+
+**The core is synchronous and must stay dependency-thin.** `tempo-core` is async
+`reqwest` + `tokio`. A capture here is cheap sysfs reads plus one `journalctl`
+spawn, and that spawn is the expensive part — it is why `watch` caches the log at
+all. So captures go off the GTK thread with `relm4::spawn_blocking`, and
+`usb-probe` stays sync and free of `tokio`.
+
+Reuse the log cache policy already worked out in the CLI's watch loop: hand the
+previous `KernelLog` back to `capture_with_log` unless a real event arrived or
+10 s have passed. Re-reading it every frame would spawn a process every frame.
+
+**The event source is a blocking child process, not a socket.**
+`monitor::Monitor` spawns `udevadm monitor --udev` and blocks on reads. That
+becomes a Relm4 **Worker** owning the thread and forwarding events. The debounce
+already exists — `wait_for_change(fallback, quiet 250 ms, max 1500 ms)` — so the
+Worker wraps it. Do not reimplement debouncing in the UI; a device in a reset
+loop must not be able to hold the display still, and that logic is already
+correct.
+
+`Snapshot::fingerprint()` exists for exactly this and should gate rebuilds: it
+excludes time, I/O counters and sub-0.5 W battery drift, so the view stays still
+while nothing is happening.
+
+**No network, no keyring, no OAuth.** Whole categories of TempoUI's complexity
+are absent. What replaces them is privilege, and v1 has none of it.
+
+---
+
+## 5. Presentation: adaptive from the start
+
+WhatCable runs as a menu-bar popover *and* as an ordinary windowed app
+(Settings, or `--desktop`). The same content therefore has to work at popover
+width and at window width, and that is a constraint worth adopting: a small
+window kept open while cables are plugged and unplugged is exactly how this tool
+gets used.
+
+So the layout is adaptive from the first commit — `AdwBreakpoint` collapsing
+`AdwNavigationSplitView` to a single pane below ~500 px. Retrofitting that later
+means rewriting every container.
+
+GNOME has no menu-bar equivalent worth targeting, so there is no tray mode. The
+compact presentation is just a narrow window.
+
+```
+┌ usbdiag ──────────────────────────────────────────── ⟳  ● live ─┐
+│ ┌─────────────────┐│  port0 · left panel                        │
+│ │ PORTS           ││  Cable is limiting charging speed          │
+│ │ ● port0   60 W  ││  ┌──────────────────────────────────────┐  │
+│ │ ○ port1   empty ││  │ POWER                                │  │
+│ │                 ││  │  charger     cable      contract  in │  │
+│ │ DEVICES         ││  │  ▉▉▉▉▉▉▉▉ →  ▉▉▉▉▉  →  ▉▉▉▉▉  → ▉▉▉▉ │  │
+│ │ ▾ usb4    10 G  ││  │  100 W       3 A/60 W   60 W     100 │  │
+│ │   ● 4-1 SanDisk ││  │              ▲ the limit             │  │
+│ │ ▾ usb5   480 M  ││  └──────────────────────────────────────┘  │
+│ │   ● 5-1.1 stick ││                                            │
+│ │     via 1 hub   ││  ⚠  Negotiated only 60 W from a supply     │
+│ │   ▲ 5-1.2 DA20  ││     offering 100 W          ⟨measured⟩     │
+│ └─────────────────┘│     → Test with a 5 A e-marked cable       │
+└────────────────────┴────────────────────────────────────────────┘
+```
+
+**Ports lead, devices follow.** WhatCable is organised around the cable as the
+subject, which matches the question people actually ask; this tool has been
+organised around devices and findings. `Subject::Cable(port)` already exists in
+the model, so the reordering costs nothing.
+
+**Hubs collapse by default**, behind a `via N hubs` label, with a control to
+reveal them. Showing every hub buries the device the user came for.
+
+---
+
+## 6. Files
+
+Flat, like `crates/ui/src`:
+
+```
+main.rs      AppModel — snapshot, findings, selection, live flag
+monitor.rs   Worker wrapping monitor::Monitor
+sidebar.rs   ports + device tree, severity dot per row, hub collapsing
+detail.rs    the selected subject: verdict, chain, findings
+chain.rs     the bottleneck chain — cairo DrawingArea
+findings.rs  finding rows: severity, title, detail, suggestion, confidence
+style.css
+```
+
+No tests in this crate. Real logic belongs in `usb-probe`, same rule as
+`tempo-core`.
+
+---
+
+## 7. The chain widget
+
+A cairo `DrawingArea`, the same call `timeline.rs` makes. Boxes and labels cannot
+do the proportional bars, the arrows and the "▲ the limit" marker without
+fighting the layout engine, and the codebase already establishes cairo as the
+answer for that.
+
+Two chains, one widget:
+
+- **power** — charger offer → cable current rating → contract → sink capability
+- **data** — device capability → cable data rating → port capability → link
+
+**Which stage is marked comes from the findings, never from logic in the
+widget.** `Subject::Cable(port)` and codes like `CABLE_CURRENT_LIMIT`,
+`PD_CONTRACT_BELOW_OFFER`, `CABLE_DATA_LIMIT` already name the culprit. A stage
+is highlighted because a finding points at it. Any diagnosis living in
+`chain.rs` would be a second rule engine, and it would drift from the first.
+
+---
+
+## 8. The honesty rules, as pixels
+
+This is the constraint to hold hardest, because a GUI makes it trivial to break.
+
+- **Confidence on every finding**, never collapsed into a colour.
+- **Severity colours the row, but a coloured dot never appears without its
+  sentence.** A red mark with no text is an accusation with no evidence.
+- **"might be defective" never becomes "is".**
+- **`Heuristic` is a different kind of card, not a lower severity.** WhatCable's
+  hedged orange "this looks unusual" trust signals are the right model: a visual
+  class for suspicion, kept apart from the scale of severity.
+- **Silence is not an answer.** Where a rule declines to fire for a good reason —
+  unknown medium on a High-Speed link, where a cheap flash drive and a bad cable
+  are indistinguishable — the detail pane says so. See task #24: the exonerating
+  cases need to exist as data before they can be rendered.
+- **Live faults surface as they happen.** An `AdwBanner` when an over-current or
+  a drop arrives while the window is open. The tool is watching; it should react,
+  not merely refresh.
+
+---
+
+## 9. Out of v1, designed for
+
+- **Probe panel.** The catalogue JSON already carries every probe's class,
+  `ready` flag and `blocker`, so rows can be greyed with the reason in the
+  tooltip without the GUI knowing anything about capabilities.
+- **`pkexec` escalation**, with `--dry-run --json` populating the confirmation
+  dialog from `side_effects`, and structured refusals rendered from `code` +
+  `message` rather than parsed from prose.
+- **The substitution workflow.** The tool's own advice is repeatedly "swap the
+  cable and measure again", and it is the one thing the CLI structurally cannot
+  help with. Baseline → prompt → wait for the udev event → capture → diff →
+  verdict. This is the strongest reason for the GUI to exist, and it is
+  deliberately last, because it depends on everything above.
+
+---
+
+## 10. Packaging
+
+Follow TempoUI's pattern — `data/com.iboalali.usbdiag.{desktop,metainfo.xml}`,
+`scripts/install-local.sh`, CI on 24.04 and 26.04 — with one deviation.
+
+**Flatpak is probably the wrong primary target.** A sandbox cannot read
+`/sys/kernel/debug`, and full `/sys/bus/usb` traversal needs `--filesystem=host`
+or `--device=all`, at which point the sandbox is decorative. For a hardware
+diagnostic the native install script should be the primary path; Flatpak stays
+optional and, if it ships, must say plainly which probes it cannot reach.
+
+Copy the `screenshot-app` and `interact-app` skills from TempoUI. Its `CLAUDE.md`
+makes them the way a UI change gets verified, and the chain widget in particular
+needs looking at rather than assuming.
+
+---
+
+## 11. Open questions
+
+- Whether `usbdiag-gui` should offer a `--desktop`-style compact mode explicitly,
+  or simply let the window be resized into the narrow breakpoint. Leaning to the
+  latter: fewer modes, same result.
+- Whether to bundle `usb.ids` for vendor names where a device exposes no strings.
+  WhatCable bundles a merged USB-IF/`usb.ids` database; here it would be the
+  first data file in the project, and most devices already carry usable strings.

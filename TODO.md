@@ -324,6 +324,35 @@ into. It gets the refusal, decides, and asks again with the answer.
 `Duration` is serialised as `window_ms`, because seconds-and-nanoseconds is a poor thing to
 put in front of another program.
 
+## A GTK4 front end
+
+Concept and decisions: [`docs/01-gui-concept.md`](docs/01-gui-concept.md). Shaped after
+[TempoUI-for-Linux](https://github.com/iboalali/TempoUI-for-Linux) — same workspace split,
+same gtk4 / libadwaita / relm4 versions, same Ubuntu 24.04 baseline. v1 is a live viewer
+with no probes and no privilege.
+
+The one piece of library work it depends on is below.
+
+### Say "not a cable problem" out loud
+
+The tool expresses "nothing is wrong here" as **silence**, and silence is not an answer —
+a clean report leaves the user unsure whether it looked. WhatCable on macOS handles this
+better with explicit exonerating verdicts (*"Device runs at 10 Gbps, this is the fastest
+it supports, not a cable problem"*), and it is the same discipline this tool already
+applies internally, just never surfaced.
+
+- **A verdict per subject** — one plain sentence, before any detail. It belongs in
+  `usb-probe`, not the GUI: a headline derived from findings inside a renderer is a second
+  rule engine, and it will drift from the first.
+- **Exonerating findings** for the cases deliberately passed over: linked at the device's
+  own maximum; the medium explains the rate rather than the link; no alt mode was
+  requested, so none failing is correct; a 3 A cable is not the limit when the charger
+  only offers 60 W.
+
+Two risks. A verdict must summarise the findings and never make a new claim. And
+exonerations must not become noise — Info level, collapsed by default in the CLI, shown in
+the GUI only for the selected subject.
+
 ## Unprivileged work worth doing
 
 ### Read SCSI error counters — a passive error signal for storage
