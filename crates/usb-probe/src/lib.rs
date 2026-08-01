@@ -29,6 +29,7 @@
 
 pub mod block;
 pub mod caps;
+pub mod chain;
 pub mod diag;
 pub mod drm;
 pub mod kernel;
