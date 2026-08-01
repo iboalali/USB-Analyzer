@@ -623,7 +623,7 @@ pub enum SpeedClass {
 // Type-C
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TypecPort {
     pub name: String,
     pub index: u32,
@@ -710,7 +710,7 @@ impl TypecPort {
 
 /// A sysfs field of the form `host [device]`: a list of supported values with
 /// the currently active one in brackets.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoleField {
     pub current: Option<String>,
     pub supported: Vec<String>,
@@ -1060,7 +1060,7 @@ pub enum PdoRole {
 /// So the contract is `now x now`, and `*_max` must never be treated as a cap.
 /// Neither pair is an instantaneous measurement: nothing in this node reports the
 /// current actually being drawn.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PortPowerSupply {
     pub name: String,
     pub online: Option<bool>,

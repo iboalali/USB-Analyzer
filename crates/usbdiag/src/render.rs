@@ -391,19 +391,34 @@ fn contract_line(p: &TypecPort, t: &Theme) -> String {
     // is flowing out. Report the advertised limit and be explicit that the
     // outgoing draw is not measurable here.
     if p.is_sourcing() {
-        let limit = match (ps.voltage_max_mv.or(ps.voltage_now_mv), ps.current_max_ma) {
-            (Some(v), Some(i)) if v > 0 && i > 0 => {
-                let mut s = t.bold(&format!("supplying up to {} at {}", volts(v), milliamps(i)));
-                if let Some(mw) = ps.contract_power_mw() {
-                    s.push_str(&format!(" ({})", watts(mw)));
+        // The `*_max` pair is the port's capability range, not what it is
+        // offering — the same trap that once turned a 100 W contract into
+        // 47 W, still live on this side of the branch. A real reading: a port
+        // advertising Type-C `3.0A`, which means 5 V at 3 A, reported
+        // voltage_max 13.4 V and current_max 5.72 A. Multiplying those would
+        // have claimed 76 W out of a 15 W port.
+        //
+        // What the port is actually offering is the Type-C advertisement,
+        // unless a PD contract has superseded it.
+        let limit = if p.pd_contract_active() {
+            match (ps.contract_voltage_mv(), ps.contract_current_ma()) {
+                (Some(v), Some(i)) => {
+                    let mut s = t.bold(&format!("supplying {} at {}", volts(v), milliamps(i)));
+                    if let Some(mw) = ps.contract_power_mw() {
+                        s.push_str(&format!(" ({})", watts(mw)));
+                    }
+                    s
                 }
-                s
+                _ => t.bold("supplying under a PD contract, terms not reported"),
             }
-            _ => t.bold("supplying (limit not reported)"),
+        } else if let Some(mw) = p.typec_advertised_ceiling_mw() {
+            t.bold(&format!("offering up to {}", watts(mw)))
+        } else {
+            t.bold("supplying, limit not reported")
         };
         return format!(
             "{limit}  {tag}  {}",
-            t.dim("outgoing current is not measurable from this node")
+            t.dim("Type-C current advertisement; outgoing draw is not measurable from this node")
         );
     }
 
@@ -1473,6 +1488,48 @@ mod tests {
             verbose: false,
         };
         assert!(t.severity(Severity::High).contains("\x1b[31m"));
+    }
+
+    /// Real values from this ThinkPad's right-hand port while sourcing. The
+    /// port advertises Type-C `3.0A` — 5 V at 3 A, 15 W — and its power_supply
+    /// node reports `voltage_max` 13.4 V with `current_max` 5.72 A, which
+    /// multiplies out to 76 W it is in no position to deliver. Those fields
+    /// are the port's capability range, and reading them as an offer is the
+    /// same mistake that once turned a 100 W contract into 47 W.
+    #[test]
+    fn a_sourcing_port_reports_its_advertisement_not_its_capability_range() {
+        let port = TypecPort {
+            name: "port1".into(),
+            power_role: Some(RoleField::parse("sink [source]")),
+            power_operation_mode: Some("3.0A".into()),
+            power_supply: Some(PortPowerSupply {
+                name: "ucsi-source-psy-USBC000:002".into(),
+                online: Some(false),
+                voltage_now_mv: Some(0),
+                current_now_ma: Some(0),
+                voltage_min_mv: Some(5_000),
+                voltage_max_mv: Some(13_400),
+                current_max_ma: Some(5_720),
+                usb_type: None,
+            }),
+            ..Default::default()
+        };
+        assert!(port.is_sourcing());
+
+        let line = contract_line(
+            &port,
+            &Theme {
+                color: false,
+                verbose: false,
+            },
+        );
+        assert!(line.contains("15 W"), "the advertisement is the offer: {line}");
+        assert!(!line.contains("13.4"), "a capability range is not an offer: {line}");
+        assert!(!line.contains("5.72"), "a capability range is not an offer: {line}");
+        assert!(
+            line.contains("not measurable"),
+            "outgoing draw is unknowable here and must be said: {line}"
+        );
     }
 
     fn fixed_pdo(index: u32, mv: u32, ma: u32) -> Pdo {

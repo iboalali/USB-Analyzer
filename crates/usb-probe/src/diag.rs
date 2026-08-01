@@ -1696,37 +1696,89 @@ fn billboard_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
         if !dev.has_interface_class(CLASS_BILLBOARD) {
             continue;
         }
+        // A video adapter with nothing plugged into its output has no reason to
+        // enter DisplayPort mode, and will say so exactly like one that tried
+        // and failed. Checking DRM separates a fault from an empty socket — and
+        // without it this fires at Medium and blames the cable of a device that
+        // has no cable, which is what a Dell DA20 with an empty HDMI socket
+        // produced on the machine this was written against.
+        let has_drm = !snap.displays.is_empty();
+        let external_display = snap
+            .displays
+            .iter()
+            .any(|d| !d.is_internal() && d.is_connected());
+        let nothing_to_drive = has_drm && !external_display;
+
+        let mut evidence = vec![
+            format!("{} exposes interface class 0x11 (billboard)", dev.sysfs_name),
+            format!(
+                "{}:{} at {}",
+                dev.vid_pid().unwrap_or_default(),
+                dev.usb_version.as_deref().unwrap_or("?"),
+                dev.speed.as_ref().map(|s| s.short()).unwrap_or_default()
+            ),
+        ];
+        if nothing_to_drive {
+            evidence.push(
+                "no external display is connected on any output, so there may simply be \
+                 nothing for it to drive"
+                    .into(),
+            );
+        } else if external_display {
+            evidence.push(
+                "an external display is connected, so something was available to drive".into(),
+            );
+        }
+
         out.push(Finding {
             code: "BILLBOARD_ALT_MODE_FAILED".into(),
-            severity: Severity::Medium,
+            // Only a fault when there was something to fail at.
+            severity: if nothing_to_drive {
+                Severity::Low
+            } else {
+                Severity::Medium
+            },
             confidence: Confidence::Measured,
             subject: Subject::Device(dev.sysfs_name.clone()),
             title: format!(
                 "{} reports an Alternate Mode it could not enter",
                 dev.label()
             ),
-            detail: "A USB Billboard device exists only to announce a failure: the attached \
-                     USB-C device requested an Alternate Mode — DisplayPort, Thunderbolt, or a \
-                     vendor mode — and the negotiation did not succeed, so it fell back to \
-                     presenting this instead. Common causes are a cable without the required \
-                     wiring, a port that does not support the mode, or a link that could not \
-                     train. The specific modes it wanted live in a Billboard capability \
-                     descriptor, which sysfs does not expose."
-                .into(),
-            evidence: vec![
-                format!("{} exposes interface class 0x11 (billboard)", dev.sysfs_name),
-                format!(
-                    "{}:{} at {}",
-                    dev.vid_pid().unwrap_or_default(),
-                    dev.usb_version.as_deref().unwrap_or("?"),
-                    dev.speed.as_ref().map(|s| s.short()).unwrap_or_default()
-                ),
-            ],
-            suggestion: Some(
-                "If you expected video or a docking mode from this device, the cable is the \
-                 usual cause — it must carry the SuperSpeed pairs, not just power and USB 2.0."
-                    .into(),
-            ),
+            detail: if nothing_to_drive {
+                "A USB Billboard device exists to announce that an Alternate Mode — \
+                 DisplayPort, Thunderbolt, or a vendor mode — was not entered. Nothing is \
+                 connected to any display output on this machine, so the most likely \
+                 explanation is the ordinary one: a video adapter with an empty socket has \
+                 nothing to drive and does not enter the mode. It reports the same way \
+                 whether it declined for that reason or tried and failed, so this is worth \
+                 re-reading once a display is attached."
+                    .to_string()
+            } else {
+                "A USB Billboard device exists only to announce a failure: the attached \
+                 USB-C device requested an Alternate Mode — DisplayPort, Thunderbolt, or a \
+                 vendor mode — and the negotiation did not succeed, so it fell back to \
+                 presenting this instead. Common causes are a cable without the required \
+                 wiring, a port that does not support the mode, or a link that could not \
+                 train. The specific modes it wanted live in a Billboard capability \
+                 descriptor, which sysfs does not expose."
+                    .to_string()
+            },
+            evidence,
+            suggestion: if nothing_to_drive {
+                Some(
+                    "Nothing to do unless you expected a picture. Attach a display and look \
+                     again: if this is still reported with one connected, the mode genuinely \
+                     failed."
+                        .into(),
+                )
+            } else {
+                Some(
+                    "If you expected video or a docking mode from this device, the cable is \
+                     the usual cause — it must carry the SuperSpeed pairs, not just power \
+                     and USB 2.0."
+                        .into(),
+                )
+            },
         });
     }
 }
@@ -3189,6 +3241,59 @@ mod tests {
         assert_eq!(hit.confidence, Confidence::Measured);
         assert!(hit.detail.contains("Alternate Mode"));
         assert!(hit.evidence.iter().any(|e| e.contains("0x11")));
+    }
+
+    /// A Dell DA20 plugged in with an empty HDMI socket, which is what
+    /// produced this on real hardware. It reports a Billboard because it has
+    /// nothing to drive, and calling that a Medium fault — then blaming the
+    /// cable of a device with no cable — is two wrong statements at once.
+    #[test]
+    fn an_adapter_with_nothing_attached_is_not_a_fault() {
+        let mut snap = empty_snapshot();
+        let mut hub = root_hub("usb5", 480.0);
+        hub.children.push(billboard_device("5-1.2", Some("usb5")));
+        snap.buses.push(hub);
+        snap.displays = vec![
+            connector("eDP-1", "connected", true),
+            connector("DP-1", "disconnected", false),
+            connector("HDMI-A-1", "disconnected", false),
+        ];
+
+        let hit = analyze(&snap)
+            .into_iter()
+            .find(|x| x.code == "BILLBOARD_ALT_MODE_FAILED")
+            .unwrap();
+        assert_eq!(hit.severity, Severity::Low, "an empty socket is not a fault");
+        assert!(
+            hit.evidence.iter().any(|e| e.contains("nothing for it to drive")),
+            "{:?}",
+            hit.evidence
+        );
+        // The advice must not send someone hunting for a cable that is not there.
+        let advice = hit.suggestion.as_deref().unwrap();
+        assert!(!advice.contains("cable"), "{advice}");
+        assert!(advice.contains("Attach a display"), "{advice}");
+    }
+
+    /// With a display actually connected, the same report means the mode was
+    /// tried and failed, and the cable advice is the right advice.
+    #[test]
+    fn a_billboard_with_a_display_attached_is_still_a_fault() {
+        let mut snap = empty_snapshot();
+        let mut hub = root_hub("usb5", 480.0);
+        hub.children.push(billboard_device("5-1.2", Some("usb5")));
+        snap.buses.push(hub);
+        snap.displays = vec![
+            connector("eDP-1", "connected", true),
+            connector("HDMI-A-1", "connected", true),
+        ];
+
+        let hit = analyze(&snap)
+            .into_iter()
+            .find(|x| x.code == "BILLBOARD_ALT_MODE_FAILED")
+            .unwrap();
+        assert_eq!(hit.severity, Severity::Medium);
+        assert!(hit.suggestion.as_deref().unwrap().contains("cable"));
     }
 
     #[test]
