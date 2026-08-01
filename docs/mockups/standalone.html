@@ -50,7 +50,7 @@
       <div class="group">
         <div class="group-hd"><h3>USB-C ports</h3></div>
         <div class="row sel">
-          <span class="dot info"></span>
+          <span class="dot ok"></span>
           <div class="body">
             <div class="line1">
               <span class="name">port0 <span class="meta">left panel</span></span>
@@ -60,7 +60,7 @@
           </div>
         </div>
         <div class="row">
-          <span class="dot info"></span>
+          <span class="dot ok"></span>
           <div class="body">
             <div class="line1">
               <span class="name">port1 <span class="meta">right panel</span></span>
@@ -86,7 +86,7 @@
           </div>
         </div>
         <div class="row">
-          <span class="dot ok"></span>
+          <span class="dot info"></span>
           <div class="body">
             <div class="line1">
               <span class="name">MediaTek Wireless_Device</span>
@@ -96,7 +96,7 @@
           </div>
         </div>
         <div class="row">
-          <span class="dot ok"></span>
+          <span class="dot info"></span>
           <div class="body">
             <div class="line1">
               <span class="name">EMV Smartcard Reader</span>
@@ -120,7 +120,7 @@
 
         <div class="bus"><span class="mono">usb5</span><span>480M</span><span class="r">xhci-hcd</span></div>
         <div class="row">
-          <span class="dot ok"></span>
+          <span class="dot info"></span>
           <div class="body">
             <div class="line1">
               <span class="name">TOSHIBA TransMemory</span>
@@ -130,13 +130,13 @@
           </div>
         </div>
         <div class="row">
-          <span class="dot info"></span>
+          <span class="dot low"></span>
           <div class="body">
             <div class="line1">
               <span class="name">Dell DA20 Adapter</span>
               <span class="meta">12M</span>
             </div>
-            <div class="why">billboard names an alt mode it did enter</div>
+            <div class="why">billboard names an alt mode it could not enter</div>
           </div>
         </div>
 
@@ -177,15 +177,70 @@
         <div class="verdict">
           <div class="glyph">✓</div>
           <div>
-            <h1>Nothing on this port is holding power back</h1>
-            <p>The charger offers 100 W and all 100 W are being drawn. No stage
-              between the two is narrower than the others, so there is no cable
-              to swap here.</p>
+            <h1>Charging at 100 W, the most this charger offers</h1>
+            <p>The contract reached the charger's best profile, so nothing on
+              this port is holding power back. A bigger charger would charge
+              faster; nothing about this port, its cable, or this machine would.</p>
+            <div class="because">
+              <span class="why-chip">CHARGING_AT_FULL_OFFER</span>
+              <span class="why-chip">CABLE_NOT_LIMITING</span>
+              <span class="why-chip">CABLE_EMARKER_NOT_REPORTED</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="card cleared">
+          <h2>Ruled out<span class="rank">3 checks that could have failed</span></h2>
+
+          <div class="cleared-row">
+            <span class="tick">✓</span>
+            <div>
+              <h4>The cable is not what limits charging here
+                <span class="subj">port0 cable</span>
+                <span class="chip measured">measured</span></h4>
+              <p>The charger's best offer is 100 W and 100 W is what the contract
+                settled on, so nothing between the two gave anything up. Swapping
+                the cable cannot make charging faster.</p>
+            </div>
+          </div>
+
+          <div class="cleared-row">
+            <span class="tick">✓</span>
+            <div>
+              <h4>Charging at 100 W, the most this charger offers
+                <span class="chip measured">measured</span></h4>
+              <p>Only a bigger charger would help. Nothing about this port, its
+                cable, or this machine would.</p>
+            </div>
+          </div>
+
+          <div class="cleared-row">
+            <span class="tick">✓</span>
+            <div>
+              <h4>DisplayPort is claimed and DP-1 is being driven
+                <span class="chip measured">measured</span></h4>
+              <p>LG ULTRAGEAR at 2560×1440 @ 120 Hz — the alt-mode claim checks
+                out against a real output rather than being taken on trust.</p>
+            </div>
           </div>
         </div>
 
         <div class="card">
-          <h2>Power · charger → cable → contract → this machine</h2>
+          <h2>Findings<span class="rank">nothing above info</span></h2>
+          <div class="finding">
+            <span class="dot info"></span>
+            <div>
+              <h4>Cable is 5 A rated
+                <span class="subj">port0 cable</span>
+                <span class="chip inferred">inferred</span></h4>
+              <p>The controller never reported an e-marker, but the port is
+                holding a 5 A contract, and a 3 A cable could not. Nothing to do.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="card supporting">
+          <h2>Evidence · the power chain<span class="rank">supporting</span></h2>
           <div class="chain">
             <div class="stage">
               <div class="cap">charger offers</div>
@@ -216,33 +271,8 @@
             </div>
           </div>
           <div class="chain-note">
-            Every stage is wide enough for the one before it. Battery at 97 %,
-            0 W flowing — the charge is simply finished.
-          </div>
-        </div>
-
-        <div class="card">
-          <h2>Alternate modes the port advertises</h2>
-          <div class="altchips">
-            <span class="altchip">Lenovo · 17ef:1</span>
-            <span class="altchip">Thunderbolt 3 · 8087:1</span>
-            <span class="altchip">DisplayPort · ff01:1</span>
-          </div>
-          <div class="chain-note">
-            DisplayPort is claimed and DP-1 is being driven — LG ULTRAGEAR at
-            2560×1440 @ 120 Hz — so the claim checks out against a real output.
-          </div>
-        </div>
-
-        <div class="card">
-          <h2>Findings for this port</h2>
-          <div class="finding">
-            <span class="dot info"></span>
-            <div>
-              <h4>Cable is 5 A rated <span class="chip inferred">inferred</span></h4>
-              <p>The controller never reported an e-marker, but the port is
-                holding a 5 A contract, and a 3 A cable could not. Nothing to do.</p>
-            </div>
+            The chain is here because a statement above rests on it, not because
+            it is the point. Battery 97 %, 0 W — the charge is simply finished.
           </div>
         </div>
 

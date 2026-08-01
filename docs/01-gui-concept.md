@@ -141,6 +141,14 @@ could not settle, and the drawings did:
 └────────────────────┴────────────────────────────────────────────┘
 ```
 
+**Findings lead, the chain supports.** Reversed after
+[`02-prior-art.md`](02-prior-art.md): the chain is what three other projects
+already draw, and the findings are what none of them has. The detail pane runs
+verdict → ruled out → findings → evidence → what cannot be answered, and the
+chain appears under a heading that says it supports a statement above rather
+than being the statement. Task #24 landed the data, so the mockups show real
+verdict output.
+
 **Ports lead, devices follow.** WhatCable is organised around the cable as the
 subject, which matches the question people actually ask; this tool has been
 organised around devices and findings. `Subject::Cable(port)` already exists in

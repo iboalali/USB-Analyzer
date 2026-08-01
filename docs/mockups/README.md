@@ -33,6 +33,24 @@ healthy capture. Its finding codes (`CABLE_CURRENT_LIMIT`,
 `PD_CONTRACT_BELOW_OFFER`, `SS_HALF_IDLE`) are real ones the rule engine can
 emit; the hardware is not.
 
+## Findings lead, the chain supports
+
+The first draft made the power chain the headline — and
+[`../02-prior-art.md`](../02-prior-art.md) then established that the chain is
+the one thing three other projects already draw, one of them in this exact
+toolkit. So the panes were reordered around what is actually differentiated:
+
+1. **Verdict** — one sentence, with the codes it rests on shown as chips. Real
+   output from `usbdiag diag` since task #24 landed; these are not invented
+   headlines, and the chips are the `because` array.
+2. **Ruled out** — the exonerations, which is what a healthy machine has
+   instead of findings. On a clean port this section *is* the content.
+3. **Findings** — worst first, with the subject tagged, because a port's pane
+   carries its cable's statements too.
+4. **Evidence** — the chain, demoted, labelled as supporting the statement
+   above it rather than as the point.
+5. **What cannot be answered here.**
+
 ## What drawing them settled
 
 - **Host-level findings need a subject row.** `Subject::Host` exists in the
@@ -51,6 +69,14 @@ emit; the hardware is not.
 - **The tray popover is a second information architecture, not a narrow
   window.** It is verdict-first with no tree and no detail pane, which means a
   second view model to build and maintain. Worth knowing before agreeing to it.
+- **Two CSS bugs worth remembering, because both would recur in GTK.** A card
+  class named `.evidence` collided with the monospace evidence block inside a
+  finding, inheriting `white-space: pre-wrap` and turning every newline in the
+  chain markup into a line break — the card rendered three times its height.
+  And `.finding .dot` restated the neutral background at the same specificity
+  as `.dot.high`, so source order decided and every severity dot inside a
+  finding came out grey. Both are the hazard of a stylesheet grown by
+  appending; a `style.css` in `crates/gui` will grow the same way.
 
 ## Regenerating
 

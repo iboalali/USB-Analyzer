@@ -89,7 +89,7 @@ body {
 
 .window {
     width: 1180px;
-    height: 820px;
+    height: 1000px;
     background: var(--window-bg);
     border-radius: 12px;
     box-shadow:
@@ -266,13 +266,20 @@ body {
     background: var(--selected);
 }
 
+/* One base rule owns the neutral colour, at lower specificity than the
+   severity modifiers below. Setting it again on `.row .dot` / `.finding .dot`
+   ties the specificity and lets source order decide, which silently greyed out
+   every severity dot inside a finding. */
+.dot {
+    background: var(--track);
+}
+
 .row .dot {
     width: 9px;
     height: 9px;
     border-radius: 50%;
     margin-top: 5px;
     flex: none;
-    background: var(--track);
 }
 
 .dot.high {
@@ -556,7 +563,6 @@ body {
     border-radius: 50%;
     margin-top: 5px;
     flex: none;
-    background: var(--track);
 }
 
 .finding h4 {
@@ -789,7 +795,7 @@ body.compare {
 
 .narrow {
     width: 392px;
-    height: 545px;
+    height: 610px;
     background: var(--window-bg);
     border-radius: 12px;
     box-shadow:
@@ -936,7 +942,6 @@ body.compare {
     border-radius: 50%;
     margin-top: 5px;
     flex: none;
-    background: var(--track);
 }
 
 .crow .body {
@@ -990,4 +995,114 @@ body.compare {
     color: #fff;
     font-size: 12px;
     padding: 8px 14px;
+}
+
+/* ══════════ verdict-led layout ══════════ */
+
+/* The verdict is the first thing on the page and the largest thing on it. */
+.verdict h1 {
+    font-size: 21px;
+}
+
+.verdict .because {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-top: 9px;
+}
+
+.because .why-chip {
+    font-size: 10.5px;
+    font-family: "Ubuntu Sans Mono", "Ubuntu Mono", monospace;
+    letter-spacing: 0.02em;
+    padding: 2px 7px;
+    border-radius: 6px;
+    background: var(--track);
+    color: var(--dim);
+}
+
+/* Section rank: what leads, what supports. */
+.card > h2 {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 12px;
+}
+
+.card > h2 .rank {
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    text-transform: none;
+    font-size: 10.5px;
+    color: var(--dimmer);
+}
+
+/* "Ruled out" — visually the inverse of a finding, never the same shape. */
+.card.cleared {
+    background: transparent;
+    box-shadow: none;
+    border: 1px solid color-mix(in srgb, var(--success-bg) 35%, transparent);
+}
+
+.card.cleared > h2 {
+    color: var(--success);
+}
+
+.cleared-row {
+    display: flex;
+    gap: 11px;
+    align-items: flex-start;
+    padding: 9px 0;
+    border-top: 1px solid var(--sep);
+}
+
+.cleared-row:first-of-type {
+    border-top: none;
+    padding-top: 1px;
+}
+
+.cleared-row .tick {
+    color: var(--success);
+    font-size: 13px;
+    line-height: 1.45;
+    flex: none;
+}
+
+.cleared-row h4 {
+    font-size: 13.5px;
+    font-weight: 600;
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    flex-wrap: wrap;
+}
+
+.cleared-row p {
+    font-size: 12.5px;
+    color: var(--dim);
+    margin-top: 2px;
+    max-width: 64ch;
+}
+
+/* a subject tag, for when a port's pane carries its cable's statements */
+.subj {
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    padding: 2px 7px;
+    border-radius: 6px;
+    background: var(--track);
+    color: var(--dim);
+    flex: none;
+}
+
+/* The chain demoted: supporting evidence, not the headline.
+   NOT `.card.evidence` — `.evidence` is already the monospace block inside a
+   finding, and it sets `white-space: pre-wrap`. Reusing the name turned every
+   newline in the chain's markup into a line break and tripled the card's
+   height. A stylesheet that grows by appending needs its names checked. */
+.card.supporting {
+    background: transparent;
+    box-shadow: none;
+    border: 1px solid var(--sep);
 }

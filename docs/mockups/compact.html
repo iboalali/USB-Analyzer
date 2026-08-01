@@ -62,13 +62,47 @@
           <div class="cverdict good" style="padding:0 0 14px">
             <div class="glyph">✓</div>
             <div>
-              <h1>Nothing here limits power</h1>
-              <p>100 W offered, 100 W drawn. No cable to swap.</p>
+              <h1>Charging at 100 W, the most this charger offers</h1>
+              <p>Nothing on this port is holding power back.</p>
+            </div>
+          </div>
+
+          <div class="card cleared" style="padding:13px 14px">
+            <h2>Ruled out<span class="rank">2</span></h2>
+            <div class="cleared-row">
+              <span class="tick">✓</span>
+              <div>
+                <h4 style="font-size:13px">The cable is not what limits charging
+                  <span class="chip measured">measured</span></h4>
+                <p style="font-size:12px">100 W offered, 100 W agreed. Nothing
+                  between the two gave anything up.</p>
+              </div>
+            </div>
+            <div class="cleared-row">
+              <span class="tick">✓</span>
+              <div>
+                <h4 style="font-size:13px">DisplayPort claim checks out
+                  <span class="chip measured">measured</span></h4>
+                <p style="font-size:12px">DP-1 is being driven at 2560×1440.</p>
+              </div>
             </div>
           </div>
 
           <div class="card" style="padding:13px 14px">
-            <h2>Power</h2>
+            <h2>Findings<span class="rank">nothing above info</span></h2>
+            <div class="finding">
+              <span class="dot info"></span>
+              <div>
+                <h4 style="font-size:13px">Cable is 5 A rated
+                  <span class="chip inferred">inferred</span></h4>
+                <p style="font-size:12px">No e-marker was reported, but a 3 A
+                  cable could not hold this contract.</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="card supporting" style="padding:13px 14px">
+            <h2>Evidence · power<span class="rank">supporting</span></h2>
             <div class="vchain">
               <div class="vs">
                 <span class="cap">charger</span>
@@ -91,28 +125,6 @@
                 <span class="val">100 W</span>
               </div>
             </div>
-            <div class="chain-note" style="margin-top:11px;padding-top:10px">
-              Every stage is wide enough for the one before it.
-            </div>
-          </div>
-
-          <div class="card" style="padding:13px 14px">
-            <h2>Findings</h2>
-            <div class="finding">
-              <span class="dot info"></span>
-              <div>
-                <h4 style="font-size:13.5px">Cable is 5 A rated
-                  <span class="chip inferred">inferred</span></h4>
-                <p style="font-size:12.5px">No e-marker was reported, but a 3 A
-                  cable could not hold this contract.</p>
-              </div>
-            </div>
-          </div>
-
-          <div class="card silent" style="padding:13px 14px">
-            <h2>Not answerable</h2>
-            <p style="font-size:12px">UCSI does not expose the cable's identity
-              VDO. The rating above is deduced, not read.</p>
           </div>
 
         </div>
@@ -140,14 +152,14 @@
       <div class="cverdict">
         <div class="glyph">!</div>
         <div>
-          <h1>Not a cable problem</h1>
-          <p>Both cables and every link are behaving. A host controller has
-            died 3 times this boot — that is a firmware or suspend fault.</p>
+          <h1>xHCI host controller failed 3 times this boot</h1>
+          <p>Every cable and link on this machine came back clear. This is a
+            host-side or power-management fault, not a cable fault.</p>
         </div>
       </div>
 
       <div class="csection">
-        <h3>port0 · charging</h3>
+        <h3>Ruled out · port0</h3>
         <div class="slim">
           <div class="s">
             <div class="cap">charger</div>
@@ -171,7 +183,8 @@
           </div>
         </div>
         <div class="chain-note" style="margin-top:9px;padding-top:9px">
-          Nothing narrows. Battery 97 %, 0 W — charge finished.
+          The cable is not what limits charging here. 100 W offered, 100 W
+          agreed.
         </div>
       </div>
 
@@ -190,10 +203,10 @@
           </div>
         </div>
         <div class="crow">
-          <span class="dot info"></span>
+          <span class="dot low"></span>
           <div class="body">
             <div class="line1"><span class="name">Dell DA20 Adapter</span><span class="meta">12M · usb5</span></div>
-            <div class="why">billboard names an alt mode it did enter</div>
+            <div class="why">billboard names an alt mode it could not enter</div>
           </div>
         </div>
         <div class="crow">

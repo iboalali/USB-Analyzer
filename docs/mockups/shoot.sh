@@ -18,12 +18,12 @@ shot() { # file  hash  name  width  height
         --screenshot="$out/$3.png" "file://$here/$1$2" >/dev/null 2>&1
 }
 
-shot standalone.html       '#light'  standalone-light        1240 880
-shot standalone.html       '#dark'   standalone-dark         1240 880
-shot standalone-fault.html '#light'  standalone-fault-light  1240 890
-shot standalone-fault.html '#dark'   standalone-fault-dark   1240 890
-shot standalone-fault.html '#scroll' standalone-fault-lower  1240 890
-shot compact.html          '#light'  compact-light            920 740
-shot compact.html          '#dark'   compact-dark             920 740
+shot standalone.html       "#light"  standalone-light        1240 1060
+shot standalone.html       "#dark"   standalone-dark         1240 1060
+shot standalone-fault.html "#light"  standalone-fault-light  1240 1070
+shot standalone-fault.html "#dark"   standalone-fault-dark   1240 1070
+shot standalone-fault.html "#scroll" standalone-fault-lower  1240 1070
+shot compact.html          '#light'  compact-light            920 830
+shot compact.html          '#dark'   compact-dark             920 830
 
 echo "wrote 7 png to $out"

@@ -176,15 +176,67 @@
         <div class="verdict bad">
           <div class="glyph">!</div>
           <div>
-            <h1>The cable is what is limiting charging</h1>
-            <p>The charger offers 100 W and this machine accepts 100 W, but the
-              cable is e-marked for 3 A, so the contract settled at 60 W. A 5 A
-              e-marked cable would lift it.</p>
+            <h1>Cable is rated for 3 A, charger offers 5 A</h1>
+            <p>The cable's e-marker reports a 3 A current rating. At the
+              negotiated 20 V that caps the contract at 60 W, 40 W below what
+              the charger can deliver.</p>
+            <div class="because">
+              <span class="why-chip">CABLE_CURRENT_LIMIT</span>
+              <span class="why-chip">PD_CONTRACT_BELOW_OFFER</span>
+              <span class="why-chip">SS_HALF_IDLE</span>
+            </div>
           </div>
         </div>
 
         <div class="card">
-          <h2>Power · charger → cable → contract → this machine</h2>
+          <h2>Findings<span class="rank">worst first</span></h2>
+
+          <div class="finding">
+            <span class="dot high"></span>
+            <div>
+              <h4>Cable is rated for 3 A, charger offers 5 A
+                <span class="subj">port0 cable</span>
+                <span class="chip measured">measured</span></h4>
+              <p>The cable's e-marker reports a 3 A current rating. At the
+                negotiated 20 V that caps the contract at 60 W, 40 W below what
+                the charger can deliver.</p>
+              <div class="fix">→ Try a 5 A e-marked cable and watch this figure</div>
+              <div class="evidence mono">port0/cable: current-capability = 3A
+port0/usb_power_delivery/source-capabilities: 20V @ 5A (100 W)</div>
+            </div>
+          </div>
+
+          <div class="finding">
+            <span class="dot medium"></span>
+            <div>
+              <h4>Contract settled below the offer
+                <span class="subj">port0</span>
+                <span class="chip measured">measured</span></h4>
+              <p>60 W agreed against a 100 W offer. Explained entirely by the
+                cable above — reported separately because the two can also come
+                apart.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="card suspicion">
+          <h2>Suspicion — not established<span class="rank">a different kind of card</span></h2>
+          <div class="finding">
+            <span class="dot medium"></span>
+            <div>
+              <h4>A 5 Gbps device enumerated on the USB 2 half
+                <span class="chip heuristic">heuristic</span></h4>
+              <p>The SuperSpeed side of this port has a companion port that is
+                populated while the SuperSpeed half sits idle. That pattern
+                usually means the cable has no SuperSpeed pairs — but a device
+                that simply chose USB 2 looks identical from here.</p>
+              <div class="fix">→ Swap the cable, keep the device, compare</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card supporting">
+          <h2>Evidence · power<span class="rank">supports the finding above</span></h2>
           <div class="chain">
             <div class="stage">
               <div class="cap">charger offers</div>
@@ -216,12 +268,14 @@
             </div>
           </div>
           <div class="chain-note">
-            Only one stage is narrow. Everything either side of it has room.
+            The marked stage comes from <span class="mono">CABLE_CURRENT_LIMIT</span>
+            naming the cable — never from logic in the widget, which would be a
+            second rule engine.
           </div>
         </div>
 
-        <div class="card">
-          <h2>Data · device → cable → port → link</h2>
+        <div class="card supporting">
+          <h2>Evidence · data<span class="rank">supports the suspicion</span></h2>
           <div class="chain">
             <div class="stage">
               <div class="cap">device can do</div>
@@ -253,53 +307,8 @@
             </div>
           </div>
           <div class="chain-note">
-            The same cable is narrow in both chains — one charging cable, doing
-            both jobs badly.
-          </div>
-        </div>
-
-        <div class="card">
-          <h2>Findings for this port</h2>
-
-          <div class="finding">
-            <span class="dot high"></span>
-            <div>
-              <h4>Cable is rated for 3 A, charger offers 5 A
-                <span class="chip measured">measured</span></h4>
-              <p>The cable's e-marker reports a 3 A current rating. At the
-                negotiated 20 V that caps the contract at 60 W, 40 W below what
-                the charger can deliver.</p>
-              <div class="fix">→ Try a 5 A e-marked cable and watch this figure</div>
-              <div class="evidence mono">port0/cable: current-capability = 3A
-port0/usb_power_delivery/source-capabilities: 20V @ 5A (100 W)</div>
-            </div>
-          </div>
-
-          <div class="finding">
-            <span class="dot medium"></span>
-            <div>
-              <h4>Contract settled below the offer
-                <span class="chip measured">measured</span></h4>
-              <p>60 W agreed against a 100 W offer. Explained entirely by the
-                cable above — reported separately because the two can also come
-                apart.</p>
-            </div>
-          </div>
-        </div>
-
-        <div class="card suspicion">
-          <h2>Suspicion — not established</h2>
-          <div class="finding">
-            <span class="dot medium"></span>
-            <div>
-              <h4>A 5 Gbps device enumerated on the USB 2 half
-                <span class="chip heuristic">heuristic</span></h4>
-              <p>The SuperSpeed side of this port has a companion port that is
-                populated while the SuperSpeed half sits idle. That pattern
-                usually means the cable has no SuperSpeed pairs — but a device
-                that simply chose USB 2 looks identical from here.</p>
-              <div class="fix">→ Swap the cable, keep the device, compare</div>
-            </div>
+            480 Mbps beside 10 Gbps really is a 5 % sliver. A log scale would
+            flatter it.
           </div>
         </div>
 
