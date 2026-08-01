@@ -10,7 +10,7 @@
 //! platform firmware. Absent is the normal case, not an error.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
@@ -41,6 +41,9 @@ pub struct Snapshot {
     pub uptime_s: Option<f64>,
     /// PD objects not reachable from a port (kept so nothing is silently dropped).
     pub orphan_pd: Vec<PowerDelivery>,
+    /// URB accounting, present only when the privileged usbmon probe ran.
+    /// `None` means it was not attempted, which is not the same as clean.
+    pub urb_traffic: Option<UrbTraffic>,
     pub kernel_log: KernelLog,
 }
 
@@ -52,6 +55,17 @@ impl Snapshot {
             bus.walk(&mut out);
         }
         out
+    }
+
+    /// The device at a USB bus address — how usbmon and usbfs name a device,
+    /// as opposed to the `3-4.1` path sysfs uses.
+    ///
+    /// Addresses are reassigned on re-enumeration, so this is only meaningful
+    /// against a snapshot taken alongside the traffic it is being matched to.
+    pub fn device_at_address(&self, bus: u32, address: u32) -> Option<&UsbDevice> {
+        self.devices()
+            .into_iter()
+            .find(|d| d.busnum == Some(bus) && d.devnum == Some(address))
     }
 
     pub fn device(&self, sysfs_name: &str) -> Option<&UsbDevice> {
@@ -1330,6 +1344,109 @@ pub struct Retimer {
     pub device: Option<u16>,
     pub nvm_version: Option<String>,
     pub nvm_authenticate: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// URB traffic
+// ---------------------------------------------------------------------------
+
+/// What a URB completion status means, which is not the same as whether it is
+/// non-zero. See `usbmon` for why the distinction decides the whole probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UrbStatusClass {
+    Success,
+    /// The link failed to carry the packet: CRC, babble, timeout, no response.
+    Transport,
+    /// The device answered "no" — a stall.
+    Protocol,
+    /// The driver unlinked the URB. Routine.
+    Cancelled,
+    Other,
+}
+
+/// URB traffic observed over a window.
+///
+/// usbmon is a live stream with no history, so this describes only the window.
+/// A device idle throughout produces no evidence — which is not evidence of
+/// health, and callers must not read it as such.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UrbTraffic {
+    pub window_ms: u64,
+    pub devices: Vec<UrbStats>,
+    pub lines_read: u64,
+    /// Lines the parser did not recognise, so a format change is visible
+    /// rather than silently producing zeroes.
+    pub unparsed: usize,
+    pub source: Option<PathBuf>,
+}
+
+impl UrbTraffic {
+    pub fn for_address(&self, bus: u32, device_address: u32) -> Option<&UrbStats> {
+        self.devices
+            .iter()
+            .find(|d| d.bus == bus && d.device_address == device_address)
+    }
+
+    pub fn total_completions(&self) -> u64 {
+        self.devices.iter().map(|d| d.completions).sum()
+    }
+}
+
+/// Per-device URB accounting.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UrbStats {
+    pub bus: u32,
+    /// The USB address, matching `devnum` in sysfs.
+    pub device_address: u32,
+    pub completions: u64,
+    pub bytes: u64,
+    /// The class that implicates the physical link.
+    pub transport_errors: u64,
+    /// Endpoints on which a transport error occurred. A fault on several
+    /// endpoints at once points at the path rather than at one pipe.
+    pub transport_endpoints: BTreeSet<u8>,
+    /// Stalls. Routine on endpoint 0.
+    pub protocol_errors: u64,
+    /// Stalls on a bulk or interrupt endpoint, which are halt conditions
+    /// rather than a device declining a request.
+    pub non_control_stalls: u64,
+    /// Driver-initiated unlinks. Counted so they are never mistaken for faults.
+    pub cancellations: u64,
+    pub other: u64,
+    /// Every status seen, with its count, for evidence.
+    pub by_status: BTreeMap<i32, u64>,
+}
+
+impl UrbStats {
+    /// Transport errors as a fraction of completions, or `None` when nothing
+    /// completed — an idle device has no rate, and calling it zero would claim
+    /// a clean bill of health that was never measured.
+    pub fn transport_error_rate(&self) -> Option<f64> {
+        (self.completions > 0)
+            .then(|| self.transport_errors as f64 / self.completions as f64)
+    }
+
+    pub fn throughput_bps(&self, window_ms: u64) -> Option<f64> {
+        (window_ms > 0).then(|| self.bytes as f64 * 1000.0 / window_ms as f64)
+    }
+
+    /// The statuses that matter, worst first, as `errno x count` text.
+    pub fn error_breakdown(&self) -> Vec<String> {
+        let mut out: Vec<(i32, u64)> = self
+            .by_status
+            .iter()
+            .filter(|(s, _)| **s != 0)
+            .map(|(s, c)| (*s, *c))
+            .collect();
+        out.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        out.into_iter()
+            .map(|(s, c)| match errno_meaning(s) {
+                Some(m) => format!("{s} {m} x{c}"),
+                None => format!("{s} x{c}"),
+            })
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------

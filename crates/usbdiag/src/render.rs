@@ -1239,6 +1239,90 @@ pub fn header(out: &mut String, snap: &Snapshot, t: &Theme) {
     let _ = writeln!(out);
 }
 
+/// URB traffic measured over a window, when the privileged probe ran.
+///
+/// Shown whenever there is traffic, not only when something is wrong: seeing
+/// zero transport errors across thousands of completions is a real result, and
+/// the only one this tool can offer that says a link is healthy rather than
+/// merely well-negotiated.
+pub fn urb_traffic(out: &mut String, snap: &Snapshot, t: &Theme) {
+    let Some(traffic) = &snap.urb_traffic else {
+        return;
+    };
+    let _ = writeln!(out, "{}", t.heading("link error counts"));
+    let _ = writeln!(
+        out,
+        "  {}",
+        t.dim(&format!(
+            "{} completions over {:.1}s from {}",
+            traffic.total_completions(),
+            traffic.window_ms as f64 / 1000.0,
+            traffic
+                .source
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "usbmon".into())
+        ))
+    );
+    if traffic.unparsed > 0 {
+        let _ = writeln!(
+            out,
+            "  {}",
+            t.yellow(&format!(
+                "{} line(s) not understood — the usbmon format may have changed",
+                traffic.unparsed
+            ))
+        );
+    }
+
+    for s in &traffic.devices {
+        let who = snap
+            .device_at_address(s.bus, s.device_address)
+            .map(|d| format!("{}  {}", d.sysfs_name, d.label()))
+            .unwrap_or_else(|| format!("bus {} address {}", s.bus, s.device_address));
+
+        let rate = s.transport_error_rate().unwrap_or(0.0);
+        let verdict = if s.transport_errors == 0 {
+            t.green("no transport errors")
+        } else {
+            t.red(&format!(
+                "{} transport error(s), {:.2}%",
+                s.transport_errors,
+                rate * 100.0
+            ))
+        };
+        let _ = writeln!(out, "  {} {}", t.bold(&who), verdict);
+
+        let mut detail = vec![format!("{} completions", s.completions)];
+        if let Some(bps) = s.throughput_bps(traffic.window_ms) {
+            if bps > 1024.0 {
+                detail.push(format!("{}/s", bytes_human(bps as u64)));
+            }
+        }
+        // Named so they are visibly excluded rather than quietly missing.
+        if s.cancellations > 0 {
+            detail.push(format!("{} cancelled by the driver (routine)", s.cancellations));
+        }
+        if s.protocol_errors > 0 {
+            detail.push(format!(
+                "{} stall(s){}",
+                s.protocol_errors,
+                if s.non_control_stalls > 0 {
+                    format!(", {} on a data endpoint", s.non_control_stalls)
+                } else {
+                    ", all on endpoint 0 (routine)".into()
+                }
+            ));
+        }
+        row(out, t, "", &t.dim(&detail.join("  ")));
+
+        if !s.error_breakdown().is_empty() {
+            row(out, t, "statuses", &t.dim(&s.error_breakdown().join(", ")));
+        }
+    }
+    let _ = writeln!(out);
+}
+
 /// What this run could and could not attempt.
 ///
 /// Verbose only. On an ordinary desktop every active probe is out of reach and

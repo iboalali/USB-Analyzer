@@ -285,34 +285,49 @@ fn read_effective_uid(root: &Path) -> Option<u32> {
 }
 
 /// usbmon exposes two APIs: binary character devices `/dev/usbmon<N>`, and a
-/// text interface under debugfs. Either will do, so both are looked for.
+/// text stream under debugfs.
+///
+/// Only the text stream counts as usable here. The binary API needs ioctls,
+/// which would mean a libc dependency, so nothing in this crate can read it —
+/// reporting it as available would be a promise the crate cannot keep. A
+/// binary node is still worth finding, because its existence proves the module
+/// is loaded and narrows down why the text stream is missing.
 fn detect_usbmon(root: &Path) -> Interface {
-    let candidates = usbmon_paths(root);
-    for path in &candidates {
-        match OpenOptions::new().read(true).open(path) {
-            Ok(_) => return Interface::new(Availability::Usable, Some(path.clone())),
-            Err(e) if e.kind() == ErrorKind::PermissionDenied => {
-                return Interface::new(
-                    Availability::Denied(format!(
-                        "{} exists but is not readable by this process — usbmon is root-only",
-                        path.display()
-                    )),
-                    Some(path.clone()),
-                )
-            }
-            // Anything else: keep looking, the other API may work.
-            Err(_) => continue,
+    let text = root.join(TEXT_API.trim_start_matches('/'));
+    match OpenOptions::new().read(true).open(&text) {
+        Ok(_) => return Interface::new(Availability::Usable, Some(text)),
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+            return Interface::new(
+                Availability::Denied(format!(
+                    "{} exists but is not readable by this process — usbmon is root-only",
+                    text.display()
+                )),
+                Some(text),
+            )
         }
+        Err(_) => {}
     }
 
     // Nothing openable. Distinguish "not built", "not loaded" and "cannot see".
     let debugfs = root.join("sys/kernel/debug");
     let debugfs_blind = debugfs.exists() && std::fs::read_dir(&debugfs).is_err();
+    let loaded = module_loaded(root, "usbmon") || !binary_nodes(root).is_empty();
+
+    if loaded && debugfs_blind {
+        return Interface::new(
+            Availability::Denied(
+                "usbmon is loaded, but /sys/kernel/debug is not readable by this process, \
+                 so its text stream cannot be opened — this needs root"
+                    .into(),
+            ),
+            None,
+        );
+    }
 
     match kernel_config_value(root, "CONFIG_USB_MON") {
-        Some('m') if module_loaded(root, "usbmon") => Interface::new(
+        Some('m') if loaded => Interface::new(
             Availability::Unknown(
-                "the usbmon module is loaded but no usable interface was found; \
+                "the usbmon module is loaded but its text stream was not found; \
                  debugfs may not be mounted"
                     .into(),
             ),
@@ -357,21 +372,17 @@ fn detect_usbmon(root: &Path) -> Interface {
     }
 }
 
-fn usbmon_paths(root: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    // Binary API. Node 0 watches every bus, which is what a sweep wants.
-    let dev = root.join("dev");
-    for entry in fsx::list_dir(&dev) {
-        if fsx::file_name(&entry).starts_with("usbmon") {
-            out.push(entry);
-        }
-    }
+/// The all-buses text stream. Per-bus streams are `<busnum>u`.
+const TEXT_API: &str = "/sys/kernel/debug/usb/usbmon/0u";
+
+/// `/dev/usbmon<N>` — the binary API. Not readable by this crate, but its
+/// presence is proof the module is loaded.
+fn binary_nodes(root: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = fsx::list_dir(root.join("dev"))
+        .into_iter()
+        .filter(|e| fsx::file_name(e).starts_with("usbmon"))
+        .collect();
     out.sort();
-    // Text API, `0u` being the all-buses stream.
-    let text = root.join("sys/kernel/debug/usb/usbmon/0u");
-    if text.exists() {
-        out.push(text);
-    }
     out
 }
 
@@ -516,16 +527,37 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// A readable usbmon node is the whole point, and it must win over any
+    /// A readable text stream is the whole point, and it must win over any
     /// inference from the kernel config.
     #[test]
     fn an_openable_interface_is_usable_whatever_the_config_says() {
         let root = fake_root("usable", None, "");
-        fs::write(root.join("dev/usbmon0"), b"").unwrap();
+        let text = root.join("sys/kernel/debug/usb/usbmon");
+        fs::create_dir_all(&text).unwrap();
+        fs::write(text.join("0u"), b"").unwrap();
 
         let caps = detect_in(&root);
         assert_eq!(caps.usbmon.availability, Availability::Usable);
-        assert_eq!(caps.usbmon.path, Some(root.join("dev/usbmon0")));
+        assert_eq!(caps.usbmon.path, Some(text.join("0u")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The binary API proves the module is loaded but cannot be read by this
+    /// crate, so it must never be reported as usable — only used to sharpen
+    /// the explanation for why the text stream is not there.
+    #[test]
+    fn a_binary_node_alone_is_not_usable() {
+        let root = fake_root("binonly", Some("CONFIG_USB_MON=m\n"), "");
+        fs::write(root.join("dev/usbmon0"), b"").unwrap();
+
+        let caps = detect_in(&root);
+        assert!(!caps.usbmon.is_usable());
+        assert!(
+            matches!(caps.usbmon.availability, Availability::Unknown(_)),
+            "loaded but no text stream: {:?}",
+            caps.usbmon
+        );
+        assert!(caps.usbmon.availability.explain().contains("debugfs"));
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -42,46 +42,53 @@ into fixtures either way.
 
 ## The root-probe chain
 
-Everything the tool does today reads *negotiated state*. A marginal cable often
-negotiates full speed and only fails under load, which is exactly the case passive
-reading cannot see. These five items are how it learns to push.
+Everything the tool did before this chain reads *negotiated state*. A marginal cable
+often negotiates full speed and only fails under load, which is exactly the case passive
+reading cannot see. These six items are how it learns to push. The first two have
+landed, and are kept here with their reasoning because the remaining four build on it.
 
-### 1. A privilege/capability model in `usb-probe`
+### 1. A privilege/capability model — **done**
 
-Foundation for the rest. Detect at capture time and expose on `Snapshot`:
+`caps::detect()` resolves the usbmon text stream and usbfs write access, and reports
+which of five registered probes each unlocks. Rendered under `-v`.
 
-- `is_root` (`geteuid == 0`)
-- usbmon readable — `/sys/kernel/debug/usb/usbmon/<bus>u` or `/dev/usbmon<N>`.
-  `CONFIG_USB_MON=m` is set on this kernel, so it is purely a permission question
-- usbfs writable — `/dev/bus/usb/BBB/DDD` is `crw-rw-r-- root:root`, so root-only;
-  `plugdev` does not help
-- the kernel log source, already resolved by `kernel.rs`
+Detection is by attempt where an attempt is cheap and side-effect free, because "am I
+root, therefore I may" is wrong often enough to matter. Where an attempt cannot answer,
+the kernel config can, and the four ways of being unavailable are kept apart because the
+fix differs completely: **not loaded** (`modprobe`), **denied** (privilege),
+**unsupported** (different kernel), **undetermined** (`/sys/kernel/debug` is 0700 and
+sometimes the honest answer is that we cannot see).
 
-A UI can then grey out unavailable probes, and findings can state what was skipped
-rather than silently omitting it — the policy `KERNEL_LOG_UNAVAILABLE` already sets.
+### 2. usbmon URB error accounting — **done, parser not yet validated**
 
-Classify every probe `Passive` (default, unprivileged, read-only) or `Active` (opt-in).
-No `Active` probe may run unless explicitly requested.
+`usbmon::sample()` watches the text stream for a window and accounts completions per
+device address. `LINK_ERROR_RATE` (Measured) fires above 3 transport errors and a 0.1%
+rate; High above 1%.
 
-### 2. usbmon URB error accounting — root, read-only
+Three classes, kept apart, because conflating them would produce exactly the confident
+false accusation this tool exists to avoid:
 
-The highest-value addition, and the only one that keeps the read-only guarantee: it
-needs root but mutates nothing.
+- **transport** — `EPROTO`, `EILSEQ`, `EOVERFLOW`, `ETIMEDOUT`. Implicates the wire.
+- **protocol** — `EPIPE`. On endpoint 0 this is a device declining a request, which is
+  routine; on a data endpoint it is a halt.
+- **cancelled** — `ENOENT`, `ECONNRESET`, `ESHUTDOWN`. A webcam stopping its stream
+  cancels URBs in bulk. Counting those would condemn every healthy camera on the machine.
 
-Account per device, from the binary API (`/dev/usbmon<N>`) or the text API:
+Corroboration deliberately stops short of what the original task asked for. Measured
+errors annotate the findings they speak to and lift Heuristic to Inferred, but nothing
+reaches Measured: the counts are measured, and blaming the cable for them is still a
+deduction. A cable is only convicted by substitution.
 
-- completion status codes — `-EPIPE` (stall), `-EPROTO`, `-EILSEQ` (CRC),
-  `-ETIMEDOUT`, `-EOVERFLOW`
-- retry and resubmit counts, babble, transfer errors
-- totals per endpoint and per device path
+**Open:** the parser has never seen real usbmon output. usbmon is `CONFIG_USB_MON=m` on
+this machine and not loaded, and both its APIs are root-only, so every test so far
+encodes the documented format rather than the emitted one. One known uncertainty: the
+isochronous type letter, where the documentation and the implementation have differed —
+both `Z` and `S` are accepted for now. To settle it:
 
-**Why it matters:** error counts are the strongest cable evidence obtainable in
-software, because they observe *behaviour* rather than negotiated state.
-
-Adds a `LINK_ERROR_RATE` finding (Measured) above a threshold over a sampling window,
-and lets corroborated cable findings move from Inferred toward Measured, citing counts
-as evidence. Needs a sampling window, so it is a distinct execution mode from the
-instantaneous snapshot — design the API for it (`probe::sample_errors(Duration)`).
+```
+sudo modprobe usbmon
+sudo timeout 5 cat /sys/kernel/debug/usb/usbmon/0u > usbmon-sample.txt
+```
 
 ### 3. An opt-in `usbdiag probe` subcommand
 
@@ -145,8 +152,10 @@ Keeping the existing honesty about what software can and cannot know:
 
 - the Passive/Active split, and why the default stays unprivileged
 - which probes need root, and which are disruptive versus read-only
-- the confidence story: usbmon error counts are the one thing that moves cable findings
-  from Inferred toward Measured
+- the confidence story, as built rather than as originally sketched: usbmon error counts
+  are measured, and they lift a Heuristic finding to Inferred — but no cable finding
+  reaches Measured, because attributing measured errors to the cable is still a
+  deduction, and a cable is only convicted by substitution
 - **what active probing still cannot reach, and why.** No userspace path exists to send
   PD/SOP' messages: the PD state machine lives in the port controller firmware.
   `CONFIG_UCSI_DEBUGFS` is not set on this kernel (6.17.0-1030-oem), and it is the one

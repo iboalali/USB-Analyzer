@@ -39,6 +39,7 @@ pub mod sysfs;
 pub mod thunderbolt;
 pub mod typec;
 pub mod usb;
+pub mod usbmon;
 pub mod vdo;
 
 #[cfg(test)]
@@ -57,6 +58,14 @@ pub struct Options {
     /// it — the measurement costs exactly this much wall-clock, since a rate
     /// cannot be derived from cumulative counters without a time base.
     pub storage_sample_ms: u64,
+    /// Milliseconds to watch the usbmon URB stream. 0 skips it.
+    ///
+    /// This is the privileged read-only probe, and setting it is the explicit
+    /// request that permits it to run: nothing beyond passive reading happens
+    /// at the default of 0. It costs this much wall-clock, needs root, and
+    /// silently yields nothing when usbmon is unreachable — [`Capabilities`]
+    /// holds the reason.
+    pub urb_sample_ms: u64,
 }
 
 /// Read the current state of the system.
@@ -99,10 +108,13 @@ pub fn capture_with_log(opts: Options, log: Option<KernelLog>) -> Snapshot {
         .map(|(_, v)| v)
         .collect();
 
+    let capabilities = caps::detect();
+    let urb_traffic = sample_urb_traffic(&capabilities, opts);
+
     Snapshot {
         captured_at_unix_ms: now_ms(),
         host: read_host(),
-        capabilities: caps::detect(),
+        capabilities,
         buses: usb::read_buses(),
         ports,
         thunderbolt: thunderbolt::read(),
@@ -116,8 +128,23 @@ pub fn capture_with_log(opts: Options, log: Option<KernelLog>) -> Snapshot {
         mains_online,
         uptime_s: read_uptime_s(),
         orphan_pd,
+        urb_traffic,
         kernel_log: log.unwrap_or_else(|| kernel::collect(opts.kernel)),
     }
+}
+
+/// Run the usbmon probe, if it was asked for and is reachable.
+///
+/// Returns `None` both when it was not requested and when it could not run.
+/// Those look the same here on purpose: [`Snapshot::capabilities`] already
+/// records exactly why usbmon was unavailable, and duplicating that reason in
+/// two places invites them to disagree.
+fn sample_urb_traffic(capabilities: &caps::Capabilities, opts: Options) -> Option<UrbTraffic> {
+    if opts.urb_sample_ms == 0 || !capabilities.usbmon.is_usable() {
+        return None;
+    }
+    let path = capabilities.usbmon.path.as_ref()?;
+    usbmon::sample(path, std::time::Duration::from_millis(opts.urb_sample_ms)).ok()
 }
 
 /// Capture and analyze in one step.

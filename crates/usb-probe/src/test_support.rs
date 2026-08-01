@@ -29,6 +29,7 @@ pub fn empty_snapshot() -> Snapshot {
         mains_online: None,
         uptime_s: None,
         orphan_pd: Vec::new(),
+        urb_traffic: None,
         kernel_log: KernelLog {
             source: KernelLogSource::Journalctl,
             note: None,
@@ -620,6 +621,49 @@ pub fn phantom_failure_events(device: &str, at_s: f64) -> Vec<KernelEvent> {
 /// A device with a known attach time, expressed as seconds before `uptime_s`.
 pub fn attached_ago(mut d: UsbDevice, seconds_ago: f64) -> UsbDevice {
     d.connected_duration_ms = Some((seconds_ago * 1000.0) as u64);
+    d
+}
+
+/// URB accounting for one device, as the usbmon probe would have produced it.
+pub fn urb_stats(bus: u32, address: u32, completions: u64, transport_errors: u64) -> UrbStats {
+    let mut by_status = BTreeMap::new();
+    if completions > transport_errors {
+        by_status.insert(0, completions - transport_errors);
+    }
+    if transport_errors > 0 {
+        by_status.insert(-71, transport_errors);
+    }
+    let mut transport_endpoints = std::collections::BTreeSet::new();
+    if transport_errors > 0 {
+        transport_endpoints.insert(1u8);
+    }
+    UrbStats {
+        bus,
+        device_address: address,
+        completions,
+        bytes: completions * 4096,
+        transport_errors,
+        transport_endpoints,
+        by_status,
+        ..Default::default()
+    }
+}
+
+pub fn urb_traffic(window_ms: u64, devices: Vec<UrbStats>) -> UrbTraffic {
+    UrbTraffic {
+        window_ms,
+        lines_read: devices.iter().map(|d| d.completions).sum(),
+        unparsed: 0,
+        source: Some(PathBuf::from("/sys/kernel/debug/usb/usbmon/0u")),
+        devices,
+    }
+}
+
+/// A device with the bus address usbmon would report it under.
+pub fn device_at(name: &str, mbps: f64, parent: Option<&str>, bus: u32, address: u32) -> UsbDevice {
+    let mut d = device(name, " 3.20", mbps, parent);
+    d.busnum = Some(bus);
+    d.devnum = Some(address);
     d
 }
 

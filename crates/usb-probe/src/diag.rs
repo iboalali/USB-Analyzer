@@ -47,6 +47,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Finding> {
     thunderbolt_rules(snap, &mut f);
     battery_rules(snap, &mut f);
     display_rules(snap, &mut f);
+    urb_error_rules(snap, &mut f);
     hub_port_rules(snap, &mut f);
 
     // One physical fault should read as one finding. Without this, a single
@@ -65,6 +66,10 @@ pub fn analyze(snap: &Snapshot) -> Vec<Finding> {
             }
         });
     }
+
+    // Measured traffic strengthens the findings it speaks to, once the set is
+    // final — so nothing later can drop a finding that has been annotated.
+    corroborate_with_urb_errors(snap, &mut f);
 
     // Strongest first, then by confidence, then stable by code for determinism.
     f.sort_by(|a, b| {
@@ -1432,6 +1437,164 @@ fn phantom_device_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
     }
 }
 
+/// Below this many transport errors, a window says nothing. One `-110` while a
+/// device wakes from suspend is normal; three is a pattern.
+const URB_ERROR_MIN: u64 = 3;
+
+/// Enough completions for a rate to mean anything.
+const URB_MIN_COMPLETIONS: u64 = 50;
+
+/// A healthy link produces essentially no transport errors, so the bar for
+/// "elevated" is low. Above [`URB_RATE_SEVERE`] the link is failing outright.
+const URB_RATE_ELEVATED: f64 = 0.001;
+const URB_RATE_SEVERE: f64 = 0.01;
+
+/// Findings that an elevated error rate genuinely speaks to. Each already
+/// claims the link is underperforming; measured errors say it is also failing.
+const CORROBORATED_BY_URB_ERRORS: [&str; 4] = [
+    "LINK_BELOW_DEVICE_CAPABILITY",
+    "LINK_SLOW_DESPITE_CAPABLE_CABLE",
+    "LINK_SINGLE_LANE",
+    "DEVICE_RESET_STORM",
+];
+
+/// URB completion errors measured over a window — behaviour, not negotiated
+/// state, and the only evidence in this crate that a link is failing *now*.
+///
+/// Only transport errors count. Stalls and driver cancellations are excluded
+/// upstream, in `usbmon::classify`, because a webcam stopping its stream and a
+/// device declining an unsupported control request both produce non-zero
+/// statuses in bulk and neither says anything about the wire.
+fn urb_error_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
+    let Some(traffic) = &snap.urb_traffic else {
+        return;
+    };
+    for stats in &traffic.devices {
+        if stats.transport_errors < URB_ERROR_MIN {
+            continue;
+        }
+        let Some(rate) = stats.transport_error_rate() else {
+            continue;
+        };
+        // A handful of errors out of a handful of transfers is not yet a rate.
+        if stats.completions < URB_MIN_COMPLETIONS && stats.transport_errors < 10 {
+            continue;
+        }
+        if rate < URB_RATE_ELEVATED {
+            continue;
+        }
+
+        let dev = snap.device_at_address(stats.bus, stats.device_address);
+        let who = dev
+            .map(|d| format!("{} ({})", d.label(), d.sysfs_name))
+            .unwrap_or_else(|| {
+                format!(
+                    "the device at bus {} address {}",
+                    stats.bus, stats.device_address
+                )
+            });
+
+        let severe = rate >= URB_RATE_SEVERE;
+        let mut evidence = vec![
+            format!(
+                "{} of {} completions failed in transport over {:.1}s — {:.2}%",
+                stats.transport_errors,
+                stats.completions,
+                traffic.window_ms as f64 / 1000.0,
+                rate * 100.0
+            ),
+            format!("statuses: {}", stats.error_breakdown().join(", ")),
+        ];
+        if stats.transport_endpoints.len() > 1 {
+            evidence.push(format!(
+                "{} endpoints affected, which points at the path rather than one pipe",
+                stats.transport_endpoints.len()
+            ));
+        }
+        if stats.cancellations > 0 {
+            evidence.push(format!(
+                "{} driver cancellations excluded — those are routine, not faults",
+                stats.cancellations
+            ));
+        }
+
+        out.push(Finding {
+            code: "LINK_ERROR_RATE".into(),
+            severity: if severe {
+                Severity::High
+            } else {
+                Severity::Medium
+            },
+            confidence: Confidence::Measured,
+            subject: match dev {
+                Some(d) => Subject::Device(d.sysfs_name.clone()),
+                None => Subject::Host,
+            },
+            title: format!(
+                "{who} is losing {:.2}% of its transfers to link errors",
+                rate * 100.0
+            ),
+            detail: "These are transfers the bus failed to carry intact — CRC mismatches, \
+                     babble, or no answer at all — counted as they happened rather than \
+                     inferred from anything. A link that negotiated cleanly and then drops \
+                     packets under load is the signature of a marginal physical path: a \
+                     damaged or out-of-spec cable, a dirty or worn connector, or a hub \
+                     running past what its power budget supports. It is not a driver \
+                     problem, and it is not power management."
+                .to_string(),
+            evidence,
+            suggestion: Some(
+                "Swap the cable first — it is the cheapest thing in the path and the most \
+                 common cause. If the errors follow the device to another port and another \
+                 cable, the device is at fault; if they stay with the port, the port is."
+                    .into(),
+            ),
+        });
+    }
+}
+
+/// Let measured errors strengthen the findings they speak to.
+///
+/// Deliberately does **not** promote anything to [`Confidence::Measured`].
+/// The error counts are measured; blaming the cable for them is still an
+/// inference, and a cable can only be convicted by substitution. Raising a
+/// heuristic to inferred is as far as the evidence reaches.
+fn corroborate_with_urb_errors(snap: &Snapshot, findings: &mut [Finding]) {
+    let Some(traffic) = &snap.urb_traffic else {
+        return;
+    };
+    for f in findings.iter_mut() {
+        if !CORROBORATED_BY_URB_ERRORS.contains(&f.code.as_str()) {
+            continue;
+        }
+        let Subject::Device(name) = &f.subject else {
+            continue;
+        };
+        let Some(dev) = snap.device(name) else {
+            continue;
+        };
+        let Some((bus, addr)) = dev.busnum.zip(dev.devnum) else {
+            continue;
+        };
+        let Some(stats) = traffic.for_address(bus, addr) else {
+            continue;
+        };
+        if stats.transport_errors < URB_ERROR_MIN {
+            continue;
+        }
+
+        f.evidence.push(format!(
+            "corroborated: {} transport error(s) measured over {:.1}s of live traffic ({})",
+            stats.transport_errors,
+            traffic.window_ms as f64 / 1000.0,
+            stats.error_breakdown().join(", ")
+        ));
+        if f.confidence == Confidence::Heuristic {
+            f.confidence = Confidence::Inferred;
+        }
+    }
+}
+
 /// The SVID VESA assigned to DisplayPort Alternate Mode.
 const SVID_DISPLAYPORT: u16 = 0xff01;
 
@@ -2672,6 +2835,125 @@ mod tests {
             .expect("6-1.2 failed while 6-1 was already attached");
         assert_eq!(hit.severity, Severity::High);
         assert!(hit.evidence.iter().any(|e| e.contains("EPROTO")));
+    }
+
+    // --- LINK_ERROR_RATE ---------------------------------------------------
+
+    fn snapshot_with_traffic(errors: u64, completions: u64) -> Snapshot {
+        let mut snap = empty_snapshot();
+        let mut bus = root_hub("usb2", 10_000.0);
+        bus.children
+            .push(device_at("2-1", 5000.0, Some("usb2"), 2, 4));
+        snap.buses.push(bus);
+        snap.urb_traffic = Some(urb_traffic(
+            5000,
+            vec![urb_stats(2, 4, completions, errors)],
+        ));
+        snap
+    }
+
+    /// The point of the probe: a link that negotiated cleanly and is dropping
+    /// packets under load. Nothing passive can see this.
+    #[test]
+    fn reports_a_measured_transport_error_rate() {
+        let snap = snapshot_with_traffic(40, 1000);
+        let hit = analyze(&snap)
+            .into_iter()
+            .find(|f| f.code == "LINK_ERROR_RATE")
+            .expect("4% of transfers failing");
+        assert_eq!(hit.severity, Severity::High, "4% is not a warning");
+        assert_eq!(hit.confidence, Confidence::Measured);
+        assert_eq!(hit.subject, Subject::Device("2-1".into()));
+        assert!(hit.evidence.iter().any(|e| e.contains("EPROTO")));
+        // The advice must be the cheapest test first.
+        assert!(hit.suggestion.as_ref().unwrap().contains("cable"));
+    }
+
+    #[test]
+    fn a_low_but_real_error_rate_is_medium_not_high() {
+        let snap = snapshot_with_traffic(5, 1000);
+        let hit = analyze(&snap)
+            .into_iter()
+            .find(|f| f.code == "LINK_ERROR_RATE")
+            .expect("0.5% is still elevated");
+        assert_eq!(hit.severity, Severity::Medium);
+    }
+
+    /// A clean window must produce nothing, and so must a window too small to
+    /// mean anything — two errors during a resume is not a failing cable.
+    #[test]
+    fn a_clean_or_tiny_sample_says_nothing() {
+        for (errors, completions) in [(0, 5000), (2, 5000), (2, 3)] {
+            let snap = snapshot_with_traffic(errors, completions);
+            assert!(
+                !codes(&analyze(&snap)).contains(&"LINK_ERROR_RATE"),
+                "{errors} errors in {completions} completions must not fire"
+            );
+        }
+    }
+
+    /// The false positive the classification exists to prevent. A webcam
+    /// stopping its stream cancels URBs in bulk and a device declines
+    /// unsupported control requests with a stall; neither touches the wire.
+    #[test]
+    fn cancellations_and_stalls_never_produce_a_finding() {
+        let mut snap = snapshot_with_traffic(0, 2000);
+        if let Some(t) = snap.urb_traffic.as_mut() {
+            t.devices[0].cancellations = 1500;
+            t.devices[0].protocol_errors = 400;
+            t.devices[0].by_status.insert(-2, 1500);
+            t.devices[0].by_status.insert(-32, 400);
+        }
+        assert!(!codes(&analyze(&snap)).contains(&"LINK_ERROR_RATE"));
+    }
+
+    /// Measured errors strengthen a finding that already claims the link is
+    /// underperforming — but must not promote a cable accusation to measured.
+    /// The counts are measured; blaming the cable for them is not.
+    #[test]
+    fn errors_corroborate_without_overclaiming_confidence() {
+        let mut snap = empty_snapshot();
+        let mut bus = root_hub("usb3", 480.0);
+        let mut dev = device_at("3-1", 12.0, Some("usb3"), 3, 7);
+        dev = with_runtime_pm(dev, "on", 0.0, 2000);
+        bus.children.push(dev);
+        snap.buses.push(bus);
+        snap.kernel_log = reset_log("3-1", 12);
+        snap.urb_traffic = Some(urb_traffic(5000, vec![urb_stats(3, 7, 900, 20)]));
+
+        let f = analyze(&snap);
+        let storm = f
+            .iter()
+            .find(|x| x.code == "DEVICE_RESET_STORM")
+            .expect("12 resets with power management ruled out");
+        assert!(
+            storm.evidence.iter().any(|e| e.contains("corroborated")),
+            "{:?}",
+            storm.evidence
+        );
+        // Heuristic -> Inferred, and no further: the errors are measured, but
+        // blaming the cable for them is still a deduction.
+        assert_eq!(storm.confidence, Confidence::Inferred);
+
+        // Without the traffic the same snapshot yields only a heuristic, which
+        // is what makes the upgrade above meaningful rather than incidental.
+        let mut bare = snap.clone();
+        bare.urb_traffic = None;
+        let plain = analyze(&bare)
+            .into_iter()
+            .find(|x| x.code == "DEVICE_RESET_STORM")
+            .unwrap();
+        assert_eq!(plain.confidence, Confidence::Heuristic);
+        assert!(!plain.evidence.iter().any(|e| e.contains("corroborated")));
+    }
+
+    /// With no probe run, nothing may be concluded from its absence.
+    #[test]
+    fn no_traffic_sampled_means_no_finding_either_way() {
+        let mut snap = empty_snapshot();
+        snap.buses.push(root_hub("usb2", 10_000.0));
+        assert!(snap.urb_traffic.is_none());
+        assert!(!codes(&analyze(&snap)).contains(&"LINK_ERROR_RATE"));
     }
 
     // --- DP_ALT_MODE_NO_OUTPUT ---------------------------------------------

@@ -70,6 +70,9 @@ fn main() -> ExitCode {
             ..Default::default()
         },
         storage_sample_ms: args.sample_ms,
+        // The privileged probe stays off until the `probe` subcommand exists
+        // to gate it properly.
+        urb_sample_ms: 0,
     };
 
     if args.command == Command::Watch {
@@ -124,6 +127,7 @@ fn format_report(report: &Report, args: &Args) -> String {
         Command::Devices => {
             render::devices(&mut out, &report.snapshot, &theme);
             render::storage(&mut out, report, &theme);
+            render::urb_traffic(&mut out, &report.snapshot, &theme);
         }
         Command::Diag => {
             render::findings(&mut out, report, &theme);
@@ -138,6 +142,7 @@ fn format_report(report: &Report, args: &Args) -> String {
             render::displays(&mut out, &report.snapshot, &theme);
             render::devices(&mut out, &report.snapshot, &theme);
             render::storage(&mut out, report, &theme);
+            render::urb_traffic(&mut out, &report.snapshot, &theme);
             render::findings(&mut out, report, &theme);
             render::capabilities(&mut out, &report.snapshot, &theme);
             render::summary(&mut out, report, &theme);
