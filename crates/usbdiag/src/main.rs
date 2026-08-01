@@ -25,9 +25,10 @@ enum Command {
     All,
     Watch,
     Json,
+    Probe,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Args {
     command: Command,
     json: bool,
@@ -36,6 +37,13 @@ struct Args {
     raw_log: bool,
     interval_ms: u64,
     sample_ms: u64,
+    /// The probe named after `probe`, if any. Without one, the catalogue is
+    /// printed and nothing runs.
+    probe: Option<String>,
+    target: Option<String>,
+    duration_ms: u64,
+    consented: bool,
+    forced: bool,
 }
 
 impl Default for Args {
@@ -48,9 +56,18 @@ impl Default for Args {
             raw_log: false,
             interval_ms: 2000,
             sample_ms: 0,
+            probe: None,
+            target: None,
+            duration_ms: DEFAULT_PROBE_MS,
+            consented: false,
+            forced: false,
         }
     }
 }
+
+/// Long enough to see a fault on an idle bus, short enough that nobody wonders
+/// whether the tool has hung.
+const DEFAULT_PROBE_MS: u64 = 3000;
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -70,13 +87,15 @@ fn main() -> ExitCode {
             ..Default::default()
         },
         storage_sample_ms: args.sample_ms,
-        // The privileged probe stays off until the `probe` subcommand exists
-        // to gate it properly.
+        // Never on by default: it needs root, and it costs a wall-clock window.
+        // `probe urb-errors` is the only thing that switches it on.
         urb_sample_ms: 0,
     };
 
-    if args.command == Command::Watch {
-        return watch(&args, opts);
+    match args.command {
+        Command::Watch => return watch(&args, opts),
+        Command::Probe => return probe(&args, opts),
+        _ => {}
     }
 
     let report = usb_probe::report(opts);
@@ -149,6 +168,7 @@ fn format_report(report: &Report, args: &Args) -> String {
             render::caveat(&mut out, &theme);
         }
         Command::Json => unreachable!("Json implies --json"),
+        Command::Probe => unreachable!("probe prints its own output"),
     }
     out
 }
@@ -160,6 +180,166 @@ fn json_of<T: serde::Serialize>(v: &T) -> String {
             s
         }
         Err(e) => format!("{{\"error\":\"{e}\"}}\n"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// probe
+// ---------------------------------------------------------------------------
+
+/// Run one named probe, or list what there is to run.
+///
+/// The decision to run is not made here — [`usb_probe::probe::plan`] makes it,
+/// so that a GUI gets the same answer without reimplementing the safety rules.
+/// This function's job is to ask, print what was decided, and where the only
+/// thing missing is a human saying yes, ask the human.
+fn probe(args: &Args, opts: Options) -> ExitCode {
+    let snapshot = usb_probe::capture(opts);
+    let theme = Theme {
+        color: args
+            .color
+            .unwrap_or_else(|| std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()),
+        verbose: args.verbose,
+    };
+
+    // No probe named: show the catalogue. Listing is not running.
+    let Some(name) = args.probe.as_deref() else {
+        if args.json {
+            print!("{}", json_of(&snapshot.capabilities));
+        } else {
+            let mut out = String::new();
+            render::probes(&mut out, &snapshot, &theme);
+            print!("{out}");
+        }
+        let _ = std::io::stdout().flush();
+        return ExitCode::SUCCESS;
+    };
+
+    let caps = snapshot.capabilities.clone();
+    let request = usb_probe::probe::Request {
+        name,
+        target: args.target.as_deref(),
+        window: Duration::from_millis(args.duration_ms),
+        consented: args.consented,
+        accepts_disruption: args.forced,
+    };
+
+    let plan = match usb_probe::probe::plan(&caps, &snapshot, &request) {
+        Ok(p) => p,
+        Err(refusal) => match confirm_interactively(&refusal, &caps, &snapshot, &request) {
+            Some(p) => p,
+            None => {
+                eprintln!("usbdiag: {}", refusal.message());
+                if let Some(hint) = flag_for(&refusal) {
+                    eprintln!("         {hint}");
+                }
+                return ExitCode::from(2);
+            }
+        },
+    };
+
+    println!("{}", plan.describe());
+
+    let Some(probe_opts) = plan.options(opts) else {
+        // Unreachable while every implemented probe is a matter of reading
+        // more; the two that will act are refused as unimplemented above.
+        eprintln!("usbdiag: '{}' has no way to run yet", plan.probe.name);
+        return ExitCode::from(2);
+    };
+
+    let report = usb_probe::report(probe_opts);
+    let scoped = plan.target.as_ref().map(|t| t.sysfs_name.clone());
+    let report = match &scoped {
+        Some(sysfs_name) => report.scoped_to(sysfs_name),
+        None => report,
+    };
+
+    if args.json {
+        print!("{}", json_of(&report));
+        let _ = std::io::stdout().flush();
+        return exit_code(&report);
+    }
+
+    let mut out = String::new();
+    if let Some(sysfs_name) = &scoped {
+        // usbmon has no per-device mode, so say plainly that the narrowing is
+        // in the display and not in the measurement.
+        out.push_str(&format!(
+            "  the whole bus was watched; only {sysfs_name} and what hangs off it is shown\n"
+        ));
+    }
+    out.push('\n');
+    render::urb_traffic(&mut out, &report.snapshot, &theme);
+    render::findings(&mut out, &report, &theme);
+    render::summary(&mut out, &report, &theme);
+    print!("{out}");
+    let _ = std::io::stdout().flush();
+
+    exit_code(&report)
+}
+
+/// The last step of consent for a disruptive probe, and only that.
+///
+/// Reached solely when everything else has already passed — the interface is
+/// there, the target resolved, and the disk is not mounted. Asking before those
+/// checks would mean prompting for permission to do something that was going to
+/// be refused anyway.
+///
+/// Re-plans rather than patching the refusal, so the mounted-filesystem check
+/// runs again against the state as it is *after* the user answered.
+fn confirm_interactively(
+    refusal: &usb_probe::probe::Refusal,
+    caps: &usb_probe::caps::Capabilities,
+    snapshot: &usb_probe::model::Snapshot,
+    request: &usb_probe::probe::Request,
+) -> Option<usb_probe::probe::Plan> {
+    use usb_probe::probe::{Consent, Refusal};
+
+    if !matches!(
+        refusal,
+        Refusal::NeedsConsent {
+            what: Consent::ToDisrupt,
+            ..
+        }
+    ) {
+        return None;
+    }
+    // A script cannot be asked, so it must have said so up front with --force.
+    if !std::io::stdin().is_terminal() {
+        return None;
+    }
+
+    let target = request.target.unwrap_or("this device");
+    eprintln!("{}", refusal.message());
+    eprint!("Type the target name ({target}) to continue, anything else to stop: ");
+    let _ = std::io::stderr().flush();
+
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() || answer.trim() != target {
+        return None;
+    }
+
+    let confirmed = usb_probe::probe::Request {
+        accepts_disruption: true,
+        ..request.clone()
+    };
+    usb_probe::probe::plan(caps, snapshot, &confirmed).ok()
+}
+
+/// The flag that would lift a refusal, where one would.
+fn flag_for(refusal: &usb_probe::probe::Refusal) -> Option<&'static str> {
+    use usb_probe::probe::{Consent, Refusal};
+    match refusal {
+        Refusal::NeedsConsent {
+            what: Consent::ToProbe,
+            ..
+        } => Some("Pass --yes if that is what you want."),
+        Refusal::NeedsConsent {
+            what: Consent::ToDisrupt,
+            ..
+        } => Some("Pass --force to accept that, or run it on a terminal to be asked."),
+        Refusal::TargetRequired(_) => Some("Name one with --target, for example --target 6-1.2."),
+        _ => None,
     }
 }
 
@@ -184,7 +364,7 @@ const LOG_REFRESH_MS: u64 = 10_000;
 fn watch(args: &Args, opts: Options) -> ExitCode {
     let mut args = Args {
         command: Command::All,
-        ..*args
+        ..args.clone()
     };
     // Colour is on by default here since watch is inherently interactive.
     if args.color.is_none() {
@@ -291,8 +471,30 @@ fn parse(argv: &[String]) -> Result<Option<Args>, String> {
                     return Err("--interval must be at least 100 ms".into());
                 }
             }
+            "--target" => {
+                i += 1;
+                args.target = Some(argv.get(i).ok_or("--target needs a device name")?.clone());
+            }
+            "--duration" => {
+                i += 1;
+                let v = argv.get(i).ok_or("--duration needs a value in milliseconds")?;
+                args.duration_ms = v
+                    .parse()
+                    .map_err(|_| format!("not a number of milliseconds: {v}"))?;
+                if args.duration_ms < 100 {
+                    return Err("--duration must be at least 100 ms to measure anything".into());
+                }
+            }
+            "-y" | "--yes" => args.consented = true,
+            "--force" => args.forced = true,
             _ if a.starts_with('-') => return Err(format!("unknown option: {a}")),
             _ => {
+                // The word after `probe` is the probe's name, not a command.
+                if args.command == Command::Probe && saw_command && args.probe.is_none() {
+                    args.probe = Some(a.to_string());
+                    i += 1;
+                    continue;
+                }
                 if saw_command {
                     return Err(format!("unexpected argument: {a}"));
                 }
@@ -303,6 +505,7 @@ fn parse(argv: &[String]) -> Result<Option<Args>, String> {
                     "all" => Command::All,
                     "watch" => Command::Watch,
                     "json" => Command::Json,
+                    "probe" => Command::Probe,
                     _ => return Err(format!("unknown command: {a}")),
                 };
                 saw_command = true;
@@ -313,6 +516,12 @@ fn parse(argv: &[String]) -> Result<Option<Args>, String> {
 
     if args.command == Command::Json {
         args.json = true;
+    }
+
+    // Consent that cannot reach a probe is a typo worth reporting, not a
+    // no-op to shrug at: `usbdiag all --force` should not look like it worked.
+    if args.command != Command::Probe && (args.consented || args.forced) {
+        return Err("--yes and --force only mean anything for 'probe'".into());
     }
     Ok(Some(args))
 }
@@ -333,6 +542,7 @@ COMMANDS
     watch      Re-render on change, driven by uevents — plug a cable in and
                watch it negotiate
     json       Full snapshot and findings as JSON
+    probe      List the active probes; 'probe NAME' runs one
 
 OPTIONS
     -j, --json          JSON output (also narrows to the command's own data)
@@ -348,10 +558,18 @@ OPTIONS
     -h, --help          This text
     -V, --version       Version
 
+PROBE OPTIONS
+        --target NAME   Scope a probe to one device: a sysfs name such as
+                        6-1.2, or a disk such as sdb
+        --duration MS   How long a sampling probe runs, default {DEFAULT_PROBE_MS}
+    -y, --yes           Consent to a disruptive probe
+        --force         Accept the interruption without being asked. Needed
+                        only when there is no terminal to ask on
+
 EXIT STATUS
     0   nothing actionable found
     1   at least one medium-or-worse finding
-    2   bad usage
+    2   bad usage, or a probe refused to run
 
 NOTES
     Runs unprivileged. On systems with kernel.dmesg_restrict=1 the kernel ring
@@ -360,6 +578,11 @@ NOTES
 
     watch uses 'udevadm monitor' for change notification, and falls back to
     plain polling at --interval if udevadm is not available.
+
+    Every default run is passive: it reads sysfs, the kernel log and DRM, and
+    changes nothing. 'probe' is the only way to do more, it says what class of
+    probe it is before acting, and it will not run a disruptive one against a
+    disk that holds a mounted filesystem no matter what flags are passed.
 
     Cable capability can only be read from an e-marker chip. Signal integrity and
     the true rating of an unmarked cable need a hardware analyzer.
@@ -420,6 +643,43 @@ mod tests {
         let a = p(&["watch", "--interval", "500"]).unwrap().unwrap();
         assert_eq!(a.interval_ms, 500);
         assert_eq!(a.command, Command::Watch);
+    }
+
+    /// The word after `probe` is a probe name, not a second command — the one
+    /// place in this parser where a bare word means something other than a
+    /// command.
+    #[test]
+    fn probe_takes_a_name_and_its_own_options() {
+        let a = p(&["probe"]).unwrap().unwrap();
+        assert_eq!(a.command, Command::Probe);
+        assert_eq!(a.probe, None, "listing is not running");
+        assert_eq!(a.duration_ms, DEFAULT_PROBE_MS);
+
+        let a = p(&["probe", "urb-errors", "--duration", "5000", "--target", "6-1.2"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.probe.as_deref(), Some("urb-errors"));
+        assert_eq!(a.target.as_deref(), Some("6-1.2"));
+        assert_eq!(a.duration_ms, 5000);
+        assert!(!a.consented && !a.forced, "consent is never implied");
+
+        let a = p(&["probe", "reenumerate", "-y", "--force"]).unwrap().unwrap();
+        assert!(a.consented && a.forced);
+
+        // Two probe names is a mistake, not a list.
+        assert!(p(&["probe", "urb-errors", "throughput"]).is_err());
+        assert!(p(&["probe", "urb-errors", "--duration", "10"]).is_err());
+        assert!(p(&["probe", "--target"]).is_err());
+    }
+
+    /// Consent that cannot reach a probe means the command was misunderstood.
+    /// Silently ignoring it would make `usbdiag all --force` look accepted.
+    #[test]
+    fn consent_flags_are_rejected_outside_probe() {
+        assert!(p(&["all", "--force"]).is_err());
+        assert!(p(&["diag", "--yes"]).is_err());
+        assert!(p(&["watch", "-y"]).is_err());
+        assert!(p(&["probe", "urb-errors", "--yes"]).is_ok());
     }
 
     #[test]

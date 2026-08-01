@@ -96,18 +96,54 @@ Still unseen by the parser: a non-zero completion status. The classification is 
 errno values, which are stable, but no real error has been observed. That needs failing
 hardware, not another capture.
 
-### 3. An opt-in `usbdiag probe` subcommand
+### 3. An opt-in `usbdiag probe` subcommand — **done**
 
-The gate. Nothing active runs without it.
+The gate. `usbdiag probe` lists the catalogue and runs nothing; `usbdiag probe NAME`
+runs one. The decision lives in `probe::plan`, not in the CLI, so a GUI cannot grow its
+own subtly different version of "is this disk mounted".
 
-- refuses without an explicit flag, and refuses outright when not root, naming what it
-  would need
-- `all` / `ports` / `devices` / `diag` behaviour is unchanged and never invasive
-- `--target <sysfs-name>` scopes a probe to one device instead of sweeping the bus
-- each probe declares read-only or disruptive, and prints that before acting
-- disruptive probes need a second confirmation, and **must refuse on a device holding a
-  mounted filesystem**
-- exit-code semantics unchanged: 0 clean / 1 medium-or-worse / 2 usage
+`all` / `ports` / `devices` / `diag` / `watch` are untouched and still passive.
+Exit codes unchanged: 0 clean, 1 medium-or-worse, 2 bad usage **or a probe refused**.
+
+**Consent is proportional to consequence — a deliberate deviation from the spec above.**
+The original said every probe refuses until a confirmation flag is passed. That was
+dropped while building it: a flag required even for a probe that only reads becomes a
+reflex, typed without thought, and therefore worth nothing on the one probe where it
+matters. So passive probes run unasked, a **read-only** probe runs when named — naming it
+*is* the request, and there is nothing to undo — and only a **disruptive** probe asks. It
+asks twice, for two different things: `--yes` to consent at all, and either `--force` or
+a typed confirmation of the target name to accept the interruption.
+
+**One refusal consent cannot lift.** A disruptive probe against a disk holding a mounted
+filesystem or an active swap area is refused however many times the user says yes.
+`block::holders()` resolves the whole stack rather than comparing names, because the
+dangerous case looks nothing like the disk: a LUKS volume on a USB stick appears in
+`/proc/self/mounts` as `/dev/mapper/backup`, which shares no substring with `sdb`.
+Following `slaves/` down to the physical disks is the only way to connect the two.
+`/proc/swaps` counts too. Read fresh at the moment of the decision, never from the
+snapshot, since a filesystem can be mounted between capture and probe.
+
+Ordering of refusals is deliberate: interface missing, then unimplemented, then target
+unresolvable, then in use, and only then consent. Being told the disk is mounted is more
+use than being told to confirm something that would then be refused anyway.
+
+`--target` takes a sysfs name (`6-1.2`) or a disk (`sdb`, `/dev/sdb`), because both are
+what a user has in hand — the device tree prints one and `df` prints the other. For
+`urb-errors` it narrows the *display* only, and says so: usbmon watches every bus at once
+and has no per-device mode, so claiming otherwise would be a lie about the measurement.
+
+The unimplemented probes are listed and then refused **by name**. A gap that is visible
+gets closed; one that is merely absent does not.
+
+The disruptive gate is tested through a stand-in `ProbeInfo`, since both real disruptive
+probes refuse as unimplemented long before reaching it. Without that the code standing
+between a probe and someone's data would have shipped having never once run.
+
+**Found by running it, not by testing it:** `Snapshot::buses` holds root hubs with their
+children *nested*, and the first version of `subtree`/`resolve_target` iterated `buses`
+directly. Every synthetic snapshot in the suite happens to be flat, so it passed
+everywhere and then resolved nothing at all for `4-1` on a real machine. The fixtures
+involved are now nested.
 
 ### 4. Throughput probe via usbfs — root, disruptive
 
@@ -226,6 +262,11 @@ for. Listed here so the gap is not mistaken for coverage.
   a tcpm-based system populates partner alt modes properly; otherwise delete, since
   `BILLBOARD_ALT_MODE_FAILED` plus the DRM cross-check already covers "adapter attached,
   no picture" and fired correctly on this hardware.
+- **`probe urb-errors` end to end** — every refusal path was exercised against live
+  hardware, but the run itself has not been: it needs `sudo modprobe usbmon` and root,
+  and the machine has rebooted since the module was last loaded. The parser is validated
+  against 638 real lines and the gate is validated unprivileged; what is untested is only
+  the join between them.
 - **The udev wake path in `watch`** — parsing, threading and debouncing are covered by a
   canned stream, and `udevadm monitor` is confirmed to spawn with the right filters, but
   no real uevent has travelled the whole chain. Plugging anything in while

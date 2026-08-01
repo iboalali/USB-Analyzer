@@ -10,8 +10,11 @@
 //! That is exact, not a heuristic, because it follows the same device hierarchy
 //! the kernel built.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
 
 use crate::model::{BlockDevice, BlockStats, Throughput};
 use crate::sysfs as fsx;
@@ -111,6 +114,179 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// What is in use, and therefore must not be interrupted
+// ---------------------------------------------------------------------------
+
+/// A reason a disk may not be taken off the bus.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hold {
+    /// The kernel name of the thing actually in use. Rarely the disk itself:
+    /// usually a partition, sometimes a device-mapper node stacked above one.
+    pub via: String,
+    pub kind: HoldKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "where")]
+pub enum HoldKind {
+    Mounted(String),
+    Swap,
+}
+
+impl Hold {
+    /// One clause, for a refusal message.
+    pub fn describe(&self) -> String {
+        match &self.kind {
+            HoldKind::Mounted(at) => format!("{} is mounted at {at}", self.via),
+            HoldKind::Swap => format!("{} is in use as swap", self.via),
+        }
+    }
+}
+
+/// Every disk currently backing a mounted filesystem or an active swap area,
+/// mapped to the reasons why.
+///
+/// This is the check that stands between a disruptive probe and someone's data,
+/// so it resolves the whole stack rather than comparing names. A LUKS volume on
+/// a USB stick appears in `/proc/self/mounts` as `/dev/mapper/backup`, which
+/// shares no substring with `sdb` — following `slaves/` links down to the
+/// physical disks is the only way to connect the two. Missing that link would
+/// mean yanking a mounted encrypted volume off the bus.
+///
+/// Read fresh at the moment of the decision, never from a snapshot: a
+/// filesystem can be mounted between capture and probe.
+pub fn holders() -> BTreeMap<String, Vec<Hold>> {
+    holders_in(Path::new("/"))
+}
+
+pub fn holders_in(root: &Path) -> BTreeMap<String, Vec<Hold>> {
+    let mut out: BTreeMap<String, Vec<Hold>> = BTreeMap::new();
+    for (node, kind) in in_use_nodes(root) {
+        let Some(name) = kernel_name(root, &node) else {
+            continue;
+        };
+        for disk in base_disks(root, &name, 0) {
+            let hold = Hold {
+                via: name.clone(),
+                kind: kind.clone(),
+            };
+            let holds = out.entry(disk).or_default();
+            if !holds.contains(&hold) {
+                holds.push(hold);
+            }
+        }
+    }
+    out
+}
+
+/// The `/dev/...` nodes named by `/proc/self/mounts` and `/proc/swaps`.
+///
+/// Sources that are not device nodes — `tmpfs`, `cgroup2`, a bind mount's
+/// original path — are skipped, since they cannot be a disk.
+fn in_use_nodes(root: &Path) -> Vec<(String, HoldKind)> {
+    let mut out = Vec::new();
+
+    if let Some(mounts) = fsx::read_str(root.join("proc/self/mounts")) {
+        for line in mounts.lines() {
+            let mut f = line.split_whitespace();
+            let (Some(src), Some(at)) = (f.next(), f.next()) else {
+                continue;
+            };
+            if src.starts_with("/dev/") {
+                out.push((src.to_string(), HoldKind::Mounted(unescape(at))));
+            }
+        }
+    }
+
+    if let Some(swaps) = fsx::read_str(root.join("proc/swaps")) {
+        // First line is a header.
+        for line in swaps.lines().skip(1) {
+            if let Some(src) = line.split_whitespace().next() {
+                if src.starts_with("/dev/") {
+                    out.push((src.to_string(), HoldKind::Swap));
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// `\040` and friends: the kernel octal-escapes whitespace in mount points.
+fn unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let digits: String = chars.clone().take(3).collect();
+        match u8::from_str_radix(&digits, 8) {
+            Ok(byte) if digits.len() == 3 => {
+                out.push(byte as char);
+                for _ in 0..3 {
+                    chars.next();
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// The kernel name behind a `/dev` path, following symlinks — a mount source is
+/// often `/dev/disk/by-uuid/...` rather than the node itself.
+fn kernel_name(root: &Path, node: &str) -> Option<String> {
+    let path = root.join(node.trim_start_matches('/'));
+    let real = fsx::canonicalize(&path).unwrap_or(path);
+    let name = fsx::file_name(&real);
+    (!name.is_empty()).then_some(name)
+}
+
+/// Walk down from a device to the physical disks underneath it.
+///
+/// Three cases: a stacked device (dm, md, bcache) names its members in
+/// `slaves/`; a partition's parent is the directory that contains it; anything
+/// else is already a disk.
+fn base_disks(root: &Path, name: &str, depth: u8) -> Vec<String> {
+    // Stacks nest — dm-crypt over LVM over md is ordinary — but a cycle would
+    // be a kernel bug, and recursing forever on one would be ours.
+    if depth > 8 {
+        return vec![name.to_string()];
+    }
+    let dir = root.join("sys/class/block").join(name);
+
+    let slaves: Vec<String> = fsx::list_dir(dir.join("slaves"))
+        .iter()
+        .map(|p| fsx::file_name(p))
+        .collect();
+    if !slaves.is_empty() {
+        let mut out: Vec<String> = slaves
+            .iter()
+            .flat_map(|s| base_disks(root, s, depth + 1))
+            .collect();
+        out.sort();
+        out.dedup();
+        return out;
+    }
+
+    if dir.join("partition").exists() {
+        // `/sys/class/block/sda1` links to `.../block/sda/sda1`, so the parent
+        // directory is the whole disk. Exact, where stripping trailing digits
+        // would only be a guess — and a wrong one for `mmcblk0` or `nvme0n1`.
+        if let Some(parent) = fsx::canonicalize(&dir).as_deref().and_then(Path::parent) {
+            let disk = fsx::file_name(parent);
+            if !disk.is_empty() && disk != "block" {
+                return vec![disk];
+            }
+        }
+    }
+
+    vec![name.to_string()]
 }
 
 /// Block devices attached through a given USB device, by path containment.
@@ -223,6 +399,84 @@ mod tests {
         assert!(after.delta(&after).is_none());
         // Counters resetting (device re-enumerated) must not underflow.
         assert!(before.delta(&after).is_none());
+    }
+
+    /// The check that guards every disruptive probe, against the shapes that
+    /// would defeat a naive one: a partition, an encrypted volume, and a mount
+    /// point with a space in it.
+    #[test]
+    fn a_mounted_stack_resolves_down_to_the_physical_disk() {
+        let root = std::env::temp_dir().join(format!("usbprobe-hold-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("proc/self")).unwrap();
+        let class = root.join("sys/class/block");
+        let devices = root.join("sys/devices/blk");
+        fs::create_dir_all(&class).unwrap();
+
+        // sda holds a mounted partition; sdb is whole-disk LUKS under dm-0;
+        // sdc holds swap; sdd is idle and must stay probeable.
+        let layout = [
+            ("sda", vec!["sda1"]),
+            ("sdb", vec!["sdb1"]),
+            ("sdc", vec![]),
+            ("sdd", vec![]),
+        ];
+        for (disk, parts) in layout {
+            fs::create_dir_all(devices.join(disk)).unwrap();
+            std::os::unix::fs::symlink(devices.join(disk), class.join(disk)).unwrap();
+            for p in parts {
+                fs::create_dir_all(devices.join(disk).join(p)).unwrap();
+                fs::write(devices.join(disk).join(p).join("partition"), "1\n").unwrap();
+                std::os::unix::fs::symlink(devices.join(disk).join(p), class.join(p)).unwrap();
+            }
+        }
+        // dm-0 declares its member rather than naming it in any recognisable way.
+        fs::create_dir_all(class.join("dm-0/slaves/sdb1")).unwrap();
+        fs::create_dir_all(root.join("dev/mapper")).unwrap();
+        std::os::unix::fs::symlink(root.join("dev/dm-0"), root.join("dev/mapper/backup")).unwrap();
+        fs::write(root.join("dev/dm-0"), b"").unwrap();
+
+        fs::write(
+            root.join("proc/self/mounts"),
+            "tmpfs /run tmpfs rw 0 0\n\
+             /dev/sda1 / ext4 rw,relatime 0 0\n\
+             /dev/mapper/backup /media/My\\040Backup ext4 rw 0 0\n\
+             sysfs /sys sysfs rw 0 0\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("proc/swaps"),
+            "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n\
+             /dev/sdc\tpartition\t8388604\t\t0\t\t-2\n",
+        )
+        .unwrap();
+
+        let held = holders_in(&root);
+        assert_eq!(
+            held.keys().collect::<Vec<_>>(),
+            vec!["sda", "sdb", "sdc"],
+            "sdd is idle and must not appear: {held:?}"
+        );
+        assert_eq!(held["sda"][0].describe(), "sda1 is mounted at /");
+        // The whole point: nothing in "/dev/mapper/backup" says "sdb".
+        assert_eq!(held["sdb"][0].via, "dm-0");
+        assert_eq!(
+            held["sdb"][0].kind,
+            HoldKind::Mounted("/media/My Backup".into())
+        );
+        assert_eq!(held["sdc"][0].kind, HoldKind::Swap);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// On any running system the root filesystem is mounted, so this cannot
+    /// come back empty — and if it did, every disruptive probe would think the
+    /// machine's own disk was free to interrupt.
+    #[test]
+    fn the_live_machine_reports_at_least_its_own_root_disk() {
+        let held = holders();
+        assert!(!held.is_empty(), "no mounted disk found on a running system");
+        assert!(held.values().flatten().any(|h| h.kind == HoldKind::Mounted("/".into())));
     }
 
     #[test]

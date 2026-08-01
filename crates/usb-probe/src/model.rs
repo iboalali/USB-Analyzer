@@ -127,6 +127,31 @@ impl Snapshot {
         }
     }
 
+    /// A device and everything hanging off it.
+    ///
+    /// Follows the parent chain rather than matching name prefixes, because the
+    /// prefix rule breaks at exactly the place it matters: a root hub is called
+    /// `usb6` and its children `6-1`, which share nothing to match on.
+    pub fn subtree(&self, sysfs_name: &str) -> Vec<&UsbDevice> {
+        // `buses` holds root hubs with their children nested inside, so the
+        // flat accessor is the only one that sees the whole tree.
+        self.devices()
+            .into_iter()
+            .filter(|d| {
+                let mut cur: &UsbDevice = d;
+                loop {
+                    if cur.sysfs_name == sysfs_name {
+                        return true;
+                    }
+                    match cur.parent.as_deref().and_then(|p| self.device(p)) {
+                        Some(next) => cur = next,
+                        None => return false,
+                    }
+                }
+            })
+            .collect()
+    }
+
     /// Kernel events for a device, limited to those since it attached.
     ///
     /// A socket outlives its occupants: the log spans the whole boot while the
@@ -1855,6 +1880,48 @@ impl Report {
     pub fn worst_severity(&self) -> Option<Severity> {
         self.findings.iter().map(|f| f.severity).max()
     }
+
+    /// The same report with findings and URB counts narrowed to one device and
+    /// its descendants.
+    ///
+    /// The snapshot itself is left whole. Narrowing what was *observed* would
+    /// be a lie — usbmon watches every bus at once, and there is no way to ask
+    /// it for one device — so this narrows only what is *shown*, and the
+    /// caller is expected to say so.
+    pub fn scoped_to(mut self, sysfs_name: &str) -> Self {
+        let names: std::collections::HashSet<&str> = self
+            .snapshot
+            .subtree(sysfs_name)
+            .iter()
+            .map(|d| d.sysfs_name.as_str())
+            .collect();
+
+        let addresses: std::collections::HashSet<(u32, u32)> = self
+            .snapshot
+            .subtree(sysfs_name)
+            .iter()
+            .filter_map(|d| Some((d.busnum?, d.devnum?)))
+            .collect();
+
+        let keep: Vec<Finding> = self
+            .findings
+            .iter()
+            .filter(|f| match &f.subject {
+                Subject::Device(d) | Subject::Port(d) | Subject::Cable(d) => {
+                    names.contains(d.as_str())
+                }
+                Subject::Host => false,
+            })
+            .cloned()
+            .collect();
+        self.findings = keep;
+
+        if let Some(t) = &mut self.snapshot.urb_traffic {
+            t.devices
+                .retain(|s| addresses.contains(&(s.bus, s.device_address)));
+        }
+        self
+    }
 }
 
 #[cfg(test)]
@@ -2014,6 +2081,91 @@ mod tests {
         // behind a hub.
         assert_eq!(snap.storage_on(snap.device("5-1").unwrap()).len(), 1);
         assert_eq!(snap.storage_on(snap.device("usb5").unwrap()).len(), 1);
+    }
+
+    /// Caught on live hardware, not in a test: `buses` holds root hubs with
+    /// their children *nested*, and an earlier version of `subtree` iterated
+    /// `buses` directly. Every synthetic snapshot in this suite happens to be
+    /// flat, so it passed everywhere and then found nothing at all for `4-1`
+    /// on a real machine.
+    #[test]
+    fn a_subtree_reaches_devices_nested_under_a_root_hub() {
+        let mut snap = ts::empty_snapshot();
+        let mut bus = ts::root_hub("usb5", 10_000.0);
+        let mut hub = ts::device("5-1", " 2.10", 480.0, Some("usb5"));
+        hub.children
+            .push(ts::device("5-1.1", " 2.10", 480.0, Some("5-1")));
+        hub.children
+            .push(ts::device("5-1.2", " 2.00", 12.0, Some("5-1")));
+        bus.children.push(hub);
+        snap.buses.push(bus);
+        // A second bus that must never be swept in by mistake.
+        snap.buses.push(ts::root_hub("usb4", 10_000.0));
+
+        let names = |n: &str| -> Vec<String> {
+            let mut v: Vec<String> = snap
+                .subtree(n)
+                .iter()
+                .map(|d| d.sysfs_name.clone())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names("usb5"), ["5-1", "5-1.1", "5-1.2", "usb5"]);
+        assert_eq!(names("5-1"), ["5-1", "5-1.1", "5-1.2"]);
+        assert_eq!(names("5-1.1"), ["5-1.1"], "a leaf is its own subtree");
+        assert_eq!(names("usb4"), ["usb4"]);
+        assert!(names("6-1").is_empty());
+    }
+
+    /// Narrowing must never reach across to another device's findings, and must
+    /// leave the snapshot itself intact — the measurement really was bus-wide.
+    #[test]
+    fn scoping_a_report_keeps_only_what_is_under_the_target() {
+        let mut snap = ts::empty_snapshot();
+        let mut bus = ts::root_hub("usb5", 10_000.0);
+        let mut hub = ts::device_at("5-1", 480.0, Some("usb5"), 5, 2);
+        hub.children
+            .push(ts::device_at("5-1.1", 480.0, Some("5-1"), 5, 3));
+        bus.children.push(hub);
+        snap.buses.push(bus);
+        snap.buses
+            .push(ts::device_at("4-1", 5000.0, None, 4, 2));
+        snap.urb_traffic = Some(ts::urb_traffic(
+            1000,
+            vec![
+                ts::urb_stats(5, 3, 500, 9),
+                ts::urb_stats(4, 2, 500, 4),
+            ],
+        ));
+
+        let finding = |subject: Subject| Finding {
+            code: "X".into(),
+            severity: Severity::Medium,
+            confidence: Confidence::Inferred,
+            subject,
+            title: "t".into(),
+            detail: "d".into(),
+            evidence: vec![],
+            suggestion: None,
+        };
+        let report = Report {
+            snapshot: snap,
+            findings: vec![
+                finding(Subject::Device("5-1.1".into())),
+                finding(Subject::Device("4-1".into())),
+                finding(Subject::Host),
+            ],
+        }
+        .scoped_to("5-1");
+
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].subject, Subject::Device("5-1.1".into()));
+        let devices = &report.snapshot.urb_traffic.as_ref().unwrap().devices;
+        assert_eq!(devices.len(), 1);
+        assert_eq!((devices[0].bus, devices[0].device_address), (5, 3));
+        // The tree is untouched: what was watched is not what is shown.
+        assert!(report.snapshot.device("4-1").is_some());
     }
 
     /// `rotational` comes from SCSI VPD page B1h, which USB bridges usually do

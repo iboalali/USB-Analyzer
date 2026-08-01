@@ -1405,6 +1405,80 @@ pub fn capabilities(out: &mut String, snap: &Snapshot, t: &Theme) {
     let _ = writeln!(out);
 }
 
+/// The probe catalogue: what exists, what this machine allows, and what each
+/// one would do to the bus.
+///
+/// Unimplemented probes are listed rather than hidden. A gap that is visible
+/// gets closed; one that is merely absent does not.
+pub fn probes(out: &mut String, snap: &Snapshot, t: &Theme) {
+    let c = &snap.capabilities;
+    let _ = writeln!(out, "{}", t.heading("probes"));
+    let _ = writeln!(
+        out,
+        "  {}",
+        t.dim(&format!(
+            "running as uid {}{}",
+            c.effective_uid
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| "?".into()),
+            if c.is_root() { " (root)" } else { "" },
+        ))
+    );
+    for (name, iface) in [("usbmon", &c.usbmon), ("usbfs", &c.usbfs)] {
+        let mark = if iface.is_usable() {
+            t.green("✓")
+        } else {
+            t.dim("·")
+        };
+        let mut lines = wrap(iface.availability.explain(), 60).into_iter();
+        let _ = writeln!(
+            out,
+            "  {mark} {} {}",
+            t.dim(&format!("{name:<7}")),
+            t.dim(&lines.next().unwrap_or_default())
+        );
+        for line in lines {
+            let _ = writeln!(out, "            {}", t.dim(&line));
+        }
+    }
+    let _ = writeln!(out);
+
+    for p in usb_probe::caps::PROBES {
+        let (mark, status) = match (p.implemented, c.blocker(p)) {
+            (false, _) => (t.dim("·"), t.dim("not implemented yet")),
+            (true, Some(_)) => (t.dim("·"), t.yellow(&format!("needs {}", p.needs.label()))),
+            (true, None) => (t.green("✓"), t.green("ready")),
+        };
+        let _ = writeln!(
+            out,
+            "  {mark} {} {}  {status}",
+            t.bold(&format!("{:<15}", p.name)),
+            t.dim(&format!("{:<24}", format!("[{}]", p.class.label()))),
+        );
+        for line in wrap(p.summary, 68) {
+            let _ = writeln!(out, "      {}", t.dim(&line));
+        }
+        let _ = writeln!(out);
+    }
+
+    let _ = writeln!(
+        out,
+        "  {}",
+        t.dim("Passive probes run in every ordinary scan. Naming a read-only probe")
+    );
+    let _ = writeln!(
+        out,
+        "  {}",
+        t.dim("is enough to run it; a disruptive one needs --target, --yes and --force,")
+    );
+    let _ = writeln!(
+        out,
+        "  {}",
+        t.dim("and is refused outright on a disk holding a mounted filesystem.")
+    );
+    let _ = writeln!(out);
+}
+
 pub fn summary(out: &mut String, report: &Report, t: &Theme) {
     let mut counts: Vec<(Severity, usize)> = Vec::new();
     for s in [

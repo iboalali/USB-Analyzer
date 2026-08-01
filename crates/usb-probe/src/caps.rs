@@ -138,7 +138,11 @@ impl Capabilities {
         ))
     }
 
-    /// Everything currently runnable, so a front end can offer exactly that.
+    /// Everything this machine's interfaces allow, so a front end can offer
+    /// exactly that.
+    ///
+    /// Capability only — consent, targeting and whether the probe is written
+    /// yet are all decided later, by [`crate::probe::plan`].
     pub fn runnable(&self) -> Vec<&'static ProbeInfo> {
         PROBES
             .iter()
@@ -204,6 +208,10 @@ pub struct ProbeInfo {
     pub name: &'static str,
     pub class: ProbeClass,
     pub needs: Requirement,
+    /// Whether the code behind it exists yet. A registered but unimplemented
+    /// probe is listed and then refused by name, which is the honest answer —
+    /// far better than omitting it and letting the gap go unnoticed.
+    pub implemented: bool,
     pub summary: &'static str,
 }
 
@@ -217,18 +225,21 @@ pub const PROBES: &[ProbeInfo] = &[
         name: "snapshot",
         class: ProbeClass::Passive,
         needs: Requirement::Nothing,
+        implemented: true,
         summary: "Read sysfs, the kernel log and DRM. Everything the default run does.",
     },
     ProbeInfo {
         name: "storage-sample",
         class: ProbeClass::Passive,
         needs: Requirement::Nothing,
+        implemented: true,
         summary: "Two reads of /sys/block/*/stat over a window, for live throughput.",
     },
     ProbeInfo {
         name: "urb-errors",
         class: ProbeClass::PrivilegedRead,
         needs: Requirement::Usbmon,
+        implemented: true,
         summary: "Count URB completion errors per device over a window. Observes \
                   behaviour rather than negotiated state, so it is the one probe that \
                   can move a cable finding from inferred to measured.",
@@ -237,6 +248,7 @@ pub const PROBES: &[ProbeInfo] = &[
         name: "throughput",
         class: ProbeClass::Disruptive,
         needs: Requirement::Usbfs,
+        implemented: false,
         summary: "Drive bulk transfers and compare achieved throughput against what \
                   both the link rate and the storage medium allow.",
     },
@@ -244,6 +256,7 @@ pub const PROBES: &[ProbeInfo] = &[
         name: "reenumerate",
         class: ProbeClass::Disruptive,
         needs: Requirement::Usbfs,
+        implemented: false,
         summary: "Cycle the port repeatedly and record the distribution of negotiated \
                   speeds. The only way to catch an intermittent link.",
     },

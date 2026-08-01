@@ -35,6 +35,7 @@ pub mod kernel;
 pub mod model;
 pub mod monitor;
 pub mod pd;
+pub mod probe;
 pub mod sysfs;
 pub mod thunderbolt;
 pub mod typec;
