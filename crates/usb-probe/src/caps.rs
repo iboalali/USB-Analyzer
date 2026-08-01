@@ -294,81 +294,102 @@ fn read_effective_uid(root: &Path) -> Option<u32> {
 /// is loaded and narrows down why the text stream is missing.
 fn detect_usbmon(root: &Path) -> Interface {
     let text = root.join(TEXT_API.trim_start_matches('/'));
-    match OpenOptions::new().read(true).open(&text) {
+
+    // `EACCES` here almost never comes from the file. `/sys/kernel/debug` is
+    // mode 0700, so an unprivileged open fails while *traversing the
+    // directory*, long before the leaf is reached — and the error is identical
+    // whether or not the leaf exists. Saying "it exists but you may not read
+    // it" would be a claim this process has no way to check.
+    let blocked = match OpenOptions::new().read(true).open(&text) {
         Ok(_) => return Interface::new(Availability::Usable, Some(text)),
-        Err(e) if e.kind() == ErrorKind::PermissionDenied => {
-            return Interface::new(
-                Availability::Denied(format!(
-                    "{} exists but is not readable by this process — usbmon is root-only",
-                    text.display()
-                )),
-                Some(text),
-            )
-        }
-        Err(_) => {}
-    }
+        Err(e) => e.kind() == ErrorKind::PermissionDenied,
+    };
 
-    // Nothing openable. Distinguish "not built", "not loaded" and "cannot see".
-    let debugfs = root.join("sys/kernel/debug");
-    let debugfs_blind = debugfs.exists() && std::fs::read_dir(&debugfs).is_err();
+    // What can be checked: whether the module is there at all. `/proc/modules`
+    // is world-readable, and so is the existence of `/dev/usbmon*`, even though
+    // the nodes themselves are not.
     let loaded = module_loaded(root, "usbmon") || !binary_nodes(root).is_empty();
+    let configured = kernel_config_value(root, "CONFIG_USB_MON");
 
-    if loaded && debugfs_blind {
-        return Interface::new(
-            Availability::Denied(
-                "usbmon is loaded, but /sys/kernel/debug is not readable by this process, \
-                 so its text stream cannot be opened — this needs root"
-                    .into(),
-            ),
-            None,
-        );
-    }
-
-    match kernel_config_value(root, "CONFIG_USB_MON") {
-        Some('m') if loaded => Interface::new(
+    match (loaded, blocked) {
+        // Present, and something is in the way. The one unambiguous case.
+        (true, true) => Interface::new(
+            Availability::Denied(format!(
+                "usbmon is loaded, but {} cannot be opened by this process — debugfs is \
+                 mode 0700, so reading the URB stream needs root",
+                text.display()
+            )),
+            Some(text),
+        ),
+        // Loaded, reachable, and still not there: debugfs is not mounted.
+        (true, false) => Interface::new(
             Availability::Unknown(
-                "the usbmon module is loaded but its text stream was not found; \
-                 debugfs may not be mounted"
+                "the usbmon module is loaded but its text stream was not found — debugfs \
+                 may not be mounted at /sys/kernel/debug"
                     .into(),
             ),
             None,
         ),
-        Some('m') => Interface::new(
-            Availability::NotLoaded(
-                "the kernel supports usbmon but the module is not loaded — \
-                 'sudo modprobe usbmon' makes it available to root"
-                    .into(),
+        // Not loaded. Whether that is fixable depends on the kernel build, and
+        // being blocked from debugfs does not change the answer.
+        (false, _) => match configured {
+            Some('m') => Interface::new(
+                Availability::NotLoaded(format!(
+                    "the kernel supports usbmon but the module is not loaded — \
+                     'sudo modprobe usbmon' loads it{}",
+                    if blocked {
+                        ", though reading its stream will still need root"
+                    } else {
+                        ""
+                    }
+                )),
+                None,
             ),
-            None,
-        ),
-        Some('y') if debugfs_blind => Interface::new(
-            Availability::Unknown(
-                "usbmon is built in, but /sys/kernel/debug is not readable, so whether \
-                 its interface is present cannot be determined without privilege"
-                    .into(),
+            // Built in, so "not loaded" is not a state it can be in; the only
+            // remaining explanations are about visibility.
+            Some('y') if blocked => Interface::new(
+                Availability::Denied(
+                    "usbmon is built into this kernel, but /sys/kernel/debug is not \
+                     readable by this process — reading the URB stream needs root"
+                        .into(),
+                ),
+                None,
             ),
-            None,
-        ),
-        Some('y') => Interface::new(
-            Availability::Denied("usbmon is built in but no interface was readable".into()),
-            None,
-        ),
-        Some(_) | None if debugfs_blind => Interface::new(
-            Availability::Unknown(
-                "/sys/kernel/debug is not readable and the kernel configuration could not \
-                 be checked, so usbmon support is undetermined"
-                    .into(),
+            Some('y') => Interface::new(
+                Availability::Unknown(
+                    "usbmon is built into this kernel but no text stream was found — \
+                     debugfs may not be mounted"
+                        .into(),
+                ),
+                None,
             ),
-            None,
-        ),
-        _ => Interface::new(
-            Availability::Unsupported(
-                "this kernel was not built with CONFIG_USB_MON, so URB tracing is \
-                 unavailable at any privilege level"
-                    .into(),
+            Some(_) => Interface::new(
+                Availability::Unknown(
+                    "the kernel configuration reports usbmon in a form this tool does not \
+                     recognise"
+                        .into(),
+                ),
+                None,
             ),
-            None,
-        ),
+            // No config to read. Being blocked means we genuinely cannot tell;
+            // being able to look and finding nothing means it is not there.
+            None if blocked => Interface::new(
+                Availability::Unknown(
+                    "/sys/kernel/debug is not readable and the kernel configuration could \
+                     not be checked, so usbmon support is undetermined without privilege"
+                        .into(),
+                ),
+                None,
+            ),
+            None => Interface::new(
+                Availability::Unsupported(
+                    "this kernel was not built with CONFIG_USB_MON, so URB tracing is \
+                     unavailable at any privilege level"
+                        .into(),
+                ),
+                None,
+            ),
+        },
     }
 }
 
@@ -539,6 +560,58 @@ mod tests {
         let caps = detect_in(&root);
         assert_eq!(caps.usbmon.availability, Availability::Usable);
         assert_eq!(caps.usbmon.path, Some(text.join("0u")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Caught on the live machine, which is the only place it could have been.
+    ///
+    /// `/sys/kernel/debug` is mode 0700, so an unprivileged open of anything
+    /// beneath it fails while traversing the directory — with the same
+    /// `EACCES` whether or not the file is there. An earlier version read that
+    /// as proof the stream existed, which meant it would have claimed usbmon
+    /// was present on a kernel that had never heard of it.
+    #[test]
+    fn permission_denied_on_debugfs_is_not_proof_the_stream_exists() {
+        let root = fake_root("blocked", Some("CONFIG_USB_MON=m\n"), "");
+        let debug = root.join("sys/kernel/debug");
+        fs::create_dir_all(&debug).unwrap();
+        let mut perms = fs::metadata(&debug).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o000);
+        fs::set_permissions(&debug, perms).unwrap();
+
+        // Root traverses a 0000 directory regardless, so there is nothing to
+        // assert if the suite happens to be running privileged.
+        if read_effective_uid(Path::new("/")) == Some(0) {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+
+        let caps = detect_in(&root);
+        // The module is not loaded, so that is the answer — not "denied", and
+        // certainly not a claim about a file nobody could see.
+        assert!(
+            matches!(caps.usbmon.availability, Availability::NotLoaded(_)),
+            "{:?}",
+            caps.usbmon
+        );
+        let why = caps.usbmon.availability.explain();
+        assert!(why.contains("modprobe"), "{why}");
+        assert!(why.contains("still need root"), "both barriers named: {why}");
+        assert!(caps.usbmon.path.is_none(), "no path was ever confirmed");
+
+        // With the module loaded, the same EACCES now means something definite.
+        fs::write(root.join("dev/usbmon0"), b"").unwrap();
+        let caps = detect_in(&root);
+        assert!(
+            matches!(caps.usbmon.availability, Availability::Denied(_)),
+            "{:?}",
+            caps.usbmon
+        );
+        assert!(caps.usbmon.availability.explain().contains("needs root"));
+
+        let mut perms = fs::metadata(&debug).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        let _ = fs::set_permissions(&debug, perms);
         let _ = fs::remove_dir_all(&root);
     }
 

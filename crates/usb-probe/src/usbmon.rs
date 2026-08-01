@@ -50,6 +50,11 @@ const O_NONBLOCK: i32 = 0o4000;
 const IDLE_POLL: Duration = Duration::from_millis(10);
 
 /// The all-buses text stream. Per-bus streams are `<busnum>u`.
+///
+/// Only the `u` form is parsed here. The older `<busnum>t` files use a
+/// different, shorter address word — the module carries both formats,
+/// `%lx %u %c %c%c:%d:%03u:%u` for `u` and `%lx %u %c %c%c:%03u:%02u` for `t`,
+/// and the latter has no endpoint field to account against.
 pub const TEXT_API_ALL: &str = "/sys/kernel/debug/usb/usbmon/0u";
 
 /// Watch the URB stream for a window and account what completed.
@@ -138,11 +143,14 @@ pub fn parse_line(line: &str) -> Option<Completion> {
     let kind = parts.next()?;
     let mut chars = kind.chars();
     let transfer = chars.next()?;
-    // `C`ontrol, `B`ulk, `I`nterrupt, and isochronous — which the kernel writes
-    // as `Z`. `S` is accepted alongside it because the documentation and the
-    // implementation have differed on that letter; accepting both costs
-    // nothing and cannot collide, since the event letter is a different field.
-    if !matches!(transfer, 'C' | 'B' | 'I' | 'Z' | 'S') {
+    // The letter table is `CZBI`, indexed by endpoint type — control 0,
+    // isochronous 1, bulk 2, interrupt 3. Isochronous is `Z`, not `S`, which
+    // matters because `S` is also the submission event letter and guessing
+    // wrong would have silently dropped every webcam's traffic.
+    //
+    // Taken from the shipped module rather than from documentation:
+    //   strings usbmon.ko -> "CZBI", "%lx %u %c %c%c:%d:%03u:%u"
+    if !matches!(transfer, 'C' | 'Z' | 'B' | 'I') {
         return None;
     }
     let bus: u32 = parts.next()?.parse().ok()?;
@@ -266,6 +274,44 @@ fn is_submission(line: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Verbatim lines from `/sys/kernel/debug/usb/usbmon/0u` on this machine —
+    /// a MediaTek Bluetooth radio at bus 3 address 4, bulk-in endpoint 2.
+    ///
+    /// Worth more than any hand-written example, because it settles details a
+    /// specification does not commit to: the URB tag is a full 64-bit kernel
+    /// pointer rather than the eight hex digits the documentation shows, and
+    /// every completion is immediately followed by the resubmission that
+    /// carries `-115`. Half of all real traffic is that resubmission, so
+    /// mistaking it for an outcome would report a permanently failing bus.
+    const REAL_CAPTURE: &str = "\
+ffff8ef2419295c0 2005406810 C Bi:3:004:2 0 19 = 01220f00 0b000400 1b220000 00000000 000000
+ffff8ef2419295c0 2005406825 S Bi:3:004:2 -115 1028 <
+ffff8ef2419283c0 2005640593 C Bi:3:004:2 0 18 = 00220e00 0a000400 1b330000 00001000 0000
+ffff8ef2419283c0 2005640602 S Bi:3:004:2 -115 1028 <
+ffff8ef2419295c0 2005649321 C Bi:3:004:2 0 18 = 00220e00 0a000400 1b330000 00001000 0000
+ffff8ef2419295c0 2005649325 S Bi:3:004:2 -115 1028 <
+";
+
+    #[test]
+    fn parses_a_real_capture() {
+        let mut acc = Accumulator::default();
+        for line in REAL_CAPTURE.lines() {
+            acc.feed(line);
+        }
+        let t = acc.finish(5000, None);
+
+        assert_eq!(t.unparsed, 0, "every line must be understood");
+        assert_eq!(t.lines_read, 6);
+        assert_eq!(t.devices.len(), 1);
+
+        let d = t.for_address(3, 4).expect("bus 3, address 4");
+        assert_eq!(d.completions, 3, "the three resubmissions are not outcomes");
+        assert_eq!(d.transport_errors, 0);
+        assert_eq!(d.cancellations, 0, "-115 must not be counted at all");
+        assert_eq!(d.bytes, 19 + 18 + 18);
+        assert_eq!(d.transport_error_rate(), Some(0.0));
+    }
+
     /// The submission/completion distinction. A control submission's status
     /// field is the letter `s`, and a non-control submission's is -115; reading
     /// either as an outcome would make ordinary traffic look catastrophic.
@@ -289,20 +335,26 @@ mod tests {
         assert_eq!(classify(c.status), UrbStatusClass::Transport);
     }
 
-    /// Isochronous completions append interval, start frame and error count to
-    /// the status word. The status is still the first field.
+    /// Isochronous is `Z`. Verified against the shipped `usbmon.ko`, whose
+    /// letter table is the literal `CZBI` indexed by endpoint type.
     ///
-    /// Both spellings of the isochronous type letter are accepted, so a webcam
-    /// cannot go unaccounted because of which one this kernel emits.
+    /// `S` must be rejected: it is the submission event letter, and treating it
+    /// as a transfer type would let a malformed line through as a completion.
     #[test]
-    fn handles_the_isochronous_status_word() {
-        for letter in ['Z', 'S'] {
-            let c = parse_line(&format!("d1000000 100 C {letter}i:1:005:1 -84:1:1234 192 <"))
-                .unwrap_or_else(|| panic!("isochronous spelled {letter}"));
-            assert_eq!(c.status, -84);
-            assert_eq!(c.endpoint, 1);
-        }
+    fn isochronous_is_z_and_s_is_not_a_transfer_type() {
+        let c = parse_line("ffff8ef241000000 100 C Zi:1:005:1 -84:1:1234 192 <").unwrap();
+        assert_eq!(c.transfer, 'Z');
+        assert_eq!(c.endpoint, 1);
+        // The status word carries interval and start frame too; status is first.
+        assert_eq!(c.status, -84);
         assert_eq!(classify(-84), UrbStatusClass::Transport);
+
+        assert!(parse_line("ffff8ef241000000 100 C Si:1:005:1 -84:1:1234 192 <").is_none());
+
+        for (letter, expect) in [('C', 'C'), ('B', 'B'), ('I', 'I')] {
+            let c = parse_line(&format!("ffff8ef241000000 100 C {letter}i:1:005:1 0 8 <")).unwrap();
+            assert_eq!(c.transfer, expect);
+        }
     }
 
     /// The false positive this classification exists to prevent: a webcam

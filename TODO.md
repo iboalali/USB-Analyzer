@@ -59,7 +59,7 @@ fix differs completely: **not loaded** (`modprobe`), **denied** (privilege),
 **unsupported** (different kernel), **undetermined** (`/sys/kernel/debug` is 0700 and
 sometimes the honest answer is that we cannot see).
 
-### 2. usbmon URB error accounting — **done, parser not yet validated**
+### 2. usbmon URB error accounting — **done**
 
 `usbmon::sample()` watches the text stream for a window and accounts completions per
 device address. `LINK_ERROR_RATE` (Measured) fires above 3 transport errors and a 0.1%
@@ -79,16 +79,22 @@ errors annotate the findings they speak to and lift Heuristic to Inferred, but n
 reaches Measured: the counts are measured, and blaming the cable for them is still a
 deduction. A cable is only convicted by substitution.
 
-**Open:** the parser has never seen real usbmon output. usbmon is `CONFIG_USB_MON=m` on
-this machine and not loaded, and both its APIs are root-only, so every test so far
-encodes the documented format rather than the emitted one. One known uncertainty: the
-isochronous type letter, where the documentation and the implementation have differed —
-both `Z` and `S` are accepted for now. To settle it:
+**Validated.** 638 real lines from `/sys/kernel/debug/usb/usbmon/0u` on this machine
+parse with nothing unrecognised: 319 completions, 319 resubmissions correctly skipped.
+Half of all real traffic is the `-115` resubmission that immediately follows each
+completion, so mistaking it for an outcome would have reported a permanently failing
+bus. Six of those lines are now a verbatim fixture in `usbmon::tests`.
 
-```
-sudo modprobe usbmon
-sudo timeout 5 cat /sys/kernel/debug/usb/usbmon/0u > usbmon-sample.txt
-```
+The isochronous type letter is `Z`, settled from the shipped module rather than from
+documentation — `strings usbmon.ko` gives the letter table `CZBI`, indexed by endpoint
+type, and the format `%lx %u %c %c%c:%d:%03u:%u`. `S` is now rejected: it is the
+submission event letter, and accepting it as a transfer type would let malformed lines
+through. The same strings show the older `<bus>t` files use a shorter address word with
+no endpoint field, which is why only the `u` form is read.
+
+Still unseen by the parser: a non-zero completion status. The classification is keyed on
+errno values, which are stable, but no real error has been observed. That needs failing
+hardware, not another capture.
 
 ### 3. An opt-in `usbdiag probe` subcommand
 
