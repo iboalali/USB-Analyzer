@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 serde = { workspace = true }
-
-[dev-dependencies]
+# Only for the stored device labels in `overrides.rs`. This does not grow what
+# ships: `usbdiag` already depends on serde_json, so the binary's tree is the
+# same 13 crates it was. The library's own tree goes 10 -> 14.
 serde_json = { workspace = true }

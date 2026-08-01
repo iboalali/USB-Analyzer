@@ -9,8 +9,10 @@ use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use usb_probe::model::{KernelLog, Report, Severity};
+use usb_probe::kind::DeviceKind;
+use usb_probe::model::{KernelLog, Medium, Report, Severity};
 use usb_probe::monitor::{Monitor, Source};
+use usb_probe::overrides::Overrides;
 use usb_probe::{kernel, Options};
 
 use render::Theme;
@@ -26,6 +28,10 @@ enum Command {
     Watch,
     Json,
     Probe,
+    /// Set or clear a stored label for a device.
+    Label,
+    /// List (and optionally clear) the stored labels.
+    Labels,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +54,20 @@ struct Args {
     /// Decide, print the decision, and stop. The step a front end takes before
     /// putting a confirmation in front of anyone.
     dry_run: bool,
+
+    /// Apply the user's stored labels. `--no-overrides` turns them off to get
+    /// the unmodified view of the machine.
+    overrides: bool,
+    /// `label --kind NAME`
+    kind: Option<String>,
+    /// `label --medium NAME`
+    medium: Option<String>,
+    /// `label --note TEXT`
+    note: Option<String>,
+    /// Scope the label to one physical unit rather than the model.
+    this_one: bool,
+    /// `label --forget` / `labels --forget ID`
+    forget: bool,
 }
 
 impl Default for Args {
@@ -67,6 +87,12 @@ impl Default for Args {
             consented: false,
             forced: false,
             dry_run: false,
+            overrides: true,
+            kind: None,
+            medium: None,
+            note: None,
+            this_one: false,
+            forget: false,
         }
     }
 }
@@ -96,11 +122,14 @@ fn main() -> ExitCode {
         // Never on by default: it needs root, and it costs a wall-clock window.
         // `probe urb-errors` is the only thing that switches it on.
         urb_sample_ms: 0,
+        overrides: args.overrides,
     };
 
     match args.command {
         Command::Watch => return watch(&args, opts),
         Command::Probe => return probe(&args, opts),
+        Command::Label => return label(&args, opts),
+        Command::Labels => return labels(&args),
         _ => {}
     }
 
@@ -177,7 +206,9 @@ fn format_report(report: &Report, args: &Args) -> String {
             render::caveat(&mut out, &theme);
         }
         Command::Json => unreachable!("Json implies --json"),
-        Command::Probe => unreachable!("probe prints its own output"),
+        Command::Probe | Command::Label | Command::Labels => {
+            unreachable!("these print their own output")
+        }
     }
     out
 }
@@ -432,6 +463,236 @@ const DEBOUNCE_MAX_MS: u64 = 1500;
 /// slower cadence — and is read immediately whenever a real event arrives.
 const LOG_REFRESH_MS: u64 = 10_000;
 
+// ---------------------------------------------------------------------------
+// Stored labels
+// ---------------------------------------------------------------------------
+
+/// `usbdiag label <device> --kind storage --medium rotating`
+///
+/// The one write path in the whole tool. Nothing else persists anything, and
+/// this only runs when the user typed the word.
+fn label(args: &Args, opts: Options) -> ExitCode {
+    let target = args.target.as_deref().expect("checked in parse");
+
+    // The target may be a sysfs name (3-5.2) or an id typed straight in
+    // (0781:5583). Resolving a sysfs name needs a capture; an id does not, so
+    // a label can be written for something that is not plugged in.
+    let (id, described) = match resolve_target(target, args, opts) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("usbdiag: {msg}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let mut store = Overrides::load();
+
+    if args.forget {
+        let removed = store.forget(&id);
+        if !removed {
+            eprintln!("usbdiag: no stored label for {id}");
+            return ExitCode::from(1);
+        }
+        if let Err(e) = store.save() {
+            eprintln!("usbdiag: could not write the labels file: {e}");
+            return ExitCode::from(2);
+        }
+        println!("Forgot the label for {id}.");
+        return ExitCode::SUCCESS;
+    }
+
+    let kind = match args.kind.as_deref().map(parse_kind).transpose() {
+        Ok(k) => k,
+        Err(msg) => {
+            eprintln!("usbdiag: {msg}");
+            return ExitCode::from(2);
+        }
+    };
+    let medium = match args.medium.as_deref().map(parse_medium).transpose() {
+        Ok(m) => m,
+        Err(msg) => {
+            eprintln!("usbdiag: {msg}");
+            return ExitCode::from(2);
+        }
+    };
+    if kind.is_none() && medium.is_none() && args.note.is_none() {
+        eprintln!("usbdiag: nothing to set — pass --kind, --medium, --note, or --forget");
+        return ExitCode::from(2);
+    }
+
+    // Keep whatever the existing entry already said, so setting a medium does
+    // not silently drop a kind set earlier.
+    let existing = store.devices.iter().find(|o| o.id == id).cloned();
+    store.set(usb_probe::overrides::Override {
+        id: id.clone(),
+        kind: kind.or_else(|| existing.as_ref().and_then(|o| o.kind)),
+        medium: medium.or_else(|| existing.as_ref().and_then(|o| o.medium)),
+        note: args
+            .note
+            .clone()
+            .or_else(|| existing.as_ref().and_then(|o| o.note.clone())),
+        set_at_unix_ms: now_ms(),
+    });
+
+    if let Err(e) = store.save() {
+        eprintln!("usbdiag: could not write the labels file: {e}");
+        return ExitCode::from(2);
+    }
+    let scope = if id.split(':').count() >= 3 {
+        "this unit only"
+    } else {
+        "every device with this id"
+    };
+    println!("Labelled {id} ({scope}){described}.");
+    println!("Forget it with: usbdiag label {id} --forget");
+    ExitCode::SUCCESS
+}
+
+/// Turn a target word into the id a label is stored under.
+///
+/// Returns the id and a human suffix naming what was matched, so the
+/// confirmation says which physical thing was labelled rather than only a
+/// number.
+fn resolve_target(target: &str, args: &Args, opts: Options) -> Result<(String, String), String> {
+    // An id typed straight in: two or three colon-separated fields.
+    if target.contains(':') {
+        return Ok((target.to_string(), String::new()));
+    }
+
+    // Otherwise it names a device in the tree, so it has to be read.
+    let snap = usb_probe::capture(Options {
+        overrides: false,
+        ..opts
+    });
+    let dev = snap
+        .device(target)
+        .ok_or_else(|| format!("no device named {target} — try 'usbdiag devices'"))?;
+
+    let id = if args.this_one {
+        usb_probe::overrides::unit_id(dev).ok_or_else(|| {
+            format!(
+                "{target} has no serial worth keying on ({}), so it cannot be labelled \
+                 individually — drop --this-one to label every {} instead",
+                match dev.serial.as_deref() {
+                    Some(s) => format!("it reports {s:?}"),
+                    None => "it reports none".into(),
+                },
+                usb_probe::overrides::model_id(dev).unwrap_or_else(|| "device".into())
+            )
+        })?
+    } else {
+        usb_probe::overrides::model_id(dev)
+            .ok_or_else(|| format!("{target} reports no vendor/product id to key on"))?
+    };
+    Ok((id, format!(" — {}", dev.label())))
+}
+
+/// `usbdiag labels` — list what is stored. `usbdiag labels <id> --forget`.
+fn labels(args: &Args) -> ExitCode {
+    let mut store = Overrides::load();
+
+    if args.forget {
+        let Some(id) = args.target.as_deref() else {
+            eprintln!("usbdiag: 'labels --forget' needs an id (see 'usbdiag labels')");
+            return ExitCode::from(2);
+        };
+        if !store.forget(id) {
+            eprintln!("usbdiag: no stored label for {id}");
+            return ExitCode::from(1);
+        }
+        if let Err(e) = store.save() {
+            eprintln!("usbdiag: could not write the labels file: {e}");
+            return ExitCode::from(2);
+        }
+        println!("Forgot the label for {id}.");
+        return ExitCode::SUCCESS;
+    }
+
+    if args.json {
+        print!("{}", json_of(&store));
+        return ExitCode::SUCCESS;
+    }
+
+    let path = usb_probe::overrides::default_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(no config directory)".into());
+
+    if store.devices.is_empty() {
+        println!("No stored labels. ({path})");
+        println!();
+        println!("Label something with, for example:");
+        println!("    usbdiag label 4-1 --medium rotating");
+        return ExitCode::SUCCESS;
+    }
+
+    println!("STORED LABELS  ({path})");
+    for o in &store.devices {
+        let mut says = Vec::new();
+        if let Some(k) = o.kind {
+            says.push(k.label().to_string());
+        }
+        if let Some(m) = o.medium {
+            says.push(m.label().to_string());
+        }
+        if let Some(n) = &o.note {
+            says.push(format!("\u{201c}{n}\u{201d}"));
+        }
+        println!(
+            "  {:<40} {:<11} {}",
+            o.id,
+            o.scope_label(),
+            says.join(", ")
+        );
+    }
+    println!();
+    println!("Forget one with: usbdiag labels <id> --forget");
+    println!("The file is plain JSON and can be edited by hand.");
+    ExitCode::SUCCESS
+}
+
+fn parse_kind(s: &str) -> Result<DeviceKind, String> {
+    let k = s.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    Ok(match k.as_str() {
+        "hub" => DeviceKind::Hub,
+        "keyboard" => DeviceKind::Keyboard,
+        "mouse" => DeviceKind::Mouse,
+        "input" | "input_device" => DeviceKind::InputDevice,
+        "storage" | "disk" | "drive" => DeviceKind::Storage,
+        "audio" => DeviceKind::Audio,
+        "camera" | "webcam" => DeviceKind::Camera,
+        "imaging" | "scanner" => DeviceKind::Imaging,
+        "printer" => DeviceKind::Printer,
+        "network" => DeviceKind::Network,
+        "smartcard" | "smartcard_reader" | "smart_card_reader" => DeviceKind::SmartcardReader,
+        "billboard" => DeviceKind::Billboard,
+        "wireless" | "radio" => DeviceKind::Wireless,
+        "diagnostic" => DeviceKind::Diagnostic,
+        "unknown" => DeviceKind::Unknown,
+        _ => {
+            return Err(format!(
+                "unknown kind: {s}\n  try one of: hub keyboard mouse input storage audio \
+                 camera scanner printer network smartcard billboard wireless diagnostic unknown"
+            ))
+        }
+    })
+}
+
+fn parse_medium(s: &str) -> Result<Medium, String> {
+    Ok(match s.trim().to_ascii_lowercase().as_str() {
+        "rotating" | "spinning" | "hdd" | "disk" => Medium::Rotating,
+        "ssd" | "flash" | "solid_state" | "solid-state" => Medium::SolidState,
+        "unknown" => Medium::Unknown,
+        _ => return Err(format!("unknown medium: {s}\n  try: rotating, ssd, unknown")),
+    })
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Re-render whenever the observed state changes. Useful for plugging and
 /// unplugging: it shows the PD contract settling in real time.
 ///
@@ -572,6 +833,25 @@ fn parse(argv: &[String]) -> Result<Option<Args>, String> {
                         .into());
                 }
             }
+            "--no-overrides" => args.overrides = false,
+            "--this-one" => args.this_one = true,
+            "--forget" => args.forget = true,
+            "--kind" => {
+                i += 1;
+                args.kind = Some(argv.get(i).ok_or("--kind needs a name")?.clone());
+            }
+            "--medium" => {
+                i += 1;
+                args.medium = Some(
+                    argv.get(i)
+                        .ok_or("--medium needs 'rotating', 'ssd' or 'unknown'")?
+                        .clone(),
+                );
+            }
+            "--note" => {
+                i += 1;
+                args.note = Some(argv.get(i).ok_or("--note needs some text")?.clone());
+            }
             "-y" | "--yes" => args.consented = true,
             "--force" => args.forced = true,
             "--dry-run" => args.dry_run = true,
@@ -580,6 +860,15 @@ fn parse(argv: &[String]) -> Result<Option<Args>, String> {
                 // The word after `probe` is the probe's name, not a command.
                 if args.command == Command::Probe && saw_command && args.probe.is_none() {
                     args.probe = Some(a.to_string());
+                    i += 1;
+                    continue;
+                }
+                // `label <device>` / `labels <id>` take a bare argument too.
+                if matches!(args.command, Command::Label | Command::Labels)
+                    && saw_command
+                    && args.target.is_none()
+                {
+                    args.target = Some(a.to_string());
                     i += 1;
                     continue;
                 }
@@ -594,6 +883,8 @@ fn parse(argv: &[String]) -> Result<Option<Args>, String> {
                     "watch" => Command::Watch,
                     "json" => Command::Json,
                     "probe" => Command::Probe,
+                    "label" => Command::Label,
+                    "labels" => Command::Labels,
                     _ => return Err(format!("unknown command: {a}")),
                 };
                 saw_command = true;
@@ -610,6 +901,23 @@ fn parse(argv: &[String]) -> Result<Option<Args>, String> {
     // no-op to shrug at: `usbdiag all --force` should not look like it worked.
     if args.command != Command::Probe && (args.consented || args.forced || args.dry_run) {
         return Err("--yes, --force and --dry-run only mean anything for 'probe'".into());
+    }
+    // Same rule for the label flags: a `--kind` that reaches no command has
+    // silently changed nothing, and looking like it worked is the failure.
+    let labelling = matches!(args.command, Command::Label | Command::Labels);
+    if !labelling
+        && (args.kind.is_some() || args.medium.is_some() || args.note.is_some() || args.this_one)
+    {
+        return Err("--kind, --medium, --note and --this-one only mean anything for 'label'".into());
+    }
+    if args.command == Command::Label && args.target.is_none() {
+        return Err("'label' needs a device: a sysfs name such as 3-5.2, or an id such as \
+                    0781:5583"
+            .into());
+    }
+    if args.command == Command::Label && args.forget && (args.kind.is_some() || args.medium.is_some())
+    {
+        return Err("--forget removes a label; it cannot be combined with --kind or --medium".into());
     }
     Ok(Some(args))
 }
@@ -631,6 +939,8 @@ COMMANDS
                watch it negotiate
     json       Full snapshot and findings as JSON
     probe      List the active probes; 'probe NAME' runs one
+    label      Say what a device is, and remember it
+    labels     List the stored labels; 'labels ID --forget' clears one
 
 OPTIONS
     -j, --json          JSON output (also narrows to the command's own data)
@@ -643,8 +953,26 @@ OPTIONS
                         looking anyway
         --sample MS     Measure live storage throughput over this window
                         (costs exactly this much wall-clock; off by default)
+        --no-overrides  Ignore stored labels and show the machine as read
     -h, --help          This text
     -V, --version       Version
+
+LABEL OPTIONS
+        --kind NAME     storage, camera, keyboard, hub, ... ('--kind ?' lists)
+        --medium NAME   rotating | ssd | unknown. The one fact a USB bridge
+                        usually will not report, and the one the throughput
+                        rule most needs
+        --note TEXT     A reminder for you; never used by a rule
+        --this-one      Label this physical unit rather than every device with
+                        the same vendor/product id. Needs a serial worth
+                        keying on — placeholders like 00000000 are refused
+        --forget        Remove the label instead of setting one
+
+    A label is a fact you supply that the bus cannot: nothing here guesses, and
+    nothing generalises from what you type. Labels sharpen findings as well as
+    quieten them, but a finding resting on one is capped at 'inferred' and says
+    where the fact came from. Stored in $XDG_CONFIG_HOME/usbdiag/devices.json,
+    which is plain JSON and safe to edit by hand.
 
 PROBE OPTIONS
         --target NAME   Scope a probe to one device: a sysfs name such as
@@ -786,6 +1114,49 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(a.dry_run && a.json);
+    }
+
+    #[test]
+    fn label_needs_a_device() {
+        assert!(p(&["label"]).is_err());
+        assert!(p(&["label", "3-5.2", "--kind", "storage"]).is_ok());
+    }
+
+    /// A flag that reaches no command has silently changed nothing, and
+    /// looking like it worked is the failure worth preventing.
+    #[test]
+    fn label_flags_outside_label_are_an_error_not_a_no_op() {
+        assert!(p(&["devices", "--kind", "storage"]).is_err());
+        assert!(p(&["all", "--this-one"]).is_err());
+    }
+
+    #[test]
+    fn forget_cannot_be_combined_with_setting_something() {
+        assert!(p(&["label", "3-5.2", "--forget", "--kind", "storage"]).is_err());
+        assert!(p(&["label", "3-5.2", "--forget"]).is_ok());
+    }
+
+    #[test]
+    fn overrides_are_on_unless_turned_off() {
+        assert!(p(&["all"]).unwrap().unwrap().overrides);
+        assert!(!p(&["all", "--no-overrides"]).unwrap().unwrap().overrides);
+    }
+
+    #[test]
+    fn kind_names_are_forgiving_but_not_inventive() {
+        assert_eq!(parse_kind("storage").unwrap(), DeviceKind::Storage);
+        assert_eq!(parse_kind("  Smart-Card Reader ").unwrap(), DeviceKind::SmartcardReader);
+        assert_eq!(parse_kind("webcam").unwrap(), DeviceKind::Camera);
+        let err = parse_kind("teapot").unwrap_err();
+        assert!(err.contains("teapot") && err.contains("try one of"), "{err}");
+    }
+
+    #[test]
+    fn medium_names_cover_what_people_type() {
+        assert_eq!(parse_medium("rotating").unwrap(), Medium::Rotating);
+        assert_eq!(parse_medium("HDD").unwrap(), Medium::Rotating);
+        assert_eq!(parse_medium("ssd").unwrap(), Medium::SolidState);
+        assert!(parse_medium("spinny").is_err());
     }
 
     #[test]

@@ -25,11 +25,35 @@ use relm4::adw::{self, prelude::*};
 use relm4::gtk::{self, glib};
 use relm4::{Component, ComponentParts, ComponentSender, RelmApp, WorkerController};
 
+use usb_probe::kind::DeviceKind;
 use usb_probe::model::{KernelLog, Outcome, Report, Severity, Subject};
+use usb_probe::overrides::{self, Overrides};
 use usb_probe::Options;
 
 /// D-Bus / window-class identity. The CLI stays `usbdiag`.
 const APP_ID: &str = "com.iboalali.usbdiag";
+
+/// The kinds offered in the override dropdown, in the order they appear.
+///
+/// `Unknown` is deliberately absent: "I don't know what this is" is what the
+/// tool already says on its own, and letting someone store it as a correction
+/// would be a label that asserts nothing while still overriding the class code.
+pub const KINDS: [DeviceKind; 14] = [
+    DeviceKind::Hub,
+    DeviceKind::Keyboard,
+    DeviceKind::Mouse,
+    DeviceKind::InputDevice,
+    DeviceKind::Storage,
+    DeviceKind::Audio,
+    DeviceKind::Camera,
+    DeviceKind::Imaging,
+    DeviceKind::Printer,
+    DeviceKind::Network,
+    DeviceKind::SmartcardReader,
+    DeviceKind::Billboard,
+    DeviceKind::Wireless,
+    DeviceKind::Diagnostic,
+];
 
 /// How long a kernel log may be reused before it is read again.
 ///
@@ -51,6 +75,11 @@ enum Msg {
     /// Explicit refresh, which also re-reads the kernel log.
     Refresh,
     DismissBanner,
+    /// Store (or clear, with `None`) what a device is.
+    SetKind {
+        device: String,
+        kind: Option<DeviceKind>,
+    },
 }
 
 /// Opening window size. Settable from the command line because the narrow
@@ -138,6 +167,23 @@ impl AppModel {
             .unwrap_or(Subject::Host)
     }
 
+    /// Every applied label in a report, for telling "the user just relabelled
+    /// something" apart from "nothing happened".
+    fn declarations_of(&self, report: &Report) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = report
+            .snapshot
+            .devices()
+            .into_iter()
+            .filter_map(|d| {
+                d.declared
+                    .as_ref()
+                    .map(|x| (d.sysfs_name.clone(), format!("{:?}", x)))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
     fn exists(&self, s: &Subject) -> bool {
         let snap = &self.report.snapshot;
         match s {
@@ -191,6 +237,55 @@ impl AppModel {
             self.selected = Self::worst_subject(&self.report);
         }
         self.revision += 1;
+    }
+
+    /// Write a label for a device, then re-read so the change is shown as the
+    /// tool sees it rather than as the UI hoped.
+    ///
+    /// This is the only thing in the GUI that writes anything, and it happens
+    /// only because someone changed a dropdown.
+    fn set_kind(&mut self, device: &str, kind: Option<DeviceKind>, sender: &ComponentSender<Self>) {
+        let Some(dev) = self.report.snapshot.device(device) else {
+            return;
+        };
+        // Model scope. The per-unit escape hatch is a CLI flag rather than a
+        // second control here: choosing between "this model" and "this one" is
+        // a question most people should not have to answer, and the default is
+        // right far more often.
+        let Some(id) = overrides::model_id(dev) else {
+            self.banner_text =
+                Some(format!("{device} reports no vendor/product id, so it cannot be labelled"));
+            return;
+        };
+
+        let mut store = Overrides::load();
+        let existing = store.devices.iter().find(|o| o.id == id).cloned();
+        match kind {
+            Some(k) => store.set(overrides::Override {
+                id: id.clone(),
+                kind: Some(k),
+                medium: existing.as_ref().and_then(|o| o.medium),
+                note: existing.as_ref().and_then(|o| o.note.clone()),
+                set_at_unix_ms: now_ms(),
+            }),
+            // "as the device says" clears only the kind, keeping a medium or a
+            // note the user set separately — those are different assertions.
+            None => match existing {
+                Some(o) if o.medium.is_some() || o.note.is_some() => store.set(overrides::Override {
+                    kind: None,
+                    ..o
+                }),
+                _ => {
+                    store.forget(&id);
+                }
+            },
+        }
+
+        if let Err(e) = store.save() {
+            self.banner_text = Some(format!("Could not save the label: {e}"));
+            return;
+        }
+        self.start_capture(sender, false);
     }
 
     fn title(&self) -> String {
@@ -469,6 +564,7 @@ impl Component for AppModel {
                 self.revision += 1;
             }
             Msg::DismissBanner => self.banner_text = None,
+            Msg::SetKind { device, kind } => self.set_kind(&device, kind, &sender),
         }
     }
 
@@ -481,8 +577,12 @@ impl Component for AppModel {
         // stays on screen.
         self.cached_log = Some(report.snapshot.kernel_log.clone());
 
+        // The fingerprint covers the hardware, and a label is not hardware — so
+        // a capture taken right after one is written would otherwise be
+        // discarded as "nothing changed" and the correction would not appear.
         let fingerprint = report.snapshot.fingerprint();
-        if self.fingerprint != Some(fingerprint) {
+        let labels_changed = self.declarations_of(&report) != self.declarations_of(&self.report);
+        if self.fingerprint != Some(fingerprint) || labels_changed {
             self.fingerprint = Some(fingerprint);
             self.adopt(*report);
         }
@@ -512,9 +612,21 @@ impl Component for AppModel {
                 self.show_hubs,
                 sender.input_sender(),
             );
-            detail::build(&widgets.detail_box, &self.report, &self.selected);
+                detail::build(
+                &widgets.detail_box,
+                &self.report,
+                &self.selected,
+                sender.input_sender(),
+            );
         }
     }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn host_line(report: &Report) -> String {

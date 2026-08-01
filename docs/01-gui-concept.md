@@ -28,7 +28,7 @@ building it changed a decision, the section says so.
 
 | | TempoUI | usb-analyzer |
 |---|---|---|
-| logic, no GTK, all tests | `crates/core` | **`crates/usb-probe`** — 231 tests |
+| logic, no GTK, all tests | `crates/core` | **`crates/usb-probe`** — 268 tests |
 | thin GTK layer, no tests | `crates/ui` | **`crates/gui`** → binary `usbdiag-gui` |
 | CLI | — | `crates/usbdiag` — unchanged |
 
@@ -222,10 +222,11 @@ This is the constraint to hold hardest, because a GUI makes it trivial to break.
   not merely refresh.
 - **A device's kind shows where it came from.** Three sources, three
   treatments: *asserted* by the class code, *guessed* from a product string, or
-  *set by you*. The guess gets the same hedged styling as a Heuristic finding,
-  and the override is editable in place — see tasks #26 and #27. A stored
-  override the user cannot see is a belief they cannot correct, and it will
-  outlive their memory of setting it.
+  *set by you*. The override is editable in place, in a *What this is* card that
+  also states what the device itself claimed and which label is being applied —
+  a stored override the user cannot see is a belief they cannot correct, and it
+  will outlive their memory of setting it. Built in #26/#27; the guessed source
+  exists in the model and nothing produces one yet.
 
 ---
 

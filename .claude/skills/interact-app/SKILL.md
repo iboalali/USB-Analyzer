@@ -62,6 +62,32 @@ xwd -id "$WID" -out /tmp/s.xwd && ffmpeg -y -i /tmp/s.xwd /tmp/s.png   # then Re
 Find click targets by reading a screenshot first and measuring the pixel
 position (coordinates are the same in the PNG and window-relative space).
 
+## Dropdowns and other popovers
+
+A `GtkDropDown`'s list is **its own X toplevel**, not part of the window you
+grabbed — `xwd -id <main window>` will not show it, and clicking blind at
+coordinates measured from an earlier attempt does not work, because GTK
+repositions the popover so the *currently selected* row sits near the button.
+Two attempts at the same row can therefore need two different coordinates.
+
+Find it, grab it, measure it, then click:
+
+```sh
+$PY .../interact.py "usbdiag" click <button-x> <button-y> sleep 1.3
+xwininfo -root -children | grep usbdiag        # the popover is the small one
+#   0x14001ef "usbdiag-gui": ... 231x454+1061+289   <- origin +1061+289
+xwd -id 0x14001ef -out /tmp/pop.xwd && ffmpeg -y -i /tmp/pop.xwd /tmp/pop.png
+```
+
+Read `/tmp/pop.png`, measure the row's y *inside the popover*, then convert:
+window-relative = popover origin + row offset − the main window's origin
+(`+40+20` after `move 40 20`). Do the open-click and the row-click in **one**
+`interact.py` invocation — the driver activates the named window on startup,
+and a second invocation would raise the toplevel and dismiss the popover.
+
+`xwd -root` does not work here at all (`BadMatch` under Xwayland), so grabbing
+the whole screen is not an option.
+
 ## Gotchas
 
 - **The sidebar reflows under you.** Rows carry a two-line reason, so their
@@ -78,6 +104,10 @@ position (coordinates are the same in the PNG and window-relative space).
   silently goes nowhere. Only a restart fixes it.
 - **Off-screen window.** If the WM parked the window partly off-screen (negative
   origin), clicks at small coordinates map off-screen. Run `move 60 60` first.
-- **No side effects to fear.** v1 is a viewer: there is nothing to click that
-  changes the system. That is not true once the probe panel arrives — a
-  re-enumeration probe cycles a real port.
+- **One control has a side effect.** The viewer touches no hardware, but the
+  *What this is* dropdown writes a label to
+  `$XDG_CONFIG_HOME/usbdiag/devices.json` and every later run reads it. Check
+  `usbdiag labels` afterwards and clear anything a test left behind:
+  `usbdiag labels <id> --forget`. Everything else is read-only — which will
+  stop being true when the probe panel arrives, since a re-enumeration probe
+  cycles a real port.

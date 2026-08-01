@@ -231,3 +231,16 @@ button.row.sel {
     min-width: 8px;
     min-height: 8px;
 }
+
+/* A card whose content the user asserted rather than the machine. Marked so a
+ * stored belief cannot pass for a reading — §8, and the whole reason the
+ * override is editable in place. */
+.card.declared {
+    background: alpha(@accent_color, 0.07);
+    box-shadow: inset 0 0 0 1px alpha(@accent_color, 0.25);
+}
+
+.kindname {
+    font-size: 1.1em;
+    font-weight: bold;
+}

@@ -87,6 +87,7 @@ pub fn device(name: &str, version: &str, mbps: f64, parent: Option<&str>) -> Usb
         interfaces: Vec::new(),
         ports: Vec::new(),
         children: Vec::new(),
+        declared: None,
     }
 }
 

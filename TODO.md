@@ -560,62 +560,55 @@ The enforcement point exists and is tested against a hand-made guess, so the hal
 carries risk cannot land without going through it. What it needs first is a second device
 worth guessing about; one fingerprint reader is not a corpus.
 
-### Let the user correct a device's type, and remember it
+### Let the user correct a device's type, and remember it — **done**
 
-Show the kind in the UI, and let it be overridden. Requested for the display; worth
-building for what the override unlocks.
+`overrides.rs`, `usbdiag label` / `usbdiag labels`, `--no-overrides`, and a *What this is*
+card in the GUI with the kind, where it came from, and a dropdown to change it.
 
-**This is not cosmetic.** Both storage devices here report class `08`, which says
-*storage* and nothing about **what kind**. `block::medium()` returns `Unknown` for
-nearly all USB because bridges omit VPD page B1h — which is exactly why
-`THROUGHPUT_FAR_BELOW_LINK` has to reason about "the slowest plausible medium" and
-`ROTATING_SHORTFALL` instead of a real threshold. A user who says *"that one is a
-spinning disk"* supplies a fact no amount of reading can recover, and the rule gets a
-yardstick. That is the case that justifies the feature.
+**The rule is the inverse of the one for string guesses, and that was got wrong first.**
+`KindSource::User` was written as *not* evidence, which would have made a correction able
+only to silence a rule. The design here says the opposite and is right: the user is holding
+the object, so a declaration may **sharpen** a finding. What it may not do is claim to have
+been measured, so `Kind::cap` weakens any finding that leaned on one to `Inferred` and the
+finding cites the label by id. Fixed with the tests inverted to match.
 
-It also means **an override must be allowed to sharpen a finding, not merely suppress
-one** — the opposite of the rule above for string heuristics, and correctly so. A
-product-string guess may only suppress because the tool invented it. A user assertion is
-better evidence than anything on the wire: they are holding the object.
+**The justifying case works end to end.** On a High-Speed link an unknown medium is not
+judgeable at all — a cheap flash drive and a bad cable look identical — so the rule stays
+silent. Declare the disk rotating and 8 MB/s against a ~120 MB/s platter becomes an
+unambiguous finding, at `Inferred`, citing `declared by you for 1234:5678 (this model)`.
+Two tests: one that the silence becomes an answer, one that the label cannot invent a fault
+where the measurement is fine.
 
-**Scope: the model, with the unit as an escape hatch.** Default to `VID:PID`, so
-correcting one SanDisk Ultra corrects every SanDisk Ultra. Offer "just this one" via
-`VID:PID:serial` where a serial exists and is trustworthy.
+**Placeholder serials are refused, with real ones as the test corpus.** `usable_serial`
+rejects empty, shorter than four characters, and one character repeated — which is exactly
+what catches the MediaTek `000000000` and the Dell DA20 `00000000000000000` on this machine
+while accepting the three genuine serials. Confirmed live: `usbdiag label 3-5.1 --this-one`
+refuses and explains, rather than silently labelling every zero-serial device ever plugged
+in.
 
-**Trustworthy is doing real work in that sentence.** Two of the six serials on this
-machine are placeholders — MediaTek reports `000000000`, the Dell DA20 reports
-`00000000000000000`. Key on those naively and correcting one adapter relabels every
-zero-serial device ever plugged in. Degenerate serials — all zeros, all one repeated
-character, shorter than a few characters — must be rejected as identifiers and fall back
-to model scope. The three genuine serials here (`4C530001010412118490`,
-`54B80A3FA797C091604B95`, `UID9802CAEE_XXXX_MOC_B`) show what a real one looks like.
+**A bug worth remembering: `owner_of` picked the wrong device.** A disk at
+`.../usb4/4-1/host1/block/sdb` sits inside both `usb4` and `4-1`, and the first attempt took
+the *longest name* — which is `usb4`, the root hub, the wrong answer. It is the *deepest*
+match that owns the disk. Now keyed on position in the path, with its own test.
 
-**Remember, never generalise.** A correction is a stored fact about one identity,
-applied on every future sighting. The tool does not mine corrections for patterns and
-start guessing — a rule inferred from user data would produce findings with no traceable
-cause, which is the one thing this project cannot afford. Every stored override is
-listable and deletable from the CLI, because a belief the user cannot inspect is a belief
-they cannot correct.
+**And one in the GUI: the guard that ate the first click.** `set_selected` is called before
+`connect_selected_notify`, so building the row cannot fire the handler — but a defensive
+"skip the initial notify" guard was added anyway, and with nothing to skip on construction it
+swallowed the user's first real choice instead. Found by clicking the control and watching
+the file not change. Replaced by the check that is actually needed: the pane rebuilds on
+every capture, so re-selecting the stored value must not rewrite the file.
 
-**Provenance goes on the device kind, not in `Confidence`.** The confidence enum is about
-certainty and should stay three-valued; where a fact came from is a second axis, and
-conflating them would make a stale override invisible behind an `inferred` badge. So the
-device kind carries `source: class | heuristic | user`, the UI shows it per device where
-the user can act on it, and any finding that leans on a declaration cites it in evidence
-("medium: rotating — set by you") and is capped at `Inferred`. Measured means read off
-the hardware, and a declaration is not that however true it is.
+**Capture is no longer a pure function of the machine**, which is the cost of the feature.
+`Options::overrides` defaults on, `--no-overrides` gets the unmodified view, and every
+applied label is serialized onto the device so a JSON consumer can tell a reading from a
+declaration. Without both, "why does it say that" is unanswerable.
 
-**This is the project's first persistent state**, which is worth being reluctant about.
-`$XDG_CONFIG_HOME/usbdiag/devices.json`, JSON because `serde_json` is already a
-dependency and the tree stays at 13 crates. Absent file means no overrides and no error.
-Hand-editable, listable (`usbdiag labels`), clearable. **Only an explicit command writes
-it** — no read path ever persists anything.
+`serde_json` became a real dependency of `usb-probe` (10 crates -> 14). The shipped binary is
+unchanged at 13, since `usbdiag` already depended on it.
 
-It also changes what `capture()` *is*: currently a pure function of the machine, now a
-function of the machine and a config file. Two runs on identical hardware can differ. So
-`--no-overrides` must exist to get the unmodified view, and the JSON must carry the
-source field so a consumer can tell which is which. Without both, "why does it say that"
-becomes unanswerable, and bug reports become useless.
+Still deliberately absent: a per-unit control in the GUI. `--this-one` exists in the CLI, but
+choosing between "this model" and "this one" is a question most people should not have to
+answer, and the model default is right far more often.
 
 ---
 

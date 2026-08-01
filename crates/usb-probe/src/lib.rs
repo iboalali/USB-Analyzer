@@ -36,6 +36,7 @@ pub mod kernel;
 pub mod kind;
 pub mod model;
 pub mod monitor;
+pub mod overrides;
 pub mod pd;
 pub mod probe;
 pub mod reenumerate;
@@ -57,7 +58,7 @@ use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// What to include in a capture.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct Options {
     pub kernel: kernel::Options,
     /// Milliseconds to sample block I/O for a live throughput figure. 0 skips
@@ -72,6 +73,25 @@ pub struct Options {
     /// silently yields nothing when usbmon is unreachable — [`Capabilities`]
     /// holds the reason.
     pub urb_sample_ms: u64,
+    /// Apply the user's stored device labels.
+    ///
+    /// On by default, which is the one place a capture stops being a pure
+    /// function of the machine: with a labels file present, two runs on
+    /// identical hardware can differ. `usbdiag --no-overrides` clears this to
+    /// get the unmodified view, and every applied label is visible in the JSON,
+    /// because without both of those "why does it say that" is unanswerable.
+    pub overrides: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            kernel: kernel::Options::default(),
+            storage_sample_ms: 0,
+            urb_sample_ms: 0,
+            overrides: true,
+        }
+    }
 }
 
 /// Read the current state of the system.
@@ -91,6 +111,23 @@ pub fn capture(opts: Options) -> Snapshot {
 /// the log lag by however long the caller waits. Nothing becomes *wrong*, only
 /// late — log events are append-only, so a stale copy is a prefix of the truth.
 pub fn capture_with_log(opts: Options, log: Option<KernelLog>) -> Snapshot {
+    let labels = if opts.overrides {
+        overrides::Overrides::load()
+    } else {
+        overrides::Overrides::new()
+    };
+    capture_with(opts, log, &labels)
+}
+
+/// As [`capture_with_log`], with the label set supplied rather than read.
+///
+/// The explicit form, so a caller that already holds the labels — or a test
+/// that wants a specific set — never touches the user's config file.
+pub fn capture_with(
+    opts: Options,
+    log: Option<KernelLog>,
+    labels: &overrides::Overrides,
+) -> Snapshot {
     let ports = typec::read_ports();
     let (batteries, mains_online) = pd::read_batteries();
 
@@ -117,7 +154,7 @@ pub fn capture_with_log(opts: Options, log: Option<KernelLog>) -> Snapshot {
     let capabilities = caps::detect();
     let urb_traffic = sample_urb_traffic(&capabilities, opts);
 
-    Snapshot {
+    let mut snap = Snapshot {
         captured_at_unix_ms: now_ms(),
         host: read_host(),
         capabilities,
@@ -140,6 +177,24 @@ pub fn capture_with_log(opts: Options, log: Option<KernelLog>) -> Snapshot {
         throughput: Vec::new(),
         reenumeration: None,
         kernel_log: log.unwrap_or_else(|| kernel::collect(opts.kernel)),
+    };
+    apply_overrides(&mut snap, labels);
+    snap
+}
+
+/// Attach any matching stored label to each device in the tree.
+fn apply_overrides(snap: &mut Snapshot, labels: &overrides::Overrides) {
+    if labels.devices.is_empty() {
+        return;
+    }
+    fn walk(dev: &mut UsbDevice, labels: &overrides::Overrides) {
+        dev.declared = labels.matching(dev).map(overrides::Declaration::from);
+        for child in &mut dev.children {
+            walk(child, labels);
+        }
+    }
+    for bus in &mut snap.buses {
+        walk(bus, labels);
     }
 }
 

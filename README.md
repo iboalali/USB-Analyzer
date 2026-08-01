@@ -494,8 +494,41 @@ guess that accuses costs a false accusation against hardware someone then
 replaces. Only one of those is recoverable.
 
 Every kind carries where it came from — declared by the device, guessed from its
-name, or set by you — and the UI shows it, because a belief the user cannot see
-is one they cannot correct.
+name, or set by you — and both front ends show it, because a belief the user
+cannot see is one they cannot correct.
+
+### Telling it what something is
+
+```sh
+usbdiag label 4-1 --medium rotating     # the fact a USB bridge will not report
+usbdiag label 3-5.2 --kind smartcard    # correct a class code that shrugged
+usbdiag labels                          # what is stored
+usbdiag labels 0781:5583 --forget       # and how to take it back
+usbdiag --no-overrides                  # the machine as read, ignoring all of it
+```
+
+The same control lives in the GUI, in the *What this is* card on any device.
+
+A label is a fact you supply that the bus cannot. The case that justifies the
+feature is the medium: `queue/rotational` is meaningless over USB because
+bridges omit SCSI VPD page B1h, so on a High-Speed link the throughput rule
+cannot tell a slow flash drive from a bad cable and correctly says nothing.
+Tell it the disk spins and it has a yardstick.
+
+Unlike a guess the tool made, a label may **sharpen** a finding as well as
+quieten one — you are holding the object. It is still not a measurement, so any
+finding resting on one is capped at `inferred` and names the label it used.
+
+Scope is the model (`VID:PID`), so correcting one drive corrects every drive of
+that model; `--this-one` narrows it to a single unit where the serial is worth
+keying on. Placeholders are refused — two of the six serials on this machine are
+all zeros, and keying on those would relabel every zero-serial device ever
+plugged in.
+
+Nothing generalises: a correction is a stored fact about one identity, replayed
+on sight, never mined for patterns. Storage is
+`$XDG_CONFIG_HOME/usbdiag/devices.json`, plain JSON, safe to edit by hand, and
+written **only** by an explicit command.
 
 ### Exonerations
 
@@ -529,7 +562,7 @@ on*, so grading one as minor would manufacture a problem out of a note.
 
 ```sh
 cargo build --release -p usbdiag     # ./target/release/usbdiag
-cargo test --workspace               # 268 tests
+cargo test --workspace               # 296 tests
 ```
 
 The CLI and the library have **no non-Rust dependencies**: `serde` and

@@ -17,7 +17,6 @@
 //! them "nothing found" is an assertion; with them it is a summary.
 
 use crate::diag::{SVID_DISPLAYPORT, watts};
-use crate::kind::DeviceKind;
 use crate::model::{
     Confidence, Finding, Outcome, Severity, Snapshot, Subject, UsbDevice, Verdict,
 };
@@ -350,11 +349,7 @@ fn medium_explains_throughput(snap: &Snapshot, findings: &[Finding], out: &mut V
 
 fn owning_device<'a>(snap: &'a Snapshot, block_name: &str) -> Option<&'a UsbDevice> {
     let block = snap.block_devices.iter().find(|b| b.name == block_name)?;
-    let path = block.sysfs_path.to_string_lossy().to_string();
-    snap.devices()
-        .into_iter()
-        .filter(|d| d.kind().asserted() == Some(DeviceKind::Storage))
-        .find(|d| path.contains(&format!("/{}/", d.sysfs_name)))
+    snap.owner_of(block)
 }
 
 // ---------------------------------------------------------------------------

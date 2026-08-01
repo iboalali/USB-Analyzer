@@ -11,17 +11,23 @@
 //! [`KindSource`] splits *asserted* from *guessed*, and the split is in the API
 //! rather than in a comment:
 //!
-//! * [`Kind::asserted`] returns a kind only when the device's own descriptors
-//!   say so. It is the only accessor a rule may use as grounds for a **new**
-//!   finding.
+//! * [`Kind::grounds`] returns a kind only when someone who could actually know
+//!   said so — the device's own descriptors, or the user. It is the only
+//!   accessor a rule may use as grounds for a **new** finding, and
+//!   [`Kind::cap`] weakens the confidence such a finding may claim.
 //! * [`Kind::kind`] is the best available answer, guesses included. It is for
 //!   display and for staying quiet.
 //!
 //! The asymmetry is not stylistic. A wrong guess that suppresses costs a missed
 //! detection, which is bad. A wrong guess that accuses costs a false accusation
 //! against hardware the user then goes and replaces, which is the failure this
-//! whole project exists to avoid. Only one of those is recoverable, so guesses
-//! may push toward silence and never toward blame.
+//! whole project exists to avoid. Only one of those is recoverable, so a guess
+//! the *tool* made may push toward silence and never toward blame.
+//!
+//! A user's correction is the other way round, and deliberately so: they are
+//! holding the object, so it may sharpen a finding as well as quieten one. It
+//! is still not a measurement, so it caps at [`crate::Confidence::Inferred`]
+//! and has to be cited. See [`crate::overrides`].
 //!
 //! # Only the free half is built
 //!
@@ -147,11 +153,29 @@ impl KindSource {
 
     /// May a rule treat a kind from this source as grounds for a new finding?
     ///
-    /// Only what the device itself asserted. A user's correction is *trusted*
-    /// for display and for silence but is still not a measurement, and a string
-    /// match is not evidence of anything.
+    /// The device's own claim, yes. A user's correction, also yes — they are
+    /// holding the object, which is better evidence than anything on the wire,
+    /// and the case the feature exists for is a user supplying a fact the bus
+    /// cannot carry ("that one is a spinning disk").
+    ///
+    /// A product-string guess, never. The tool invented it, so it may push
+    /// toward silence and never toward blame. See the module docs.
     pub fn is_evidence(&self) -> bool {
-        matches!(self, Self::Class)
+        matches!(self, Self::Class | Self::User)
+    }
+
+    /// The strongest confidence a finding resting on this may claim.
+    ///
+    /// A declaration is not a measurement however true it is: `Measured` means
+    /// read off the hardware. So a user's correction caps at `Inferred`, and a
+    /// finding that leans on one has to say where the fact came from.
+    pub fn confidence_cap(&self) -> crate::model::Confidence {
+        use crate::model::Confidence;
+        match self {
+            Self::Class => Confidence::Measured,
+            Self::User => Confidence::Inferred,
+            Self::Heuristic => Confidence::Heuristic,
+        }
     }
 }
 
@@ -173,9 +197,25 @@ impl Kind {
     /// The kind a rule may use as grounds for a **new** finding, or `None`.
     ///
     /// See the module docs: this is the enforcement point for "a guess may
-    /// quieten a rule but never start one".
-    pub fn asserted(&self) -> Option<DeviceKind> {
+    /// quieten a rule but never start one". A user's declaration passes — with
+    /// its confidence capped, see [`Kind::cap`].
+    pub fn grounds(&self) -> Option<DeviceKind> {
         (self.source.is_evidence() && self.kind != DeviceKind::Unknown).then_some(self.kind)
+    }
+
+    /// `want`, weakened if this kind's provenance cannot support it.
+    ///
+    /// A rule that selected a device by its kind calls this on the confidence
+    /// it was going to claim, so a finding reached via a user's label cannot
+    /// come out `Measured`.
+    pub fn cap(&self, want: crate::model::Confidence) -> crate::model::Confidence {
+        use crate::model::Confidence::*;
+        match (self.source.confidence_cap(), want) {
+            (Measured, w) => w,
+            (Inferred, Measured) => Inferred,
+            (Inferred, w) => w,
+            (Heuristic, _) => Heuristic,
+        }
     }
 
     /// Is this a definite answer, from any source?
@@ -290,7 +330,7 @@ fn from_class_code(code: u8) -> Option<DeviceKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::UsbInterface;
+    use crate::model::{Confidence, UsbInterface};
     use crate::test_support as ts;
 
     fn iface(class: u8, protocol: Option<u8>) -> UsbInterface {
@@ -342,7 +382,7 @@ mod tests {
         let k = classify(&d);
         assert_eq!(k.kind, DeviceKind::Unknown);
         assert!(!k.is_known());
-        assert_eq!(k.asserted(), None);
+        assert_eq!(k.grounds(), None);
     }
 
     #[test]
@@ -401,32 +441,51 @@ mod tests {
             kind: DeviceKind::Storage,
             source: KindSource::Heuristic,
         };
-        assert_eq!(guessed.asserted(), None);
+        assert_eq!(guessed.grounds(), None);
         assert!(guessed.is_known(), "it is still shown, and may still quieten");
     }
 
-    /// A user's correction is trusted enough to display and to stay quiet
-    /// about, and still is not a measurement.
+    /// The opposite of the guess rule, and deliberately so: the user is holding
+    /// the object, so their correction may sharpen a finding as well as quieten
+    /// one. What it cannot do is claim to have been measured.
     #[test]
-    fn a_user_override_is_not_evidence_either() {
+    fn a_user_override_is_grounds_but_never_measured() {
         let declared = Kind {
             kind: DeviceKind::Storage,
             source: KindSource::User,
         };
-        assert_eq!(declared.asserted(), None);
-        assert!(declared.is_known());
+        assert_eq!(declared.grounds(), Some(DeviceKind::Storage));
+        assert_eq!(declared.cap(Confidence::Measured), Confidence::Inferred);
+        // It does not *raise* a weaker claim either.
+        assert_eq!(declared.cap(Confidence::Heuristic), Confidence::Heuristic);
+    }
+
+    #[test]
+    fn a_class_derived_kind_may_claim_a_measurement() {
+        let k = Kind::class(DeviceKind::Storage);
+        assert_eq!(k.cap(Confidence::Measured), Confidence::Measured);
+    }
+
+    /// A guess cannot lend its confidence to anything, in either direction.
+    #[test]
+    fn a_guess_caps_everything_to_heuristic() {
+        let guessed = Kind {
+            kind: DeviceKind::Storage,
+            source: KindSource::Heuristic,
+        };
+        assert_eq!(guessed.cap(Confidence::Measured), Confidence::Heuristic);
     }
 
     #[test]
     fn an_asserted_kind_is_grounds_for_a_finding() {
         let k = Kind::class(DeviceKind::Storage);
-        assert_eq!(k.asserted(), Some(DeviceKind::Storage));
+        assert_eq!(k.grounds(), Some(DeviceKind::Storage));
     }
 
     /// Unknown is never grounds for anything, whatever the source says.
     #[test]
     fn unknown_is_not_grounds_even_when_asserted() {
-        assert_eq!(Kind::class(DeviceKind::Unknown).asserted(), None);
+        assert_eq!(Kind::class(DeviceKind::Unknown).grounds(), None);
     }
 
     #[test]

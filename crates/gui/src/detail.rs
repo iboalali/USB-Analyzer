@@ -20,6 +20,7 @@
 
 use relm4::gtk::{self, prelude::*};
 use usb_probe::chain;
+use usb_probe::kind::KindSource;
 use usb_probe::model::{
     Finding, KernelLogSource, Outcome, Report, Severity, Subject, Verdict,
 };
@@ -33,7 +34,12 @@ const NOTHING_FIRED: &str = "No rule fired for this subject, in either direction
 That is weaker than a clean bill of health — it means nothing was concluded here, \
 not that everything was checked and passed.";
 
-pub fn build(container: &gtk::Box, report: &Report, subject: &Subject) {
+pub fn build(
+    container: &gtk::Box,
+    report: &Report,
+    subject: &Subject,
+    sender: &relm4::Sender<crate::Msg>,
+) {
     crate::sidebar::clear(container);
 
     let mine = findings::about(&report.findings, subject);
@@ -42,6 +48,12 @@ pub fn build(container: &gtk::Box, report: &Report, subject: &Subject) {
     let mixed = matches!(subject, Subject::Port(_));
 
     container.append(&verdict_block(report, subject, &mine));
+
+    if let Subject::Device(name) = subject {
+        if let Some(dev) = report.snapshot.device(name) {
+            container.append(&kind_card(dev, sender));
+        }
+    }
 
     if !cleared.is_empty() {
         let (card, body) = findings::card(
@@ -84,6 +96,117 @@ pub fn build(container: &gtk::Box, report: &Report, subject: &Subject) {
         container.append(&card);
     }
 }
+
+// ---------------------------------------------------------------------------
+// what this is, and correcting it
+// ---------------------------------------------------------------------------
+
+/// The device's kind, where it came from, and a control to change it.
+///
+/// §8: *a device's kind shows where it came from*, and the override is editable
+/// in place. A stored override the user cannot see is a belief they cannot
+/// correct, and it will outlive their memory of setting it — so when one is
+/// applied this card also says what the device itself claimed, right next to
+/// it, and offers to put it back.
+fn kind_card(dev: &usb_probe::model::UsbDevice, sender: &relm4::Sender<crate::Msg>) -> gtk::Box {
+    let kind = dev.kind();
+    let declared = dev.declared.clone();
+    let overridden = kind.source == KindSource::User;
+
+    let (card, body) = findings::card(
+        "What this is",
+        Some(kind.source.label()),
+        if overridden { &["declared"] } else { &[] },
+    );
+
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+
+    let name = gtk::Label::new(Some(kind.kind.label()));
+    name.add_css_class("kindname");
+    name.set_xalign(0.0);
+    name.set_hexpand(true);
+    row.append(&name);
+
+    // The control. A plain dropdown of every kind, with the current one
+    // selected; changing it writes a label, and "as the device says" clears it.
+    let names: Vec<&str> = std::iter::once(AS_DECLARED)
+        .chain(crate::KINDS.iter().map(|k| k.label()))
+        .collect();
+    let choose = gtk::DropDown::from_strings(&names);
+    choose.set_valign(gtk::Align::Center);
+    choose.set_tooltip_text(Some(
+        "Say what this is. Stored against its vendor/product id and applied \
+         whenever it is plugged in again.",
+    ));
+    let selected = match overridden {
+        true => crate::KINDS.iter().position(|k| *k == kind.kind).map_or(0, |i| i + 1),
+        false => 0,
+    };
+    choose.set_selected(selected as u32);
+    {
+        let sender = sender.clone();
+        let name = dev.sysfs_name.clone();
+        // No "skip the first notify" guard here, and deliberately not.
+        // `set_selected` above runs *before* this handler is connected, so
+        // building the row cannot fire it. A guard would have nothing to skip
+        // on construction and would instead swallow the user's first real
+        // choice — which is exactly what it did until this was found by
+        // clicking the control and watching the file not change.
+        //
+        // What is needed instead is the no-op check: the pane is rebuilt on
+        // every capture, and re-selecting the value already stored must not
+        // rewrite the file with a new timestamp.
+        let current = selected;
+        choose.connect_selected_notify(move |d| {
+            let idx = d.selected() as usize;
+            if idx == current {
+                return;
+            }
+            let want = (idx > 0).then(|| crate::KINDS[idx - 1]);
+            sender.emit(crate::Msg::SetKind {
+                device: name.clone(),
+                kind: want,
+            });
+        });
+    }
+    row.append(&choose);
+    body.append(&row);
+
+    if overridden {
+        let says = dev.declared_kind();
+        let mut line = format!(
+            "You set this. The device itself reports {}.",
+            says.kind.label()
+        );
+        if let Some(d) = &declared {
+            line.push_str(&format!(" Stored against {} ({}).", d.id, d.scope_label()));
+        }
+        body.append(&findings::paragraph(&line, &["dim"]));
+    }
+
+    if let Some(note) = declared.as_ref().and_then(|d| d.note.as_deref()) {
+        body.append(&findings::paragraph(
+            &format!("\u{201c}{note}\u{201d}"),
+            &["dim"],
+        ));
+    }
+
+    if let Some(m) = declared.as_ref().and_then(|d| d.medium) {
+        body.append(&findings::paragraph(
+            &format!(
+                "Medium: {} \u{2014} set by you. The bus does not report this, and the \
+                 throughput rule uses it as a yardstick.",
+                m.label()
+            ),
+            &["dim"],
+        ));
+    }
+
+    card
+}
+
+/// The dropdown's first entry: not a kind, but "stop overriding".
+pub const AS_DECLARED: &str = "as the device says";
 
 // ---------------------------------------------------------------------------
 // verdict

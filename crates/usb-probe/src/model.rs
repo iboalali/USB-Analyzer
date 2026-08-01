@@ -159,6 +159,46 @@ impl Snapshot {
             .collect()
     }
 
+    /// The USB device a block device hangs off, by canonical sysfs path.
+    ///
+    /// The *deepest* match wins, because a disk at
+    /// `.../usb4/4-1/host1/block/sdb` sits inside both `usb4` and `4-1` and
+    /// only the second is its owner. Deepest means furthest along the path, not
+    /// longest-named: `usb4` is the longer string and the wrong answer.
+    ///
+    /// Deliberately not filtered by device kind — a bridge that fails to
+    /// declare mass storage still owns its disk, and a user's label on it has
+    /// to keep working.
+    pub fn owner_of(&self, block: &BlockDevice) -> Option<&UsbDevice> {
+        let path = block.sysfs_path.to_string_lossy().to_string();
+        self.devices()
+            .into_iter()
+            .filter_map(|d| Some((path.find(&format!("/{}/", d.sysfs_name))?, d)))
+            .max_by_key(|(at, _)| *at)
+            .map(|(_, d)| d)
+    }
+
+    /// What a block device is made of, and how well that is known.
+    ///
+    /// The bus almost never says: USB bridges omit SCSI VPD page B1h, so
+    /// [`BlockDevice::medium`] is `Unknown` for nearly everything. A user who
+    /// has told us "that one is a spinning disk" supplies a fact no amount of
+    /// reading can recover, and it wins — capped at `Inferred`, because a
+    /// declaration is not a measurement.
+    ///
+    /// Returns the source too, so a rule leaning on this can cap its confidence
+    /// and cite where the fact came from.
+    pub fn medium_of(&self, block: &BlockDevice) -> (Medium, crate::kind::KindSource) {
+        if let Some(m) = self
+            .owner_of(block)
+            .and_then(|d| d.declared.as_ref())
+            .and_then(|d| d.medium)
+        {
+            return (m, crate::kind::KindSource::User);
+        }
+        (block.medium(), crate::kind::KindSource::Class)
+    }
+
     /// Kernel events for a device, limited to those since it attached.
     ///
     /// A socket outlives its occupants: the log spans the whole boot while the
@@ -443,6 +483,15 @@ pub struct UsbDevice {
     /// over-current counter, which is a measured hardware fault signal.
     pub ports: Vec<HubPort>,
     pub children: Vec<UsbDevice>,
+
+    /// A stored correction the user made about this device, if one matched.
+    ///
+    /// Attached by [`crate::capture`] from the labels file and `None` under
+    /// `--no-overrides`. Serialized so that a JSON consumer can tell a reading
+    /// from a declaration — without that, "why does it say that" becomes
+    /// unanswerable the moment a label is involved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared: Option<crate::overrides::Declaration>,
 }
 
 impl UsbDevice {
@@ -496,7 +545,11 @@ impl UsbDevice {
         self.speed.as_ref().is_some_and(|s| s.mbps <= 480.0)
     }
 
-    /// What this device is, from its class codes.
+    /// What this device is.
+    ///
+    /// A user's correction wins over the class codes — they are holding the
+    /// object — and says so through [`crate::kind::KindSource::User`], which
+    /// caps what any finding resting on it may claim.
     ///
     /// Computed rather than stored. `usb_version_num` sets the precedent for a
     /// derived field living in the struct, but that one is a parse of a single
@@ -505,6 +558,20 @@ impl UsbDevice {
     /// three after construction — `root_hub_version` sets `device_class` on an
     /// already-built device. A stored kind would be silently stale there.
     pub fn kind(&self) -> crate::kind::Kind {
+        if let Some(k) = self.declared.as_ref().and_then(|d| d.kind) {
+            return crate::kind::Kind {
+                kind: k,
+                source: crate::kind::KindSource::User,
+            };
+        }
+        crate::kind::classify(self)
+    }
+
+    /// What the device itself says it is, ignoring any correction.
+    ///
+    /// For showing a user what they overrode, so a label can be judged against
+    /// the thing it replaced rather than taken on trust.
+    pub fn declared_kind(&self) -> crate::kind::Kind {
         crate::kind::classify(self)
     }
 
@@ -1258,8 +1325,7 @@ impl BlockDevice {
     /// medium is actually known. Spinning disks are limited by the platter
     /// rather than the bus, which is the whole reason to ask.
     pub fn media_ceiling_bps(&self) -> Option<f64> {
-        // ~120 MB/s is a generous figure for a 2.5" 5400 rpm drive.
-        matches!(self.medium(), Medium::Rotating).then_some(120e6)
+        self.medium().practical_ceiling_bps()
     }
 }
 
@@ -1386,6 +1452,14 @@ pub enum Medium {
 }
 
 impl Medium {
+    /// Practical sustained read ceiling, in bytes/sec, where the medium implies
+    /// one. `None` for solid state, which is limited by the bus rather than by
+    /// physics, and for unknown.
+    pub fn practical_ceiling_bps(&self) -> Option<f64> {
+        // ~120 MB/s is a generous figure for a 2.5" 5400 rpm drive.
+        matches!(self, Self::Rotating).then_some(120e6)
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
             Medium::Rotating => "spinning disk",
@@ -2131,6 +2205,31 @@ impl Report {
 mod tests {
     use super::*;
     use crate::test_support as ts;
+
+    /// A disk's sysfs path contains every device above it, so picking the wrong
+    /// one is easy — and `usb4` is a *longer* string than `4-1` while being the
+    /// wrong answer. The owner is the deepest match, not the longest.
+    #[test]
+    fn a_disk_is_owned_by_the_deepest_device_in_its_path() {
+        let mut snap = ts::empty_snapshot();
+        let mut bus = ts::root_hub("usb4", 5000.0);
+        bus.children
+            .push(ts::device("4-1", "3.00", 5000.0, Some("usb4")));
+        snap.buses.push(bus);
+        snap.block_devices.push(BlockDevice {
+            name: "sdb".into(),
+            sysfs_path: "/sys/devices/pci/usb4/4-1/host1/block/sdb".into(),
+            model: None,
+            vendor: None,
+            size_bytes: None,
+            rotational: None,
+            removable: Some(true),
+            stats: None,
+            throughput: None,
+        });
+        let owner = snap.owner_of(&snap.block_devices[0]).expect("an owner");
+        assert_eq!(owner.sysfs_name, "4-1");
+    }
 
     /// The point of the fingerprint: a watcher must not repaint because time
     /// passed or because a disk was busy.

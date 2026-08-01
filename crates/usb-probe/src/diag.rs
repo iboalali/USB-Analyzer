@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::kind::DeviceKind;
+use crate::kind::{DeviceKind, Kind, KindSource};
 use crate::model::*;
 use crate::vdo;
 
@@ -677,7 +677,7 @@ fn link_speed_rules(snap: &Snapshot, dev: &UsbDevice, out: &mut Vec<Finding>) {
             && dev.speed.as_ref().is_some_and(|s| s.mbps <= 10_000.0)
             // `asserted`, not `kind`: this creates a finding, so it may only
             // rest on what the device said about itself. See `kind`'s docs.
-            && dev.kind().asserted() == Some(DeviceKind::Storage)
+            && dev.kind().grounds() == Some(DeviceKind::Storage)
         {
             out.push(Finding {
                 code: "LINK_SINGLE_LANE".into(),
@@ -1046,7 +1046,7 @@ fn ss_half_idle_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
         if !ss_errors_on(snap, rec.fast.hub_name).is_empty() {
             continue;
         }
-        if dev.kind().asserted() != Some(DeviceKind::Storage) {
+        if dev.kind().grounds() != Some(DeviceKind::Storage) {
             continue;
         }
 
@@ -1624,7 +1624,12 @@ fn throughput_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
         };
         let link = speed.practical_bps();
 
-        let (floor, because) = match block.media_ceiling_bps() {
+        // The medium is the yardstick, and the bus almost never supplies it —
+        // USB bridges omit VPD page B1h. A user who said "that one is a
+        // spinning disk" gives the rule a real threshold instead of the
+        // "slowest plausible medium" fallback below.
+        let (medium, medium_source) = snap.medium_of(block);
+        let (floor, because) = match medium.practical_ceiling_bps() {
             Some(media) => (
                 media.min(link) * ROTATING_SHORTFALL,
                 format!(
@@ -1648,10 +1653,16 @@ fn throughput_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
             continue;
         }
 
+        // A declaration is better evidence than the bus could give and still is
+        // not a measurement, so a finding that used one cannot claim to be one.
+        let declared = Kind {
+            kind: DeviceKind::Storage,
+            source: medium_source,
+        };
         out.push(Finding {
             code: "THROUGHPUT_FAR_BELOW_LINK".into(),
             severity: Severity::Medium,
-            confidence: Confidence::Measured,
+            confidence: declared.cap(Confidence::Measured),
             subject: Subject::Device(dev.sysfs_name.clone()),
             title: format!(
                 "{} reads at {}/s on a link that allows {}/s",
@@ -1676,7 +1687,10 @@ fn throughput_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
                     bytes_per_second(achieved)
                 ),
                 format!("link negotiated {} ({})", speed.label, dev.sysfs_name),
-                format!("medium: {}", block.medium().label()),
+                match dev.declared.as_ref().filter(|_| medium_source == KindSource::User) {
+                    Some(d) => format!("medium: {} \u{2014} {}", medium.label(), d.cite()),
+                    None => format!("medium: {}", medium.label()),
+                },
             ],
             suggestion: Some(
                 "Measure the same drive again on a different cable, then on a different \
@@ -2645,6 +2659,65 @@ mod tests {
         // Attribution is by path, so the disk is no longer behind the USB
         // device and there is nothing to judge — which is the honest answer for
         // a SATA disk in a USB report.
+        assert!(!codes(&analyze(&snap)).contains(&"THROUGHPUT_FAR_BELOW_LINK"));
+    }
+
+    /// The case the whole override feature exists for.
+    ///
+    /// On a High-Speed link an unknown medium is not judgeable — the test above
+    /// asserts the silence. A user who says "that one is a spinning disk"
+    /// supplies the yardstick the bus cannot, and the rule can finally answer.
+    #[test]
+    fn a_declared_spinning_disk_gives_the_rule_a_yardstick_it_could_not_read() {
+        // 8 MB/s on a High-Speed link: silence, because a cheap flash drive and
+        // a bad cable are indistinguishable at these rates.
+        let mut snap = measured(480.0, None, 8e6);
+        assert!(!codes(&analyze(&snap)).contains(&"THROUGHPUT_FAR_BELOW_LINK"));
+
+        // The user says it is a spinning disk. 8 MB/s from a platter that
+        // should sustain ~120 MB/s is now unambiguous.
+        snap.buses[0].children[0].declared = Some(crate::overrides::Declaration {
+            id: "1234:5678".into(),
+            unit: false,
+            kind: None,
+            medium: Some(Medium::Rotating),
+            note: None,
+        });
+        let f = analyze(&snap);
+        let hit = f
+            .iter()
+            .find(|x| x.code == "THROUGHPUT_FAR_BELOW_LINK")
+            .unwrap_or_else(|| panic!("{:?}", codes(&f)));
+
+        // A declaration is better evidence than the bus could give and is still
+        // not a measurement.
+        assert_eq!(hit.confidence, Confidence::Inferred);
+        assert!(
+            hit.evidence.iter().any(|e| e.contains("declared by you")),
+            "the finding must say where the fact came from: {:?}",
+            hit.evidence
+        );
+        assert!(
+            hit.evidence.iter().any(|e| e.contains("1234:5678")),
+            "and name the label so it can be found and deleted: {:?}",
+            hit.evidence
+        );
+    }
+
+    /// The override must not be able to invent a fault where the measurement
+    /// is fine: a platter delivering platter speed is healthy.
+    #[test]
+    fn a_declared_spinning_disk_reading_at_platter_speed_is_not_accused() {
+        let mut snap = measured(480.0, None, 40e6);
+        snap.buses[0].children[0].declared = Some(crate::overrides::Declaration {
+            id: "1234:5678".into(),
+            unit: false,
+            kind: None,
+            medium: Some(Medium::Rotating),
+            note: None,
+        });
+        // The link itself only allows ~40 MB/s, so the floor is the link, not
+        // the platter, and 40 MB/s clears it.
         assert!(!codes(&analyze(&snap)).contains(&"THROUGHPUT_FAR_BELOW_LINK"));
     }
 

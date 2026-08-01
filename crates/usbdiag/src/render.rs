@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 
 use usb_probe::diag::{milliamps, volts, watts};
 use usb_probe::model::*;
-use usb_probe::kind::DeviceKind;
+use usb_probe::kind::{DeviceKind, KindSource};
 use usb_probe::usb::class_name;
 
 const WIDTH: usize = 96;
@@ -1269,8 +1269,21 @@ fn device_detail(dev: &UsbDevice) -> String {
     let mut parts = Vec::new();
     // What it is, before what it implements. The raw class codes stay below as
     // the evidence for it.
+    //
+    // A kind the user set must never look like one the device declared (§8): a
+    // stored belief they cannot see is one they cannot correct, and this is the
+    // only place a stale label would show up.
     if kind.is_known() {
-        parts.push(kind.kind.label().to_string());
+        parts.push(match dev.declared.as_ref().filter(|_| kind.source == KindSource::User) {
+            Some(d) => format!("{} (set by you, {})", kind.kind.label(), d.id),
+            None => kind.kind.label().to_string(),
+        });
+    }
+    if let Some(note) = dev.declared.as_ref().and_then(|d| d.note.as_deref()) {
+        parts.push(format!("\u{201c}{note}\u{201d}"));
+    }
+    if let Some(m) = dev.declared.as_ref().and_then(|d| d.medium) {
+        parts.push(format!("medium {} (set by you)", m.label()));
     }
     parts.push(format!("USB {}", dev.usb_version.as_deref().unwrap_or("?")));
     if let (Some(tx), Some(rx)) = (dev.tx_lanes, dev.rx_lanes) {

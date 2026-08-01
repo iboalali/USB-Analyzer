@@ -118,6 +118,8 @@ fn read_device(name: &str, link: &Path, real: &Path) -> UsbDevice {
         interfaces: read_interfaces(name, real),
         ports: read_hub_ports(name, real),
         children: Vec::new(),
+        // Filled in after the tree is read — see `apply_overrides` in lib.rs.
+        declared: None,
     }
 }
 
