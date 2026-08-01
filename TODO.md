@@ -326,7 +326,10 @@ put in front of another program.
 
 ## A GTK4 front end
 
-Concept and decisions: [`docs/01-gui-concept.md`](docs/01-gui-concept.md). Shaped after
+Concept and decisions: [`docs/01-gui-concept.md`](docs/01-gui-concept.md).
+**Read [`docs/02-prior-art.md`](docs/02-prior-art.md) first** — three tools already ship
+the cable-identity half of this, one of them a GTK4/libadwaita app. The chain should not
+be the headline; the findings should, which promotes #24 from nice-to-have to gate. Shaped after
 [TempoUI-for-Linux](https://github.com/iboalali/TempoUI-for-Linux) — same workspace split,
 same gtk4 / libadwaita / relm4 versions, same Ubuntu 24.04 baseline. v1 is a live viewer
 with no probes and no privilege.
