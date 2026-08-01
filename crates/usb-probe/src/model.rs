@@ -167,7 +167,11 @@ impl Snapshot {
         (kept, excluded)
     }
 
-    /// Block devices attached through a given USB device.
+    /// Block devices reachable through a given USB device, **including through
+    /// any hub below it**. A root hub therefore claims everything on its bus.
+    ///
+    /// For "which device is this drive actually plugged into", use
+    /// [`Snapshot::storage_devices`], which resolves that unambiguously.
     pub fn storage_on(&self, dev: &UsbDevice) -> Vec<&BlockDevice> {
         self.block_devices
             .iter()
@@ -175,13 +179,31 @@ impl Snapshot {
             .collect()
     }
 
-    /// USB devices that carry storage, paired with it.
+    /// Each USB device that carries storage, paired with the drives that are
+    /// really its own.
+    ///
+    /// Path containment alone is not enough: a drive on `5-1.1` sits under
+    /// `5-1` and under `usb5` too, so a naive mapping lists it three times and
+    /// reports the root hub's link speed for two of them. The deepest match is
+    /// the device the drive is actually attached to, and the only one whose
+    /// negotiated speed describes the drive's link.
     pub fn storage_devices(&self) -> Vec<(&UsbDevice, Vec<&BlockDevice>)> {
-        self.devices()
-            .into_iter()
-            .map(|d| (d, self.storage_on(d)))
-            .filter(|(_, b)| !b.is_empty())
-            .collect()
+        let devices = self.devices();
+        let mut owners: Vec<(&UsbDevice, Vec<&BlockDevice>)> = Vec::new();
+
+        for b in &self.block_devices {
+            let owner = devices
+                .iter()
+                .filter(|d| b.sysfs_path.starts_with(&d.sysfs_path))
+                .max_by_key(|d| d.sysfs_path.components().count());
+            let Some(owner) = owner else { continue };
+
+            match owners.iter_mut().find(|(d, _)| d.sysfs_name == owner.sysfs_name) {
+                Some((_, list)) => list.push(b),
+                None => owners.push((owner, vec![b])),
+            }
+        }
+        owners
     }
 
     /// A hash of the state a viewer would notice a change in.
@@ -1152,13 +1174,59 @@ impl BlockDevice {
         }
     }
 
-    /// Practical sustained ceiling for this medium, in bytes/sec, when known.
-    /// Spinning disks are limited by the platter, not the bus.
-    pub fn media_ceiling_bps(&self) -> Option<f64> {
+    /// Reached through a USB controller, per its canonical sysfs path
+    /// (`.../usb4/4-1/host2/...`).
+    pub fn is_usb_attached(&self) -> bool {
+        self.sysfs_path
+            .components()
+            .any(|c| c.as_os_str().to_string_lossy().starts_with("usb"))
+    }
+
+    /// What the drive is made of, as far as can honestly be told.
+    ///
+    /// `queue/rotational` comes from SCSI VPD page B1h, the Block Device
+    /// Characteristics page. USB bridges very often do not implement it — no
+    /// `vpd_pg_b1` appears in sysfs for either drive tested here — and the
+    /// kernel then defaults the flag to 1. So over USB, `rotational = 1` means
+    /// "nobody said", and a SanDisk Ultra reports it exactly like a 5400 rpm
+    /// 2.5" disk does.
+    ///
+    /// This deliberately gives up a true statement about real USB hard drives
+    /// in order to stop making a false one about every flash drive. `false` is
+    /// still trusted, because a bridge that answers at all answers correctly.
+    pub fn medium(&self) -> Medium {
         match self.rotational {
-            // ~120 MB/s is a generous figure for a 2.5" 5400 rpm drive.
-            Some(true) => Some(120e6),
-            _ => None,
+            Some(true) if self.is_usb_attached() => Medium::Unknown,
+            Some(true) => Medium::Rotating,
+            Some(false) => Medium::SolidState,
+            None => Medium::Unknown,
+        }
+    }
+
+    /// Practical sustained ceiling for this medium, in bytes/sec, when the
+    /// medium is actually known. Spinning disks are limited by the platter
+    /// rather than the bus, which is the whole reason to ask.
+    pub fn media_ceiling_bps(&self) -> Option<f64> {
+        // ~120 MB/s is a generous figure for a 2.5" 5400 rpm drive.
+        matches!(self.medium(), Medium::Rotating).then_some(120e6)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Medium {
+    Rotating,
+    SolidState,
+    /// Not determinable — the usual case for anything behind a USB bridge.
+    Unknown,
+}
+
+impl Medium {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Medium::Rotating => "spinning disk",
+            Medium::SolidState => "solid state",
+            Medium::Unknown => "medium not reported",
         }
     }
 }
@@ -1899,6 +1967,76 @@ mod tests {
         // both must terminate rather than loop.
         assert!(snap.nearest_existing_ancestor("usb6").is_none());
         assert!(snap.nearest_existing_ancestor("9-1").is_none());
+    }
+
+    fn block_at(name: &str, path: &str, rotational: Option<bool>) -> BlockDevice {
+        BlockDevice {
+            name: name.into(),
+            sysfs_path: PathBuf::from(path),
+            model: None,
+            vendor: None,
+            size_bytes: Some(62_000_000_000),
+            rotational,
+            removable: Some(true),
+            stats: None,
+            throughput: None,
+        }
+    }
+
+    /// A drive sits under every ancestor's path, so containment alone listed a
+    /// stick behind a hub three times — as its own device, as the hub's, and as
+    /// the root hub's — and printed the root hub's 10 Gbps link speed for a
+    /// drive negotiated at 480 Mbps.
+    #[test]
+    fn a_drive_belongs_to_the_device_it_is_plugged_into_only() {
+        let mut snap = ts::empty_snapshot();
+        let mut bus = ts::root_hub("usb5", 10_000.0);
+        bus.sysfs_path = PathBuf::from("/sys/devices/pci/usb5");
+        let mut hub = ts::device("5-1", " 2.10", 480.0, Some("usb5"));
+        hub.sysfs_path = PathBuf::from("/sys/devices/pci/usb5/5-1");
+        let mut stick = ts::device("5-1.1", " 2.10", 480.0, Some("5-1"));
+        stick.sysfs_path = PathBuf::from("/sys/devices/pci/usb5/5-1/5-1.1");
+        hub.children.push(stick);
+        bus.children.push(hub);
+        snap.buses.push(bus);
+        snap.block_devices.push(block_at(
+            "sdb",
+            "/sys/devices/pci/usb5/5-1/5-1.1/host2/block/sdb",
+            Some(true),
+        ));
+
+        let owned = snap.storage_devices();
+        assert_eq!(owned.len(), 1, "one drive, one owner");
+        assert_eq!(owned[0].0.sysfs_name, "5-1.1");
+        assert_eq!(owned[0].0.speed.as_ref().unwrap().mbps, 480.0);
+
+        // The broader question still has its answer, for anyone asking what is
+        // behind a hub.
+        assert_eq!(snap.storage_on(snap.device("5-1").unwrap()).len(), 1);
+        assert_eq!(snap.storage_on(snap.device("usb5").unwrap()).len(), 1);
+    }
+
+    /// `rotational` comes from SCSI VPD page B1h, which USB bridges usually do
+    /// not implement — the kernel then defaults it to 1. A SanDisk Ultra and a
+    /// Toshiba TransMemory both report 1, exactly like a real 5400 rpm disk, so
+    /// over USB the flag says nothing and must not be turned into a claim.
+    #[test]
+    fn rotational_is_not_trusted_over_usb() {
+        let usb = block_at("sda", "/sys/devices/pci/usb4/4-1/host1/block/sda", Some(true));
+        assert!(usb.is_usb_attached());
+        assert_eq!(usb.medium(), Medium::Unknown);
+        assert_eq!(usb.media_ceiling_bps(), None, "no ceiling from a guess");
+
+        // A bridge that does answer is believed, because answering wrongly is
+        // not a failure mode of that page.
+        let ssd = block_at("sdc", "/sys/devices/pci/usb4/4-2/host1/block/sdc", Some(false));
+        assert_eq!(ssd.medium(), Medium::SolidState);
+
+        // Internal SATA has no such problem.
+        let sata = block_at("sdd", "/sys/devices/pci/ata1/host3/block/sdd", Some(true));
+        assert!(!sata.is_usb_attached());
+        assert_eq!(sata.medium(), Medium::Rotating);
+        assert_eq!(sata.media_ceiling_bps(), Some(120e6));
     }
 
     /// Orphan PD objects are part of the state, so a change in them counts.

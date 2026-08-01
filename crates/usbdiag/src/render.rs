@@ -214,6 +214,20 @@ pub fn ports(out: &mut String, snap: &Snapshot, t: &Theme) {
         }
         let _ = writeln!(out);
     }
+
+    // Socket positions come from ACPI, and firmware gets them wrong. On the
+    // machine this was written against, `_PLD` puts one USB-C port on the right
+    // panel when both are on the left, and calls the right-hand USB-A
+    // receptacle a left-panel one. The *grouping* of ports into receptacles has
+    // held up against every test; only the panel names have not, and a wrong
+    // one sends someone to look at the wrong side of the laptop.
+    if snap.ports.iter().any(|p| p.physical_location.is_some()) {
+        let _ = writeln!(
+            out,
+            "  {}\n",
+            t.dim("socket positions come from ACPI _PLD — some firmware names the wrong panel")
+        );
+    }
 }
 
 /// Power Delivery objects the kernel exposed that no Type-C port refers to.
@@ -632,11 +646,7 @@ pub fn storage(out: &mut String, report: &Report, t: &Theme) {
                 t.dim(&format!(
                     "{}  {}  via {}",
                     b.size_bytes.map(bytes_human).unwrap_or_else(|| "?".into()),
-                    match b.rotational {
-                        Some(true) => "spinning disk",
-                        Some(false) => "solid state",
-                        None => "unknown media",
-                    },
+                    b.medium().label(),
                     usb.sysfs_name
                 ))
             );

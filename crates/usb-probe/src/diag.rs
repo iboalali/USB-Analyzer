@@ -1708,6 +1708,15 @@ fn billboard_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
             .iter()
             .any(|d| !d.is_internal() && d.is_connected());
         let nothing_to_drive = has_drm && !external_display;
+        // A live DisplayPort output *is* DisplayPort Alt Mode working. Some
+        // adapters present a Billboard permanently rather than only on failure
+        // — the Dell DA20 does, and kept reporting one while driving a 1440p
+        // monitor through it. Contradicting a picture on the screen is the
+        // worst thing this rule could do.
+        let dp_working = snap
+            .displays
+            .iter()
+            .any(|d| d.is_displayport() && !d.is_internal() && d.is_lit());
 
         let mut evidence = vec![
             format!("{} exposes interface class 0x11 (billboard)", dev.sysfs_name),
@@ -1718,7 +1727,13 @@ fn billboard_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
                 dev.speed.as_ref().map(|s| s.short()).unwrap_or_default()
             ),
         ];
-        if nothing_to_drive {
+        if dp_working {
+            evidence.push(
+                "a DisplayPort output is connected and being driven, so DisplayPort Alt Mode \
+                 is working despite this report"
+                    .into(),
+            );
+        } else if nothing_to_drive {
             evidence.push(
                 "no external display is connected on any output, so there may simply be \
                  nothing for it to drive"
@@ -1732,8 +1747,11 @@ fn billboard_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
 
         out.push(Finding {
             code: "BILLBOARD_ALT_MODE_FAILED".into(),
-            // Only a fault when there was something to fail at.
-            severity: if nothing_to_drive {
+            // Only a fault when there was something to fail at, and not a fault
+            // at all when the mode is demonstrably working.
+            severity: if dp_working {
+                Severity::Info
+            } else if nothing_to_drive {
                 Severity::Low
             } else {
                 Severity::Medium
@@ -1744,7 +1762,15 @@ fn billboard_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
                 "{} reports an Alternate Mode it could not enter",
                 dev.label()
             ),
-            detail: if nothing_to_drive {
+            detail: if dp_working {
+                "A USB Billboard device is meant to announce that an Alternate Mode was not \
+                 entered — but a DisplayPort output on this machine is connected and being \
+                 driven, so the mode plainly did work. Some adapters expose the Billboard \
+                 interface permanently instead of only on failure, and this appears to be \
+                 one of them. Nothing here is wrong; it is reported only so the interface \
+                 is not mistaken for a fault later."
+                    .to_string()
+            } else if nothing_to_drive {
                 "A USB Billboard device exists to announce that an Alternate Mode — \
                  DisplayPort, Thunderbolt, or a vendor mode — was not entered. Nothing is \
                  connected to any display output on this machine, so the most likely \
@@ -1764,7 +1790,9 @@ fn billboard_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
                     .to_string()
             },
             evidence,
-            suggestion: if nothing_to_drive {
+            suggestion: if dp_working {
+                None
+            } else if nothing_to_drive {
                 Some(
                     "Nothing to do unless you expected a picture. Attach a display and look \
                      again: if this is still reported with one connected, the mode genuinely \
@@ -3275,8 +3303,8 @@ mod tests {
         assert!(advice.contains("Attach a display"), "{advice}");
     }
 
-    /// With a display actually connected, the same report means the mode was
-    /// tried and failed, and the cable advice is the right advice.
+    /// With a display connected but not on DisplayPort, the report still means
+    /// the mode was tried and failed, and the cable advice is right.
     #[test]
     fn a_billboard_with_a_display_attached_is_still_a_fault() {
         let mut snap = empty_snapshot();
@@ -3294,6 +3322,43 @@ mod tests {
             .unwrap();
         assert_eq!(hit.severity, Severity::Medium);
         assert!(hit.suggestion.as_deref().unwrap().contains("cable"));
+    }
+
+    /// The Dell DA20 kept reporting a Billboard while driving a 1440p monitor
+    /// through DisplayPort Alt Mode. Some adapters expose the interface
+    /// permanently rather than only on failure, and a rule that contradicts a
+    /// picture on the screen is worse than no rule.
+    #[test]
+    fn a_billboard_cannot_outrank_a_working_displayport_output() {
+        let mut snap = empty_snapshot();
+        let mut hub = root_hub("usb5", 480.0);
+        hub.children.push(billboard_device("5-1.2", Some("usb5")));
+        snap.buses.push(hub);
+        snap.displays = vec![
+            connector("eDP-1", "connected", true),
+            connector("DP-1", "connected", true),
+        ];
+
+        let hit = analyze(&snap)
+            .into_iter()
+            .find(|x| x.code == "BILLBOARD_ALT_MODE_FAILED")
+            .unwrap();
+        assert_eq!(hit.severity, Severity::Info);
+        assert!(hit.suggestion.is_none(), "there is nothing to suggest");
+        assert!(
+            hit.evidence.iter().any(|e| e.contains("is working despite")),
+            "{:?}",
+            hit.evidence
+        );
+
+        // A connected-but-dark DisplayPort output is not proof of anything, so
+        // the benefit of the doubt does not extend to it.
+        snap.displays[1] = connector("DP-1", "connected", false);
+        let hit = analyze(&snap)
+            .into_iter()
+            .find(|x| x.code == "BILLBOARD_ALT_MODE_FAILED")
+            .unwrap();
+        assert_eq!(hit.severity, Severity::Medium);
     }
 
     #[test]
