@@ -9,7 +9,7 @@ because most of it is about what the UI must *not* do.
 
 ---
 
-## 1. Scope of v1
+## 1. Scope of v1 — **built**
 
 **Viewer only.** Device tree, detail pane, findings, and the bottleneck chain,
 updating live from udev. No probes, no privilege, no consent dialogs, no
@@ -19,13 +19,16 @@ Probes and the substitution workflow are designed for (§9) and deliberately not
 built yet: the layout and the chain widget are the parts worth proving first, and
 they carry no privilege risk while being proven.
 
+Everything below is now describing shipped code rather than a plan. Where
+building it changed a decision, the section says so.
+
 ---
 
 ## 2. Shape
 
 | | TempoUI | usb-analyzer |
 |---|---|---|
-| logic, no GTK, all tests | `crates/core` | **`crates/usb-probe`** — exists, 234 tests |
+| logic, no GTK, all tests | `crates/core` | **`crates/usb-probe`** — 231 tests |
 | thin GTK layer, no tests | `crates/ui` | **`crates/gui`** → binary `usbdiag-gui` |
 | CLI | — | `crates/usbdiag` — unchanged |
 
@@ -147,17 +150,18 @@ reveal them. Showing every hub buries the device the user came for.
 Flat, like `crates/ui/src`:
 
 ```
-main.rs      AppModel — snapshot, findings, selection, live flag
+main.rs      AppModel — report, selection, live flag, capture scheduling
 monitor.rs   Worker wrapping monitor::Monitor
 sidebar.rs   ports + device tree, severity dot per row, hub collapsing
-detail.rs    the selected subject: verdict, chain, findings
-chain.rs     the bottleneck chain — cairo DrawingArea
-findings.rs  finding rows: severity, title, detail, suggestion, confidence
+detail.rs    the selected subject: verdict, ruled out, findings, chain, silence
+chain.rs     draws a usb_probe::chain::Chain — cairo DrawingArea
+findings.rs  finding rows, and the enum → CSS vocabulary
 style.css
 ```
 
 No tests in this crate. Real logic belongs in `usb-probe`, same rule as
-`tempo-core`.
+`tempo-core` — which is why **deriving** the chain went there
+(`usb-probe/src/chain.rs`, 20 tests) and only **drawing** it stayed here. See §7.
 
 ---
 
@@ -178,6 +182,23 @@ widget.** `Subject::Cable(port)` and codes like `CABLE_CURRENT_LIMIT`,
 `PD_CONTRACT_BELOW_OFFER`, `CABLE_DATA_LIMIT` already name the culprit. A stage
 is highlighted because a finding points at it. Any diagnosis living in
 `chain.rs` would be a second rule engine, and it would drift from the first.
+
+That rule is a `code → (chain, stage)` table, and a table deserves tests — so it
+lives in `usb_probe::chain` with the stage derivation, and the GUI file is only a
+draw function. Two properties are asserted rather than remembered: a power code
+cannot mark a data stage even though both chains have a stage called *cable*, and
+an Info finding never aims the marker at anything (Info means worth knowing, and
+the "▲ the limit" marker is an accusation).
+
+**A stage with no number is the normal case.** On UCSI the cable stage is
+unknowable; `bcdUSB` names a specification rather than a rate, so a device's own
+claim usually has no figure either. Both are `None`, and `None` is drawn as a
+dashed outline — never as an empty bar, which reads as zero and is a far stronger
+claim than "not reported". The card says how many stages are dashed and why.
+
+The data chain's one genuinely measured ceiling is **path allows**: the narrowest
+negotiated hop between the device and its root hub. A USB 3 drive behind a USB 2
+hub is exactly that stage, and it names which hop.
 
 ---
 
@@ -253,3 +274,33 @@ needs looking at rather than assuming.
   [`02-prior-art.md`](02-prior-art.md) and task #25. Most devices do carry
   usable strings — but a cable e-marker never does, so this is the difference
   between naming a cable and printing its VID in hex.
+- ~~Whether a `clear` verdict with an empty `because` should look different from
+  a cited one.~~ Settled by building it: it does. An uncited clear gets a hollow
+  dot and a plain fact in the sidebar rather than its headline, because saying
+  "Nothing wrong found" about a subject no rule examined is a claim the data does
+  not support. §8's honesty rules cut in the reassuring direction too.
+
+---
+
+## 12. What building it changed
+
+Three things, each found by running the app rather than by reading the code.
+
+**An empty port advertised 4.5 W.** `TypecPort::typec_advertised_ceiling_mw()`
+reports what the CC resistors offer, which exists whether or not anything is
+plugged in — so every unused socket read *"4.5 W in"*. Power figures on a port row
+are now suppressed unless something is attached.
+
+**The transposed chain drew four rows into the height of two.**
+`GtkDrawingArea::resize` is emitted from inside `size_allocate`, and changing a
+size request there queues a resize *during* allocation, which GTK drops on the
+floor. The widget kept the height of the layout it was no longer using. Deferring
+the change to an idle callback fixes it, and the comment in `chain.rs` says why so
+nobody simplifies it back.
+
+**Sidebar reasons need two lines.** §5 said one, from the mockups. But the
+sentence is a finding's title quoted verbatim, and those are written for a list
+that names the subject separately — so they open with the device's own name and
+run past a single line. Truncating a quote is worse than spending a second line on
+it, and uneven row heights turn out to read fine: a row with more to say is
+bigger.

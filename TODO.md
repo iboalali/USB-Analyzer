@@ -329,10 +329,9 @@ put in front of another program.
 Concept and decisions: [`docs/01-gui-concept.md`](docs/01-gui-concept.md).
 **Read [`docs/02-prior-art.md`](docs/02-prior-art.md) first** — three tools already ship
 the cable-identity half of this, one of them a GTK4/libadwaita app. The chain should not
-be the headline; the findings should, which promotes #24 from nice-to-have to gate. Shaped after
-[TempoUI-for-Linux](https://github.com/iboalali/TempoUI-for-Linux) — same workspace split,
-same gtk4 / libadwaita / relm4 versions, same Ubuntu 24.04 baseline. v1 is a live viewer
-with no probes and no privilege.
+be the headline; the findings should, which promoted #24 from nice-to-have to gate. Shaped
+after [TempoUI-for-Linux](https://github.com/iboalali/TempoUI-for-Linux) — same workspace
+split, same gtk4 / libadwaita / relm4 versions, same Ubuntu 24.04 baseline.
 
 Both presentations are drawn in [`docs/mockups/`](docs/mockups/) — HTML, libadwaita
 palette, real data from this machine except one deliberately synthetic fault page.
@@ -341,7 +340,54 @@ subject row; sidebar dots carry their sentence; the chain transposes rather than
 below the breakpoint; the bars stay linear; a tray popover is a second view model, not a
 narrow window) and closed the `--desktop`-mode question: no mode.
 
-The one piece of library work it depends on is below.
+### v1 viewer — **done**
+
+`crates/gui`, binary `usbdiag-gui`. Live viewer, no probes, no privilege. Sidebar (system
+row, Type-C ports, device tree with hubs collapsed), detail pane ordered verdict → ruled
+out → findings → evidence → what cannot be answered, cairo chain widget, udev updates.
+`gtk4` 0.11 / `libadwaita` 0.9 / `relm4` 0.11, exactly TempoUI's versions.
+
+**The chain derivation went into `usb-probe`, not the GUI.** `crates/usb-probe/src/chain.rs`
+turns a port or a device into four stages with magnitudes; `crates/gui/src/chain.rs` only
+draws them. The concept doc already forbade diagnosis in the widget, and the rule it gave —
+a stage is marked because a *finding* points at it — is a `code → stage` table that deserves
+tests. It now has 20, including one asserting a power code cannot mark a data stage and one
+asserting an Info finding never aims the marker at anything.
+
+**A stage with no number is the normal case, and is drawn as a dashed outline.** On UCSI the
+cable stage is unknowable, and `bcdUSB` names a specification rather than a rate, so a
+device's own claim usually has no figure either — two of four stages on the data chain here.
+An empty bar would read as zero, which is a much stronger and quite false statement; the
+card says how many stages are dashed and why.
+
+**A verdict that cites nothing does not get to speak in the sidebar.** Rows fall back to a
+plain fact and a hollow dot. This settles the question left open under #24: `clear` with an
+empty `because` is drawn differently from a cited `clear`, because saying "Nothing wrong
+found" in green about a subject no rule examined is a claim the data does not support.
+
+Three things found only by running it:
+
+- **An empty port advertised 4.5 W.** `typec_advertised_ceiling_mw()` reports what the CC
+  resistors offer, which exists whether or not anything is plugged in — so every unused
+  socket read "4.5 W in". The meta is now suppressed unless something is attached.
+- **The transposed chain drew four rows into the height of two.** `GtkDrawingArea::resize`
+  is emitted from inside `size_allocate`, and changing a size request there queues a resize
+  during allocation, which GTK drops. Deferred to an idle callback.
+- **Sidebar reasons need two lines, not one.** They are finding titles quoted verbatim, and
+  those are written for a list that names the subject separately — so they open with the
+  device's own name and run long. Truncating the quote is worse than spending a line.
+
+Verified by screenshot in both colour schemes and at both widths (`.claude/skills/`
+`screenshot-app` and `interact-app`, ported from TempoUI). Live updates were confirmed by
+accident, which is the best way: a dock was plugged in mid-session and the sidebar grew two
+buses and a storage row without being asked.
+
+### Still out of v1
+
+Probe panel, `pkexec` escalation, and the substitution workflow — all designed for in
+[`docs/01-gui-concept.md`](docs/01-gui-concept.md) §9, none built. The substitution
+workflow is the strongest reason for the GUI to exist and deliberately comes last, since it
+depends on everything above.
 
 ### Say "not a cable problem" out loud — **done**
 
@@ -387,9 +433,11 @@ charger offers"* and its cable *"The cable is not what limits charging here"*. T
 was then unplugged mid-session and both correctly disappeared, `4-1`'s
 `LINK_AT_DEVICE_MAXIMUM` surviving unchanged.
 
-Still open: the CLI shows `clear` verdicts with an empty `because` only as a count. Whether
-a GUI should draw those differently from a cited `clear` is a real question — the data
-distinguishes them, see [`docs/01-gui-concept.md`](docs/01-gui-concept.md).
+~~Still open: the CLI shows `clear` verdicts with an empty `because` only as a count.
+Whether a GUI should draw those differently from a cited `clear` is a real question.~~
+Settled by the viewer: a `clear` with nothing to cite gets a hollow dot and a plain fact
+instead of its headline, because an uncited clean bill of health is a claim the data does
+not support.
 
 ## Unprivileged work worth doing
 

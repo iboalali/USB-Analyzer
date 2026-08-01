@@ -6,6 +6,13 @@ They exist because [`../01-gui-concept.md`](../01-gui-concept.md) makes claims
 about layout that prose cannot settle, and because it is cheaper to be wrong in
 CSS than in Relm4.
 
+**The real thing now exists** (`crates/gui`, binary `usbdiag-gui`), so these are
+history rather than a specification. They are kept because they are where the
+layout decisions were argued out, and because the fault page shows a scenario
+this machine cannot produce. Where the app diverged from them, the app is right
+and [`../01-gui-concept.md`](../01-gui-concept.md) §12 says why — the one that
+matters is that a sidebar reason takes two lines, not one.
+
 | file | what it shows |
 |---|---|
 | `standalone.html` | the wide window, **real data** captured from this machine |

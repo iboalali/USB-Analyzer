@@ -36,11 +36,14 @@ FINDINGS
 |---|---|
 | `crates/usb-probe` | Library. Reads sysfs, decodes VDOs, runs the rule engine. No I/O beyond reads; no printing. |
 | `crates/usbdiag` | CLI. Argument parsing and rendering only. |
+| `crates/gui` | GTK4 + libadwaita viewer, binary `usbdiag-gui`. Widgets only; no rules. |
 
 The split is deliberate: `usb-probe` returns a `Report` of plain serializable
-data with no borrows and no sysfs handles, so a native UI (egui, iced, GTK) can
-consume it directly and `crates/usbdiag/src/render.rs` is the only file a GUI
-replaces.
+data with no borrows and no sysfs handles, so a front end consumes it directly.
+The GUI proved that literally — it links the library, holds no logic of its own,
+and `usb-probe` gained no dependency from its existence. Its 13-crate tree is a
+stated design property that decided the shape of two probes; `gtk4`,
+`libadwaita` and `relm4` are dependencies of `crates/gui` alone.
 
 ```rust
 let report = usb_probe::report(usb_probe::Options::default());
@@ -89,6 +92,37 @@ do.
 the `side_effects` list, and runs nothing. With `--json` the interactive prompt is skipped
 entirely, since it would otherwise hang a front end on a read of a stdin nobody is typing
 into.
+
+## The window
+
+```sh
+cargo run --bin usbdiag-gui          # or ./scripts/install-local.sh
+```
+
+A read-only viewer for the same report, updating live from udev. The sidebar is
+the machine, its Type-C ports and the device tree with hubs collapsed behind
+*via N hubs*; the detail pane for whatever is selected runs **verdict → ruled out
+→ findings → evidence → what cannot be answered**, in that order and for a
+reason: the bottleneck chain is the one thing several other tools already draw,
+and the findings are what none of them has, so the chain appears last, under a
+heading saying it supports a statement above rather than being one.
+
+It needs no privileges and has none of the probes — those stay in `usbdiag
+probe`, behind the consent gate, in a process that can be given root without a
+window sitting open as root all day.
+
+The honesty rules are the same as the CLI's, drawn rather than printed:
+confidence on every finding and never collapsed into a colour; a coloured dot
+never without its sentence; a heuristic gets a visually different card, not a
+lower severity; a chain stage the platform cannot report is a dashed outline
+rather than an empty bar; and a `clear` verdict with nothing to cite reads as a
+plain fact and a hollow dot, because "nothing wrong found" about a subject no
+rule examined is a stronger claim than the data supports.
+
+The window is adaptive from the first commit — below ~500 sp the split view
+collapses to one pane and the chain transposes from four columns into four rows.
+`--width` / `--height` open it at a given size, which is how the narrow shape
+gets looked at.
 
 ## Usage
 
@@ -475,12 +509,26 @@ on*, so grading one as minor would manufacture a problem out of a note.
 ## Build
 
 ```sh
-cargo build --release        # ./target/release/usbdiag
-cargo test                   # 234 tests
+cargo build --release -p usbdiag     # ./target/release/usbdiag
+cargo test --workspace               # 253 tests
 ```
 
-No non-Rust dependencies. Dependencies are `serde` and `serde_json` only; sysfs
-is read with `std::fs`, so `libusb` is not needed.
+The CLI and the library have **no non-Rust dependencies**: `serde` and
+`serde_json` only, sysfs read with `std::fs`, no `libusb`.
+
+The GUI is the exception and is kept separate for that reason. It needs the GTK4
+and libadwaita development packages, and building the whole workspace needs them
+too:
+
+```sh
+sudo apt install libgtk-4-dev libadwaita-1-dev   # Ubuntu 24.04+
+cargo build --release                            # both binaries
+./scripts/install-local.sh                       # into ~/.local, no root
+```
+
+Flatpak is deliberately not the primary target: a sandbox cannot read
+`/sys/kernel/debug`, and a full `/sys/bus/usb` traversal needs
+`--filesystem=host` or `--device=all`, at which point the sandbox is decorative.
 
 The VDO bit-field decoders and the rule engine are unit-tested against
 hand-constructed values — a 5 A/10 Gbps cable, a 3 A/USB 2.0 cable, PD 2.0 vs
