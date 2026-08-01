@@ -331,6 +331,13 @@ Concept and decisions: [`docs/01-gui-concept.md`](docs/01-gui-concept.md). Shape
 same gtk4 / libadwaita / relm4 versions, same Ubuntu 24.04 baseline. v1 is a live viewer
 with no probes and no privilege.
 
+Both presentations are drawn in [`docs/mockups/`](docs/mockups/) — HTML, libadwaita
+palette, real data from this machine except one deliberately synthetic fault page.
+Drawing them settled five things prose had left open (host findings need their own
+subject row; sidebar dots carry their sentence; the chain transposes rather than shrinks
+below the breakpoint; the bars stay linear; a tray popover is a second view model, not a
+narrow window) and closed the `--desktop`-mode question: no mode.
+
 The one piece of library work it depends on is below.
 
 ### Say "not a cable problem" out loud

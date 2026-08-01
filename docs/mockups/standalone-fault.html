@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>usbdiag — standalone window, something is wrong</title>
+<link rel="stylesheet" href="mockup.css">
+<script>
+  // #dark / #scroll / #dark-scroll — these mockups are screenshotted headless
+  const h = location.hash;
+  if (h.includes("dark")) document.documentElement.className = "dark";
+  addEventListener("DOMContentLoaded", () => {
+    if (h.includes("scroll")) {
+      const p = document.querySelector(".content .pad");
+      if (p) p.style.marginTop = "-628px";
+    }
+  });
+</script>
+</head>
+<body>
+
+<div class="synthetic">illustrative scenario · synthetic data, not a capture</div>
+
+<div class="window">
+
+  <!-- ══════════ sidebar ══════════ -->
+  <aside class="sidebar">
+    <div class="headerbar">
+      <div class="btn">☰</div>
+      <div class="titlebox start">
+        <div class="title">usbdiag</div>
+        <div class="subtitle">LENOVO 21QRCTO1WW</div>
+      </div>
+      <div class="btn">⌕</div>
+    </div>
+
+    <div class="scroll">
+
+      <div class="group">
+        <div class="group-hd"><h3>System</h3></div>
+        <div class="row">
+          <span class="dot ok"></span>
+          <div class="body">
+            <div class="line1">
+              <span class="name">This machine</span>
+              <span class="meta">kernel 6.17.0</span>
+            </div>
+            <div class="why">no host-level faults this boot</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="group">
+        <div class="group-hd"><h3>USB-C ports</h3></div>
+        <div class="row sel">
+          <span class="dot high"></span>
+          <div class="body">
+            <div class="line1">
+              <span class="name">port0 <span class="meta">left panel</span></span>
+              <span class="meta">60 W in</span>
+            </div>
+            <div class="why high">cable caps a 100 W charger at 60 W</div>
+          </div>
+        </div>
+        <div class="row">
+          <span class="dot info"></span>
+          <div class="body">
+            <div class="line1">
+              <span class="name">port1 <span class="meta">right panel</span></span>
+              <span class="meta">empty</span>
+            </div>
+            <div class="why">nothing attached</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="group">
+        <div class="group-hd"><h3>Devices</h3><a>show hubs ⌄</a></div>
+
+        <div class="bus"><span class="mono">usb3</span><span>480M</span><span class="r">xhci-hcd</span></div>
+        <div class="row">
+          <span class="dot medium"></span>
+          <div class="body">
+            <div class="line1">
+              <span class="name">SanDisk Ultra USB 3.0</span>
+              <span class="meta">480M</span>
+            </div>
+            <div class="why">a 5 G device running at 480 M</div>
+          </div>
+        </div>
+        <div class="row">
+          <span class="dot low"></span>
+          <div class="body">
+            <div class="line1">
+              <span class="name">Goodix USB2.0 MISC</span>
+              <span class="meta">12M</span>
+            </div>
+            <div class="why">reset 35× — runtime power management</div>
+          </div>
+        </div>
+
+        <div class="bus"><span class="mono">usb4</span><span>10G</span><span class="r">xhci-hcd</span></div>
+        <div class="row">
+          <span class="dot high"></span>
+          <div class="body">
+            <div class="line1">
+              <span class="name">4-1 <span class="meta">port 1</span></span>
+              <span class="meta">gone</span>
+            </div>
+            <div class="why high">over-current, 12 s ago</div>
+          </div>
+        </div>
+
+        <div class="bus"><span class="mono">usb5</span><span>480M</span><span class="r">xhci-hcd</span></div>
+        <div class="row">
+          <span class="dot ok"></span>
+          <div class="body">
+            <div class="line1">
+              <span class="name">TOSHIBA TransMemory</span>
+              <span class="meta">480M</span>
+            </div>
+            <div class="why">via 1 hub</div>
+          </div>
+        </div>
+
+        <div class="row">
+          <span class="dot info"></span>
+          <div class="body">
+            <div class="line1">
+              <span class="name">Dell DA20 Adapter</span>
+              <span class="meta">12M</span>
+            </div>
+            <div class="why">via 1 hub</div>
+          </div>
+        </div>
+
+        <div class="bus"><span class="mono">usb6</span><span>10G</span><span class="r">xhci-hcd</span></div>
+        <div class="row">
+          <span class="dot info"></span>
+          <div class="body">
+            <div class="line1">
+              <span class="name">VIA USB3.0 Hub</span>
+              <span class="meta">5G</span>
+            </div>
+            <div class="why">nothing attached</div>
+          </div>
+        </div>
+
+        <div class="footnote">3 controllers with nothing attached</div>
+      </div>
+
+    </div>
+  </aside>
+
+  <!-- ══════════ content ══════════ -->
+  <main class="content">
+    <div class="headerbar">
+      <div class="titlebox start">
+        <div class="title">port0</div>
+        <div class="subtitle">left panel · sink · 20 V at 3 A</div>
+      </div>
+      <span class="live"><b></b>live</span>
+      <div class="btn flat-bg">⟳</div>
+      <div class="btn">⋮</div>
+      <div class="wctl"><i>–</i><i>□</i><i>✕</i></div>
+    </div>
+
+    <div class="banner">
+      <span>usb 4-1: over-current condition, 12 s ago — the device dropped off the bus</span>
+      <span style="flex:1"></span>
+      <span class="btn">Show</span>
+    </div>
+
+    <div class="scroll">
+      <div class="pad">
+
+        <div class="verdict bad">
+          <div class="glyph">!</div>
+          <div>
+            <h1>The cable is what is limiting charging</h1>
+            <p>The charger offers 100 W and this machine accepts 100 W, but the
+              cable is e-marked for 3 A, so the contract settled at 60 W. A 5 A
+              e-marked cable would lift it.</p>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Power · charger → cable → contract → this machine</h2>
+          <div class="chain">
+            <div class="stage">
+              <div class="cap">charger offers</div>
+              <div class="bar"><span style="width:100%"></span></div>
+              <div class="val">100 W</div>
+              <div class="sub">20 V @ 5 A available</div>
+            </div>
+            <div class="arrow">→</div>
+            <div class="stage limit">
+              <div class="cap">cable carries</div>
+              <div class="bar"><span style="width:60%"></span></div>
+              <div class="val">3 A</div>
+              <div class="sub">e-marker read · 60 W at 20 V</div>
+              <span class="mark">▲ the limit</span>
+            </div>
+            <div class="arrow">→</div>
+            <div class="stage">
+              <div class="cap">contract</div>
+              <div class="bar"><span style="width:60%"></span></div>
+              <div class="val">60 W</div>
+              <div class="sub">20 V at 3 A · PD 3.0</div>
+            </div>
+            <div class="arrow">→</div>
+            <div class="stage">
+              <div class="cap">this machine accepts</div>
+              <div class="bar"><span style="width:100%"></span></div>
+              <div class="val">100 W</div>
+              <div class="sub">9 V–20 V @ 5 A</div>
+            </div>
+          </div>
+          <div class="chain-note">
+            Only one stage is narrow. Everything either side of it has room.
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Data · device → cable → port → link</h2>
+          <div class="chain">
+            <div class="stage">
+              <div class="cap">device can do</div>
+              <div class="bar"><span style="width:50%"></span></div>
+              <div class="val">5 Gbps</div>
+              <div class="sub">SanDisk Ultra USB 3.0</div>
+            </div>
+            <div class="arrow">→</div>
+            <div class="stage limit">
+              <div class="cap">cable carries</div>
+              <div class="bar"><span style="width:5%"></span></div>
+              <div class="val">480 Mbps</div>
+              <div class="sub">e-marker: USB 2.0 only</div>
+              <span class="mark">▲ the limit</span>
+            </div>
+            <div class="arrow">→</div>
+            <div class="stage">
+              <div class="cap">port can do</div>
+              <div class="bar"><span style="width:100%"></span></div>
+              <div class="val">10 Gbps</div>
+              <div class="sub">usb3 · 3.10</div>
+            </div>
+            <div class="arrow">→</div>
+            <div class="stage">
+              <div class="cap">link reached</div>
+              <div class="bar"><span style="width:5%"></span></div>
+              <div class="val">480 Mbps</div>
+              <div class="sub">enumerated on the USB 2 half</div>
+            </div>
+          </div>
+          <div class="chain-note">
+            The same cable is narrow in both chains — one charging cable, doing
+            both jobs badly.
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Findings for this port</h2>
+
+          <div class="finding">
+            <span class="dot high"></span>
+            <div>
+              <h4>Cable is rated for 3 A, charger offers 5 A
+                <span class="chip measured">measured</span></h4>
+              <p>The cable's e-marker reports a 3 A current rating. At the
+                negotiated 20 V that caps the contract at 60 W, 40 W below what
+                the charger can deliver.</p>
+              <div class="fix">→ Try a 5 A e-marked cable and watch this figure</div>
+              <div class="evidence mono">port0/cable: current-capability = 3A
+port0/usb_power_delivery/source-capabilities: 20V @ 5A (100 W)</div>
+            </div>
+          </div>
+
+          <div class="finding">
+            <span class="dot medium"></span>
+            <div>
+              <h4>Contract settled below the offer
+                <span class="chip measured">measured</span></h4>
+              <p>60 W agreed against a 100 W offer. Explained entirely by the
+                cable above — reported separately because the two can also come
+                apart.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="card suspicion">
+          <h2>Suspicion — not established</h2>
+          <div class="finding">
+            <span class="dot medium"></span>
+            <div>
+              <h4>A 5 Gbps device enumerated on the USB 2 half
+                <span class="chip heuristic">heuristic</span></h4>
+              <p>The SuperSpeed side of this port has a companion port that is
+                populated while the SuperSpeed half sits idle. That pattern
+                usually means the cable has no SuperSpeed pairs — but a device
+                that simply chose USB 2 looks identical from here.</p>
+              <div class="fix">→ Swap the cable, keep the device, compare</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card silent">
+          <h2>What cannot be answered here</h2>
+          <p>Whether the drive itself is slow is not decidable without reading
+            from it. The link rate above is what was negotiated, not what the
+            device achieves — a 5 Gbps link and a cheap flash chip look the
+            same until something measures the transfer.</p>
+        </div>
+
+      </div>
+    </div>
+  </main>
+
+</div>
+</body>
+</html>

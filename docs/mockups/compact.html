@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>usbdiag — compact presentation</title>
+<link rel="stylesheet" href="mockup.css">
+<style>
+  body.compare { flex-direction: column; align-items: stretch; gap: 0; }
+  .pair { display: flex; gap: 46px; justify-content: center; align-items: flex-start; }
+
+  /* below the breakpoint the chain turns on its side */
+  .vchain .vs { display: flex; align-items: center; gap: 10px; padding: 3px 0; }
+  .vchain .vs .cap { width: 96px; font-size: 11.5px; color: var(--dim); flex: none; }
+  .vchain .vs .bar { flex: 1; height: 8px; border-radius: 4px; background: var(--track); overflow: hidden; }
+  .vchain .vs .bar span { display: block; height: 100%; border-radius: 4px; background: var(--success-bg); }
+  .vchain .vs .val { width: 62px; text-align: right; font-size: 12px; font-weight: 600; flex: none; }
+  .vchain .vs.limit .bar span { background: var(--caution-bg); }
+  .vchain .vs.limit .val { color: var(--caution); }
+</style>
+<script>
+  // #dark / #scroll / #dark-scroll — these mockups are screenshotted headless
+  const h = location.hash;
+  if (h.includes("dark")) document.documentElement.className = "dark";
+  addEventListener("DOMContentLoaded", () => {
+    if (h.includes("scroll")) {
+      const p = document.querySelector(".content .pad");
+      if (p) p.style.marginTop = "-628px";
+    }
+  });
+</script>
+</head>
+<body class="compare">
+
+<div class="shell">
+  <div class="left"><span>Activities</span></div>
+  <span>1 Aug&nbsp; 14:22</span>
+  <div class="right">
+    <span class="indicator"><i></i>usbdiag</span>
+    <span>🔊 ⏻</span>
+  </div>
+</div>
+
+<div class="pair">
+
+  <!-- ══════════ the same app, narrow ══════════ -->
+  <div class="column">
+    <div class="narrow">
+
+      <div class="headerbar">
+        <span class="btn">←</span>
+        <div class="titlebox start">
+          <div class="title">port0</div>
+          <div class="subtitle">left panel · sink</div>
+        </div>
+        <span class="live"><b></b>live</span>
+        <span class="btn">⋮</span>
+      </div>
+
+      <div class="scroll" style="padding:0">
+        <div style="padding:14px">
+
+          <div class="cverdict good" style="padding:0 0 14px">
+            <div class="glyph">✓</div>
+            <div>
+              <h1>Nothing here limits power</h1>
+              <p>100 W offered, 100 W drawn. No cable to swap.</p>
+            </div>
+          </div>
+
+          <div class="card" style="padding:13px 14px">
+            <h2>Power</h2>
+            <div class="vchain">
+              <div class="vs">
+                <span class="cap">charger</span>
+                <span class="bar"><span style="width:100%"></span></span>
+                <span class="val">100 W</span>
+              </div>
+              <div class="vs">
+                <span class="cap">cable</span>
+                <span class="bar"><span style="width:100%"></span></span>
+                <span class="val">5 A</span>
+              </div>
+              <div class="vs">
+                <span class="cap">contract</span>
+                <span class="bar"><span style="width:100%"></span></span>
+                <span class="val">100 W</span>
+              </div>
+              <div class="vs">
+                <span class="cap">this machine</span>
+                <span class="bar"><span style="width:100%"></span></span>
+                <span class="val">100 W</span>
+              </div>
+            </div>
+            <div class="chain-note" style="margin-top:11px;padding-top:10px">
+              Every stage is wide enough for the one before it.
+            </div>
+          </div>
+
+          <div class="card" style="padding:13px 14px">
+            <h2>Findings</h2>
+            <div class="finding">
+              <span class="dot info"></span>
+              <div>
+                <h4 style="font-size:13.5px">Cable is 5 A rated
+                  <span class="chip inferred">inferred</span></h4>
+                <p style="font-size:12.5px">No e-marker was reported, but a 3 A
+                  cable could not hold this contract.</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="card silent" style="padding:13px 14px">
+            <h2>Not answerable</h2>
+            <p style="font-size:12px">UCSI does not expose the cable's identity
+              VDO. The rating above is deduced, not read.</p>
+          </div>
+
+        </div>
+      </div>
+
+    </div>
+    <div class="caption">
+      <b>Narrow window · below the breakpoint</b>
+      The same widgets as the wide window, with the split view collapsed to one
+      pane and the chain turned on its side. This is the only compact shape
+      GNOME actually needs.
+    </div>
+  </div>
+
+  <!-- ══════════ tray popover ══════════ -->
+  <div class="column">
+    <div class="popover">
+
+      <div class="chd">
+        <span class="title">usbdiag</span>
+        <span class="live"><b></b>live</span>
+        <span class="btn">⟳</span>
+      </div>
+
+      <div class="cverdict">
+        <div class="glyph">!</div>
+        <div>
+          <h1>Not a cable problem</h1>
+          <p>Both cables and every link are behaving. A host controller has
+            died 3 times this boot — that is a firmware or suspend fault.</p>
+        </div>
+      </div>
+
+      <div class="csection">
+        <h3>port0 · charging</h3>
+        <div class="slim">
+          <div class="s">
+            <div class="cap">charger</div>
+            <div class="bar"><span style="width:100%"></span></div>
+            <div class="val">100 W</div>
+          </div>
+          <div class="s">
+            <div class="cap">cable</div>
+            <div class="bar"><span style="width:100%"></span></div>
+            <div class="val">5 A</div>
+          </div>
+          <div class="s">
+            <div class="cap">contract</div>
+            <div class="bar"><span style="width:100%"></span></div>
+            <div class="val">100 W</div>
+          </div>
+          <div class="s">
+            <div class="cap">this machine</div>
+            <div class="bar"><span style="width:100%"></span></div>
+            <div class="val">100 W</div>
+          </div>
+        </div>
+        <div class="chain-note" style="margin-top:9px;padding-top:9px">
+          Nothing narrows. Battery 97 %, 0 W — charge finished.
+        </div>
+      </div>
+
+      <div class="csection">
+        <h3>Attached</h3>
+        <div class="crow">
+          <span class="dot ok"></span>
+          <div class="body">
+            <div class="line1"><span class="name">SanDisk Ultra USB 3.0</span><span class="meta">5G · usb4</span></div>
+          </div>
+        </div>
+        <div class="crow">
+          <span class="dot ok"></span>
+          <div class="body">
+            <div class="line1"><span class="name">TOSHIBA TransMemory</span><span class="meta">480M · usb5</span></div>
+          </div>
+        </div>
+        <div class="crow">
+          <span class="dot info"></span>
+          <div class="body">
+            <div class="line1"><span class="name">Dell DA20 Adapter</span><span class="meta">12M · usb5</span></div>
+            <div class="why">billboard names an alt mode it did enter</div>
+          </div>
+        </div>
+        <div class="crow">
+          <span class="dot low"></span>
+          <div class="body">
+            <div class="line1"><span class="name">Goodix USB2.0 MISC</span><span class="meta">12M · usb3</span></div>
+            <div class="why">reset 35× — runtime power management</div>
+          </div>
+        </div>
+        <div class="crow">
+          <span class="dot info"></span>
+          <div class="body">
+            <div class="line1"><span class="name">2 more</span><span class="meta">behind hubs</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="cfoot">
+        <span class="btn flat-bg">Open window</span>
+        <span class="grow"></span>
+        <span class="btn">⚙</span>
+        <span class="btn">⋮</span>
+      </div>
+
+    </div>
+    <div class="caption">
+      <b>Tray popover</b>
+      Summary first: one verdict, the charging chain, the attached list.
+      No tree, no detail pane. GNOME has no menu bar, so this shape only
+      ships where a tray host exists.
+    </div>
+  </div>
+
+</div>
+</body>
+</html>

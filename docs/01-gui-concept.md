@@ -104,6 +104,25 @@ means rewriting every container.
 GNOME has no menu-bar equivalent worth targeting, so there is no tray mode. The
 compact presentation is just a narrow window.
 
+Both shapes are drawn in [`mockups/`](mockups/) — HTML, real data from this
+machine except where a badge says otherwise. Five things the ASCII sketch below
+could not settle, and the drawings did:
+
+- **Host findings need a subject row.** `Subject::Host` had nowhere to live in a
+  sidebar organised by port and device. It becomes *System · This machine*, at
+  the top, and on this laptop it is the only red row.
+- **Sidebar dots carry their sentence.** §8 forbids a coloured dot without text.
+  A tree of bare dots breaks that rule while looking perfectly normal, so every
+  row gets a one-line reason under the name.
+- **The chain transposes below the breakpoint** rather than shrinking — four
+  labelled rows instead of four columns. Same widget, same data, rotated.
+- **The bars stay linear.** 480 Mbps beside 10 Gbps is a 5 % sliver that reads
+  as a rendering bug. It is not one; a log scale would flatter a USB 2 fallback.
+- **A tray popover is a second information architecture**, not a narrow window:
+  verdict first, no tree, no detail pane. That is a second view model to build
+  and keep true. Ship the narrow window; take the popover only where a tray host
+  exists and someone asks for it.
+
 ```
 ┌ usbdiag ──────────────────────────────────────────── ⟳  ● live ─┐
 │ ┌─────────────────┐│  port0 · left panel                        │
@@ -227,9 +246,11 @@ needs looking at rather than assuming.
 
 ## 11. Open questions
 
-- Whether `usbdiag-gui` should offer a `--desktop`-style compact mode explicitly,
-  or simply let the window be resized into the narrow breakpoint. Leaning to the
-  latter: fewer modes, same result.
+- ~~Whether `usbdiag-gui` should offer a `--desktop`-style compact mode
+  explicitly, or simply let the window be resized into the narrow breakpoint.~~
+  Settled by the mockups: no mode. The narrow window is the same widget tree
+  under a breakpoint, and it costs nothing. A tray popover would be a genuinely
+  different view — that is the thing to say no to, not the narrow width.
 - Whether to bundle `usb.ids` for vendor names where a device exposes no strings.
   WhatCable bundles a merged USB-IF/`usb.ids` database; here it would be the
   first data file in the project, and most devices already carry usable strings.

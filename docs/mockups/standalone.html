@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>usbdiag — standalone window</title>
+<link rel="stylesheet" href="mockup.css">
+<script>
+  // #dark / #scroll / #dark-scroll — these mockups are screenshotted headless
+  const h = location.hash;
+  if (h.includes("dark")) document.documentElement.className = "dark";
+  addEventListener("DOMContentLoaded", () => {
+    if (h.includes("scroll")) {
+      const p = document.querySelector(".content .pad");
+      if (p) p.style.marginTop = "-628px";
+    }
+  });
+</script>
+</head>
+<body>
+
+<div class="window">
+
+  <!-- ══════════ sidebar ══════════ -->
+  <aside class="sidebar">
+    <div class="headerbar">
+      <div class="btn">☰</div>
+      <div class="titlebox start">
+        <div class="title">usbdiag</div>
+        <div class="subtitle">LENOVO 21QRCTO1WW</div>
+      </div>
+      <div class="btn">⌕</div>
+    </div>
+
+    <div class="scroll">
+
+      <div class="group">
+        <div class="group-hd"><h3>System</h3></div>
+        <div class="row">
+          <span class="dot high"></span>
+          <div class="body">
+            <div class="line1">
+              <span class="name">This machine</span>
+              <span class="meta">kernel 6.17.0</span>
+            </div>
+            <div class="why high">xHCI controller failed 3× this boot</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="group">
+        <div class="group-hd"><h3>USB-C ports</h3></div>
+        <div class="row sel">
+          <span class="dot info"></span>
+          <div class="body">
+            <div class="line1">
+              <span class="name">port0 <span class="meta">left panel</span></span>
+              <span class="meta">100 W in</span>
+            </div>
+            <div class="why">charging at the full offer</div>
+          </div>
+        </div>
+        <div class="row">
+          <span class="dot info"></span>
+          <div class="body">
+            <div class="line1">
+              <span class="name">port1 <span class="meta">right panel</span></span>
+              <span class="meta">15 W out</span>
+            </div>
+            <div class="why">partner does not speak PD</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="group">
+        <div class="group-hd"><h3>Devices</h3><a>show hubs ⌄</a></div>
+
+        <div class="bus"><span class="mono">usb3</span><span>480M</span><span class="r">xhci-hcd</span></div>
+        <div class="row">
+          <span class="dot low"></span>
+          <div class="body">
+            <div class="line1">
+              <span class="name">Goodix USB2.0 MISC</span>
+              <span class="meta">12M</span>
+            </div>
+            <div class="why">reset 35× — runtime power management</div>
+          </div>
+        </div>
+        <div class="row">
+          <span class="dot ok"></span>
+          <div class="body">
+            <div class="line1">
+              <span class="name">MediaTek Wireless_Device</span>
+              <span class="meta">480M</span>
+            </div>
+            <div class="why">via 1 hub</div>
+          </div>
+        </div>
+        <div class="row">
+          <span class="dot ok"></span>
+          <div class="body">
+            <div class="line1">
+              <span class="name">EMV Smartcard Reader</span>
+              <span class="meta">12M</span>
+            </div>
+            <div class="why">via 1 hub</div>
+          </div>
+        </div>
+
+        <div class="bus"><span class="mono">usb4</span><span>10G</span><span class="r">xhci-hcd</span></div>
+        <div class="row">
+          <span class="dot ok"></span>
+          <div class="body">
+            <div class="line1">
+              <span class="name">SanDisk Ultra USB 3.0</span>
+              <span class="meta">5G</span>
+            </div>
+            <div class="why">mounted at /media/iboalali/UNRAID</div>
+          </div>
+        </div>
+
+        <div class="bus"><span class="mono">usb5</span><span>480M</span><span class="r">xhci-hcd</span></div>
+        <div class="row">
+          <span class="dot ok"></span>
+          <div class="body">
+            <div class="line1">
+              <span class="name">TOSHIBA TransMemory</span>
+              <span class="meta">480M</span>
+            </div>
+            <div class="why">via 1 hub</div>
+          </div>
+        </div>
+        <div class="row">
+          <span class="dot info"></span>
+          <div class="body">
+            <div class="line1">
+              <span class="name">Dell DA20 Adapter</span>
+              <span class="meta">12M</span>
+            </div>
+            <div class="why">billboard names an alt mode it did enter</div>
+          </div>
+        </div>
+
+        <div class="bus"><span class="mono">usb6</span><span>10G</span><span class="r">xhci-hcd</span></div>
+        <div class="row">
+          <span class="dot info"></span>
+          <div class="body">
+            <div class="line1">
+              <span class="name">VIA USB3.0 Hub</span>
+              <span class="meta">5G</span>
+            </div>
+            <div class="why">nothing attached</div>
+          </div>
+        </div>
+
+        <div class="footnote">4 controllers with nothing attached</div>
+      </div>
+
+    </div>
+  </aside>
+
+  <!-- ══════════ content ══════════ -->
+  <main class="content">
+    <div class="headerbar">
+      <div class="titlebox start">
+        <div class="title">port0</div>
+        <div class="subtitle">left panel · sink · 20 V at 5 A</div>
+      </div>
+      <span class="live"><b></b>live</span>
+      <div class="btn flat-bg">⟳</div>
+      <div class="btn">⋮</div>
+      <div class="wctl"><i>–</i><i>□</i><i>✕</i></div>
+    </div>
+
+    <div class="scroll">
+      <div class="pad">
+
+        <div class="verdict">
+          <div class="glyph">✓</div>
+          <div>
+            <h1>Nothing on this port is holding power back</h1>
+            <p>The charger offers 100 W and all 100 W are being drawn. No stage
+              between the two is narrower than the others, so there is no cable
+              to swap here.</p>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Power · charger → cable → contract → this machine</h2>
+          <div class="chain">
+            <div class="stage">
+              <div class="cap">charger offers</div>
+              <div class="bar"><span style="width:100%"></span></div>
+              <div class="val">100 W</div>
+              <div class="sub">20 V @ 5 A · 5 fixed, 1 PPS</div>
+            </div>
+            <div class="arrow">→</div>
+            <div class="stage">
+              <div class="cap">cable carries</div>
+              <div class="bar"><span style="width:100%"></span></div>
+              <div class="val">5 A</div>
+              <div class="sub">inferred — no e-marker read</div>
+            </div>
+            <div class="arrow">→</div>
+            <div class="stage">
+              <div class="cap">contract</div>
+              <div class="bar"><span style="width:100%"></span></div>
+              <div class="val">100 W</div>
+              <div class="sub">20 V at 5 A · PD 2.0</div>
+            </div>
+            <div class="arrow">→</div>
+            <div class="stage">
+              <div class="cap">this machine accepts</div>
+              <div class="bar"><span style="width:100%"></span></div>
+              <div class="val">100 W</div>
+              <div class="sub">9 V–20 V @ 5 A</div>
+            </div>
+          </div>
+          <div class="chain-note">
+            Every stage is wide enough for the one before it. Battery at 97 %,
+            0 W flowing — the charge is simply finished.
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Alternate modes the port advertises</h2>
+          <div class="altchips">
+            <span class="altchip">Lenovo · 17ef:1</span>
+            <span class="altchip">Thunderbolt 3 · 8087:1</span>
+            <span class="altchip">DisplayPort · ff01:1</span>
+          </div>
+          <div class="chain-note">
+            DisplayPort is claimed and DP-1 is being driven — LG ULTRAGEAR at
+            2560×1440 @ 120 Hz — so the claim checks out against a real output.
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Findings for this port</h2>
+          <div class="finding">
+            <span class="dot info"></span>
+            <div>
+              <h4>Cable is 5 A rated <span class="chip inferred">inferred</span></h4>
+              <p>The controller never reported an e-marker, but the port is
+                holding a 5 A contract, and a 3 A cable could not. Nothing to do.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="card silent">
+          <h2>What cannot be answered here</h2>
+          <p>This platform speaks UCSI, which does not expose the cable's
+            identity VDO. The 5 A above is deduced from the contract, not read
+            off the cable — so a cable rated higher than 5 A is indistinguishable
+            from one rated at exactly 5 A.</p>
+        </div>
+
+      </div>
+    </div>
+  </main>
+
+</div>
+</body>
+</html>
