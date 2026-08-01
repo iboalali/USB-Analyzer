@@ -45,6 +45,9 @@ struct Args {
     cycles: usize,
     consented: bool,
     forced: bool,
+    /// Decide, print the decision, and stop. The step a front end takes before
+    /// putting a confirmation in front of anyone.
+    dry_run: bool,
 }
 
 impl Default for Args {
@@ -63,6 +66,7 @@ impl Default for Args {
             cycles: usb_probe::probe::DEFAULT_CYCLES,
             consented: false,
             forced: false,
+            dry_run: false,
         }
     }
 }
@@ -207,7 +211,13 @@ fn probe(args: &Args, opts: Options) -> ExitCode {
     // No probe named: show the catalogue. Listing is not running.
     let Some(name) = args.probe.as_deref() else {
         if args.json {
-            print!("{}", json_of(&snapshot.capabilities));
+            print!(
+                "{}",
+                json_of(&serde_json::json!({
+                    "capabilities": &snapshot.capabilities,
+                    "probes": usb_probe::probe::catalogue(&snapshot.capabilities),
+                }))
+            );
         } else {
             let mut out = String::new();
             render::probes(&mut out, &snapshot, &theme);
@@ -227,21 +237,55 @@ fn probe(args: &Args, opts: Options) -> ExitCode {
         accepts_disruption: args.forced,
     };
 
-    let plan = match usb_probe::probe::plan(&caps, &snapshot, &request) {
+    let decision = usb_probe::probe::plan(&caps, &snapshot, &request);
+
+    // A machine is never prompted: it gets the refusal, decides for itself, and
+    // asks again with the answer. Prompting would hang a front end on a read of
+    // a stdin nobody is typing into.
+    let decision = match decision {
+        Err(refusal) if !args.json => {
+            match confirm_interactively(&refusal, &caps, &snapshot, &request) {
+                Some(plan) => Ok(plan),
+                None => Err(refusal),
+            }
+        }
+        other => other,
+    };
+
+    let plan = match decision {
         Ok(p) => p,
-        Err(refusal) => match confirm_interactively(&refusal, &caps, &snapshot, &request) {
-            Some(p) => p,
-            None => {
+        Err(refusal) => {
+            if args.json {
+                // On stdout, because it is the answer to the question that was
+                // asked — not a diagnostic about this process.
+                print!("{}", json_of(&refusal.report()));
+                let _ = std::io::stdout().flush();
+            } else {
                 eprintln!("usbdiag: {}", refusal.message());
                 if let Some(hint) = flag_for(&refusal) {
                     eprintln!("         {hint}");
                 }
-                return ExitCode::from(2);
             }
-        },
+            return ExitCode::from(2);
+        }
     };
 
-    println!("{}", plan.describe());
+    // Deciding is not doing. This is the call a front end makes to find out
+    // what it would be asking someone to agree to.
+    if args.dry_run {
+        if args.json {
+            print!("{}", json_of(&plan));
+        } else {
+            println!("{}", plan.describe());
+            println!("(--dry-run: nothing was run)");
+        }
+        let _ = std::io::stdout().flush();
+        return ExitCode::SUCCESS;
+    }
+
+    if !args.json {
+        println!("{}", plan.describe());
+    }
 
     let report = usb_probe::probe::run(&plan, opts);
     let scoped = plan.target.as_ref().map(|t| t.sysfs_name.clone());
@@ -526,6 +570,7 @@ fn parse(argv: &[String]) -> Result<Option<Args>, String> {
             }
             "-y" | "--yes" => args.consented = true,
             "--force" => args.forced = true,
+            "--dry-run" => args.dry_run = true,
             _ if a.starts_with('-') => return Err(format!("unknown option: {a}")),
             _ => {
                 // The word after `probe` is the probe's name, not a command.
@@ -559,8 +604,8 @@ fn parse(argv: &[String]) -> Result<Option<Args>, String> {
 
     // Consent that cannot reach a probe is a typo worth reporting, not a
     // no-op to shrug at: `usbdiag all --force` should not look like it worked.
-    if args.command != Command::Probe && (args.consented || args.forced) {
-        return Err("--yes and --force only mean anything for 'probe'".into());
+    if args.command != Command::Probe && (args.consented || args.forced || args.dry_run) {
+        return Err("--yes, --force and --dry-run only mean anything for 'probe'".into());
     }
     Ok(Some(args))
 }
@@ -606,6 +651,9 @@ PROBE OPTIONS
     -y, --yes           Consent to a disruptive probe
         --force         Accept the interruption without being asked. Needed
                         only when there is no terminal to ask on
+        --dry-run       Decide and print the decision, then stop. With --json
+                        this is how a front end finds out what a probe would
+                        do, and what it would interrupt, before asking anyone
 
 EXIT STATUS
     0   nothing actionable found
@@ -720,7 +768,20 @@ mod tests {
         assert!(p(&["all", "--force"]).is_err());
         assert!(p(&["diag", "--yes"]).is_err());
         assert!(p(&["watch", "-y"]).is_err());
+        assert!(p(&["all", "--dry-run"]).is_err());
         assert!(p(&["probe", "urb-errors", "--yes"]).is_ok());
+        assert!(p(&["probe", "reenumerate", "--dry-run"]).is_ok());
+    }
+
+    /// Deciding and doing are separate requests, so a front end can put the
+    /// decision in front of someone before anything happens.
+    #[test]
+    fn dry_run_is_off_unless_asked_for() {
+        assert!(!p(&["probe", "throughput"]).unwrap().unwrap().dry_run);
+        let a = p(&["probe", "throughput", "--dry-run", "--json"])
+            .unwrap()
+            .unwrap();
+        assert!(a.dry_run && a.json);
     }
 
     #[test]

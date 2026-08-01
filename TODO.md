@@ -282,6 +282,47 @@ Keeping the existing honesty about what software can and cannot know:
 
 ---
 
+## The JSON surface is an API, not a print format — **done**
+
+Two kinds of front end were considered, and they were in different states. One that
+**links the library** was always fine: every decision lives in `usb-probe`, so
+`probe::plan` hands back either a `Plan` or a `Refusal`, `Refusal::is_recoverable()` says
+whether to show a confirmation or an error, and the mounted-disk and keyboard refusals
+cannot be skipped by a caller who forgets to check, because the check is inside the gate.
+`render.rs` really is the only file to replace.
+
+One that **shells out and parses `--json`** could render state but could not drive a
+probe. Three gaps, now closed:
+
+- **Refusals were prose on stderr.** For the disruptive probes the refusals *are* half the
+  interaction, so a front end was left parsing English to discover that a disk was
+  mounted. There is now a `RefusalReport` on stdout with a stable `code`
+  (`in_use`, `critical_device`, `whole_bus`, `needs_consent`, …), a `recoverable` flag, and
+  the details in fields: which disk, mounted where, which of the two confirmations is
+  missing. Exit code is still 2.
+- **The catalogue was not exposed.** `probe --json` emitted only `Capabilities`, so a
+  front end had to hardcode the probe list. It now emits `{capabilities, probes}`, where
+  each probe carries its class, requirement, summary, `ready`, and the `blocker` when it is
+  not. Registry and capability are joined *there* rather than left for the caller, because
+  combining them is the step a front end would get subtly wrong — and getting it wrong
+  means offering a button that cannot work.
+- **`Plan` was unreachable.** `--dry-run` decides, prints the decision, and stops. With
+  `--json` it emits the plan, including `side_effects` — the list a confirmation dialog
+  needs. That is the whole flow: dry-run to find out what would happen, show the dialog,
+  then run with `--yes --force`.
+
+`RefusalReport` is written out by hand rather than derived from `Refusal`. A derived shape
+would follow the enum, and the enum exists to make the *decision* clear — its variants get
+renamed as the rules sharpen. The wire format's job is to not move when they do. Tests
+assert the exact slugs and field names for the same reason.
+
+Also: a machine is never prompted. With `--json` the interactive confirmation is skipped
+entirely, since prompting would hang a front end on a read of a stdin nobody is typing
+into. It gets the refusal, decides, and asks again with the answer.
+
+`Duration` is serialised as `window_ms`, because seconds-and-nanoseconds is a poor thing to
+put in front of another program.
+
 ## Unprivileged work worth doing
 
 ### Read SCSI error counters — a passive error signal for storage

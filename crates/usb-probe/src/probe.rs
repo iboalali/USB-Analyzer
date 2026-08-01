@@ -33,6 +33,8 @@
 
 use std::time::Duration;
 
+use serde::Serialize;
+
 use crate::block::{self, Hold};
 use crate::caps::{Capabilities, ProbeClass, ProbeInfo};
 use crate::model::Snapshot;
@@ -74,7 +76,7 @@ impl<'a> Request<'a> {
 pub const DEFAULT_CYCLES: usize = 20;
 
 /// A device a probe has been pointed at, resolved against a real snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Target {
     pub sysfs_name: String,
     pub label: String,
@@ -86,10 +88,13 @@ pub struct Target {
 }
 
 /// An approved probe. Holding one means every check has already passed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Plan {
     pub probe: &'static ProbeInfo,
     pub target: Option<Target>,
+    /// Serialised as `window_ms`: serde renders a `Duration` as seconds plus
+    /// nanoseconds, which is a poor thing to put in front of another program.
+    #[serde(rename = "window_ms", serialize_with = "millis")]
     pub window: Duration,
     pub cycles: usize,
     /// What else stops working while this runs. Not reasons to refuse — things
@@ -148,6 +153,10 @@ impl Plan {
             _ => base,
         }
     }
+}
+
+fn millis<S: serde::Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_u64(d.as_millis() as u64)
 }
 
 /// Carry out an approved plan and analyse the result.
@@ -212,6 +221,41 @@ pub fn run(plan: &Plan, base: Options) -> crate::model::Report {
     crate::diag::report(snapshot)
 }
 
+/// One probe as a caller sees it: what it is, and whether it could run here.
+///
+/// The registry and the capability check are joined here rather than left for
+/// the caller to combine, because combining them is exactly the step a front
+/// end would get subtly wrong — and getting it wrong means offering a button
+/// that cannot work.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProbeStatus {
+    #[serde(flatten)]
+    pub info: &'static ProbeInfo,
+    /// Nothing stands in the way right now.
+    pub ready: bool,
+    /// What does, when something does.
+    pub blocker: Option<String>,
+}
+
+/// Every probe, with this machine's answer for each.
+pub fn catalogue(caps: &Capabilities) -> Vec<ProbeStatus> {
+    crate::caps::PROBES
+        .iter()
+        .map(|info| {
+            let blocker = if info.implemented {
+                caps.blocker(info)
+            } else {
+                Some(format!("{} is not implemented yet", info.name))
+            };
+            ProbeStatus {
+                info,
+                ready: blocker.is_none(),
+                blocker,
+            }
+        })
+        .collect()
+}
+
 /// Why a probe will not run. Every variant names the thing that would fix it,
 /// except the one that nothing fixes.
 #[derive(Debug, Clone)]
@@ -252,6 +296,95 @@ pub enum Refusal {
         probe: &'static ProbeInfo,
         what: Consent,
     },
+}
+
+/// A refusal in a shape another program can act on.
+///
+/// Written out by hand rather than derived from [`Refusal`]. A derived
+/// representation would follow the enum, and the enum exists to make the
+/// *decision* clear — variants get added and renamed as the rules sharpen. This
+/// is the wire format, and the point of a wire format is that it does not move
+/// when the code behind it does.
+///
+/// Deliberately flat: a caller reading `code` and `recoverable` has everything
+/// it needs to decide between showing an error and showing a confirmation, with
+/// no nested matching.
+#[derive(Debug, Clone, Serialize)]
+pub struct RefusalReport {
+    /// Stable slug. The one field a caller should branch on.
+    pub code: &'static str,
+    /// Whether consent would change the answer. `false` means every other
+    /// field is an explanation, not a negotiation.
+    pub recoverable: bool,
+    /// The same sentence a human would be shown.
+    pub message: String,
+    pub probe: Option<&'static str>,
+    pub target: Option<String>,
+    /// Which act of consent is missing: `to_probe` or `to_disrupt`.
+    pub consent: Option<&'static str>,
+    /// Filesystems and swap keeping a disk busy, for `in_use`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub holds: Vec<Hold>,
+    /// Input devices in the way, for `critical_device`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub uses: Vec<String>,
+    /// Every probe there is, for `no_such_probe`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub known_probes: Vec<&'static str>,
+}
+
+impl Refusal {
+    /// Stable identifier for this kind of refusal.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Refusal::NoSuchProbe { .. } => "no_such_probe",
+            Refusal::NotImplemented(_) => "not_implemented",
+            Refusal::Unavailable { .. } => "unavailable",
+            Refusal::NoSuchTarget { .. } => "no_such_target",
+            Refusal::TargetRequired(_) => "target_required",
+            Refusal::InUse { .. } => "in_use",
+            Refusal::CriticalDevice { .. } => "critical_device",
+            Refusal::WholeBus { .. } => "whole_bus",
+            Refusal::NeedsConsent { .. } => "needs_consent",
+        }
+    }
+
+    pub fn report(&self) -> RefusalReport {
+        let mut r = RefusalReport {
+            code: self.code(),
+            recoverable: self.is_recoverable(),
+            message: self.message(),
+            probe: None,
+            target: None,
+            consent: None,
+            holds: Vec::new(),
+            uses: Vec::new(),
+            known_probes: Vec::new(),
+        };
+        match self {
+            Refusal::NoSuchProbe { known, .. } => r.known_probes = known.clone(),
+            Refusal::NotImplemented(p) | Refusal::TargetRequired(p) => r.probe = Some(p.name),
+            Refusal::Unavailable { probe, .. } => r.probe = Some(probe.name),
+            Refusal::NoSuchTarget { name } => r.target = Some(name.clone()),
+            Refusal::InUse { target, holds } => {
+                r.target = Some(target.clone());
+                r.holds = holds.clone();
+            }
+            Refusal::CriticalDevice { target, uses } => {
+                r.target = Some(target.clone());
+                r.uses = uses.clone();
+            }
+            Refusal::WholeBus { target } => r.target = Some(target.clone()),
+            Refusal::NeedsConsent { probe, what } => {
+                r.probe = Some(probe.name);
+                r.consent = Some(match what {
+                    Consent::ToProbe => "to_probe",
+                    Consent::ToDisrupt => "to_disrupt",
+                });
+            }
+        }
+        r
+    }
 }
 
 /// Which of the two acts of consent is missing.
@@ -840,6 +973,180 @@ mod tests {
         );
         // And it reaches the text the user actually sees.
         assert!(plan.describe().contains("sdb"), "{}", plan.describe());
+    }
+
+    // -----------------------------------------------------------------------
+    // The wire format
+    //
+    // These assert on exact field names and exact slugs. That is the point:
+    // another program branches on them, and a rename that goes unnoticed here
+    // is a silent break there.
+    // -----------------------------------------------------------------------
+
+    fn json(v: &impl serde::Serialize) -> serde_json::Value {
+        serde_json::to_value(v).unwrap()
+    }
+
+    /// Every refusal must carry a stable code, and no two may share one.
+    #[test]
+    fn every_refusal_has_its_own_stable_code() {
+        let caps = caps_with(Availability::Usable, Availability::Usable);
+        let snap = snapshot_with_a_disk();
+        let mounted = held(
+            "sdb",
+            Hold {
+                via: "sdb1".into(),
+                kind: crate::block::HoldKind::Mounted("/media/stick".into()),
+            },
+        );
+        let bare = Request {
+            target: Some("6-1"),
+            ..Request::new(CYCLE.name, Duration::from_secs(1))
+        };
+
+        let refusals = [
+            plan(&caps, &snap, &Request::new("nope", Duration::ZERO)).unwrap_err(),
+            approve(&CYCLE, &caps, &snap, &cycle_request(None), &free()).unwrap_err(),
+            approve(&CYCLE, &caps, &snap, &cycle_request(Some("zz")), &free()).unwrap_err(),
+            approve(&CYCLE, &caps, &snap, &cycle_request(Some("usb6")), &free()).unwrap_err(),
+            approve(&CYCLE, &caps, &snap, &cycle_request(Some("6-1")), &mounted).unwrap_err(),
+            approve(&CYCLE, &caps, &snap, &bare, &free()).unwrap_err(),
+            approve(
+                &CYCLE,
+                &caps,
+                &snap,
+                &Request {
+                    consented: true,
+                    ..bare.clone()
+                },
+                &free(),
+            )
+            .unwrap_err(),
+        ];
+
+        let codes: Vec<&str> = refusals.iter().map(|r| r.code()).collect();
+        assert_eq!(
+            codes,
+            [
+                "no_such_probe",
+                "target_required",
+                "no_such_target",
+                "whole_bus",
+                "in_use",
+                "needs_consent",
+                "needs_consent",
+            ]
+        );
+
+        for r in &refusals {
+            let v = json(&r.report());
+            assert_eq!(v["code"], r.code());
+            assert_eq!(v["recoverable"], r.is_recoverable());
+            assert!(
+                v["message"].as_str().is_some_and(|m| !m.is_empty()),
+                "every refusal explains itself: {v}"
+            );
+        }
+    }
+
+    /// The structured parts a caller acts on, rather than displays.
+    #[test]
+    fn a_refusal_carries_its_details_in_fields_not_only_in_prose() {
+        let caps = caps_with(Availability::Usable, Availability::Usable);
+        let snap = snapshot_with_a_disk();
+        let mounted = held(
+            "sdb",
+            Hold {
+                via: "sdb1".into(),
+                kind: crate::block::HoldKind::Mounted("/media/stick".into()),
+            },
+        );
+
+        let v = json(
+            &approve(&CYCLE, &caps, &snap, &cycle_request(Some("6-1")), &mounted)
+                .unwrap_err()
+                .report(),
+        );
+        assert_eq!(v["code"], "in_use");
+        assert_eq!(v["target"], "6-1");
+        assert_eq!(v["holds"][0]["via"], "sdb1");
+        assert_eq!(v["holds"][0]["kind"]["kind"], "mounted");
+        assert_eq!(v["holds"][0]["kind"]["where"], "/media/stick");
+
+        // Which of the two confirmations is missing, without parsing English.
+        let v = json(
+            &approve(
+                &CYCLE,
+                &caps,
+                &snap,
+                &Request {
+                    target: Some("6-1"),
+                    consented: true,
+                    ..Request::new(CYCLE.name, Duration::from_secs(1))
+                },
+                &free(),
+            )
+            .unwrap_err()
+            .report(),
+        );
+        assert_eq!(v["code"], "needs_consent");
+        assert_eq!(v["consent"], "to_disrupt");
+        assert_eq!(v["recoverable"], true);
+
+        // An unknown probe hands back the real list rather than making the
+        // caller guess.
+        let v = json(
+            &plan(&caps, &snap, &Request::new("nope", Duration::ZERO))
+                .unwrap_err()
+                .report(),
+        );
+        assert!(v["known_probes"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("urb-errors")));
+    }
+
+    /// A duration is not seconds-and-nanoseconds to anyone outside this
+    /// process, and the side effects a confirmation dialog needs must survive
+    /// serialisation.
+    #[test]
+    fn a_plan_serialises_in_units_another_program_can_use() {
+        let caps = caps_with(Availability::Usable, Availability::Usable);
+        let snap = snapshot_with_a_disk();
+        let p = approve(&CYCLE, &caps, &snap, &cycle_request(Some("6-1")), &free()).unwrap();
+
+        let v = json(&p);
+        assert_eq!(v["window_ms"], 1000);
+        assert!(v.get("window").is_none(), "the Duration shape must not leak");
+        assert_eq!(v["probe"]["name"], "test-cycle");
+        assert_eq!(v["probe"]["class"], "disruptive");
+        assert_eq!(v["target"]["sysfs_name"], "6-1");
+        assert_eq!(v["cycles"], 20);
+        assert!(
+            v["side_effects"][0].as_str().unwrap().contains("sdb"),
+            "{v}"
+        );
+    }
+
+    /// The catalogue joins the registry to this machine's verdict, so a front
+    /// end never has to combine them itself and never offers a dead button.
+    #[test]
+    fn the_catalogue_says_what_is_ready_and_why_not() {
+        let caps = Capabilities::default();
+        let v = json(&catalogue(&caps));
+        let rows = v.as_array().unwrap();
+        assert_eq!(rows.len(), crate::caps::PROBES.len());
+
+        // Flattened, so a row is one object rather than a nesting.
+        assert_eq!(rows[0]["name"], "snapshot");
+        assert_eq!(rows[0]["class"], "passive");
+        assert_eq!(rows[0]["ready"], true);
+        assert_eq!(rows[0]["blocker"], serde_json::Value::Null);
+
+        let urb = rows.iter().find(|r| r["name"] == "urb-errors").unwrap();
+        assert_eq!(urb["ready"], false);
+        assert!(urb["blocker"].as_str().unwrap().contains("usbmon"));
+        assert!(urb["summary"].as_str().is_some_and(|s| !s.is_empty()));
     }
 
     /// Order matters. A mounted disk is reported as mounted even when the user
