@@ -176,15 +176,56 @@ Keeping the existing honesty about what software can and cannot know:
 
 ---
 
+## Unprivileged work worth doing
+
+### Read SCSI error counters — a passive error signal for storage
+
+`/sys/block/<dev>/device/` exposes counters that are world-readable, unlike usbmon: 
+`iorequest_cnt`, `iodone_cnt`, `ioerr_cnt`, `iotmo_cnt`, `device_busy`, `device_blocked`.
+For USB storage this reaches part of what `LINK_ERROR_RATE` reaches, with no privilege at
+all — which matters, because usbmon needs root and most people running this will not have
+it.
+
+**`ioerr_cnt` is not a bus-error counter**, and treating it as one would repeat exactly
+the mistake usbmon's classification exists to prevent. It counts any command that did not
+return GOOD status, including the kernel probing for optional features and being told no.
+From this machine, both drives freshly plugged in and working perfectly:
+
+```
+sda  SanDisk Ultra USB 3.0   iorequest 0x243  ioerr 0x2  iotmo 0x0
+sdb  TOSHIBA TransMemory     iorequest 0x20d  ioerr 0x2  iotmo 0x0
+```
+
+Two healthy flash drives, both at exactly `ioerr_cnt=2` — routine CHECK CONDITION replies
+from discovery. A rule firing on `ioerr_cnt > 0` would condemn every storage device on
+every machine.
+
+- the values are **hex** (`0x243`), not decimal
+- `iotmo_cnt` is the closest thing to a genuine transport failure and deserves its own
+  weight — a timeout means the device stopped answering
+- the signal is the **delta over a window**, not the absolute count, since the baseline is
+  a fixed handful from discovery. Sampling fits the existing shape of `block::sample()`
+- only SCSI-attached devices have these; NVMe has no such directory, so absence is normal
+- give it its own code (`STORAGE_IO_ERRORS`) rather than folding it into
+  `LINK_ERROR_RATE`, so the two sources are never conflated in evidence
+
+---
+
 ## Shipped but unverified against hardware
 
 Both are implemented, tested synthetically, and have never seen the situation they exist
 for. Listed here so the gap is not mistaken for coverage.
 
-- **`DP_ALT_MODE_NO_OUTPUT`** — needs any device that negotiates DisplayPort Alt Mode: a
-  dock, or a USB-C→HDMI adapter. Only its guards are currently proven, including the
-  false positive this machine would otherwise produce from a local port's meaningless
-  `active` flag.
+- **`DP_ALT_MODE_NO_OUTPUT`** — worse than unverified: probably **unreachable** on this
+  platform. A Dell DA20 is driving a 1440p monitor through DisplayPort Alt Mode, so the
+  mode is unambiguously active, and yet `/sys/class/typec/port1-partner/` has no
+  `number_of_alternate_modes` attribute and no alt-mode directories at all. UCSI never
+  enumerates the partner's modes here even while one is entered, so the rule's
+  precondition — a partner alt mode with SVID `ff01` and `active = yes` — cannot be
+  satisfied. Same shape as the `LINK_BELOW_DEVICE_CAPABILITY` problem above. Keep only if
+  a tcpm-based system populates partner alt modes properly; otherwise delete, since
+  `BILLBOARD_ALT_MODE_FAILED` plus the DRM cross-check already covers "adapter attached,
+  no picture" and fired correctly on this hardware.
 - **The udev wake path in `watch`** — parsing, threading and debouncing are covered by a
   canned stream, and `udevadm monitor` is confirmed to spawn with the right filters, but
   no real uevent has travelled the whole chain. Plugging anything in while
