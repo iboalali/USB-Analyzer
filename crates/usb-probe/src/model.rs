@@ -496,6 +496,18 @@ impl UsbDevice {
         self.speed.as_ref().is_some_and(|s| s.mbps <= 480.0)
     }
 
+    /// What this device is, from its class codes.
+    ///
+    /// Computed rather than stored. `usb_version_num` sets the precedent for a
+    /// derived field living in the struct, but that one is a parse of a single
+    /// attribute and cannot drift; a classification reads `device_class`, the
+    /// interface list and `is_root_hub` together, and test builders mutate all
+    /// three after construction — `root_hub_version` sets `device_class` on an
+    /// already-built device. A stored kind would be silently stale there.
+    pub fn kind(&self) -> crate::kind::Kind {
+        crate::kind::classify(self)
+    }
+
     /// True when any interface reports this USB class code.
     ///
     /// Needed because `bDeviceClass` is usually `0x00` ("see interfaces"), so the

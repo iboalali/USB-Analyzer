@@ -33,6 +33,7 @@ pub mod chain;
 pub mod diag;
 pub mod drm;
 pub mod kernel;
+pub mod kind;
 pub mod model;
 pub mod monitor;
 pub mod pd;

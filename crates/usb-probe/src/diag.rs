@@ -12,6 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::kind::DeviceKind;
 use crate::model::*;
 use crate::vdo;
 
@@ -674,8 +675,9 @@ fn link_speed_rules(snap: &Snapshot, dev: &UsbDevice, out: &mut Vec<Finding>) {
         if dev.usb_version_num.is_some_and(|v| v >= 3.2)
             && dev.tx_lanes == Some(1)
             && dev.speed.as_ref().is_some_and(|s| s.mbps <= 10_000.0)
-            && !dev.has_interface_class(CLASS_HUB)
-            && dev.has_interface_class(CLASS_MASS_STORAGE)
+            // `asserted`, not `kind`: this creates a finding, so it may only
+            // rest on what the device said about itself. See `kind`'s docs.
+            && dev.kind().asserted() == Some(DeviceKind::Storage)
         {
             out.push(Finding {
                 code: "LINK_SINGLE_LANE".into(),
@@ -928,12 +930,12 @@ fn kernel_history_rules(snap: &Snapshot, dev: &UsbDevice, out: &mut Vec<Finding>
     }
 }
 
-/// USB mass storage class code.
-pub(crate) const CLASS_MASS_STORAGE: u8 = 0x08;
 /// USB Billboard class code — a device announcing a failed Alternate Mode.
+///
+/// The last raw class code left in the rule engine, and it stays raw on
+/// purpose: Billboard is a symptom, not an identity. Everything that asks what
+/// a device *is* goes through [`crate::kind`].
 const CLASS_BILLBOARD: u8 = 0x11;
-/// USB hub class code.
-const CLASS_HUB: u8 = 0x09;
 
 /// A downstream port together with the hub it belongs to.
 struct PortSite<'a> {
@@ -1044,7 +1046,7 @@ fn ss_half_idle_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
         if !ss_errors_on(snap, rec.fast.hub_name).is_empty() {
             continue;
         }
-        if !dev.has_interface_class(CLASS_MASS_STORAGE) {
+        if dev.kind().asserted() != Some(DeviceKind::Storage) {
             continue;
         }
 
@@ -2001,6 +2003,10 @@ fn display_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
 /// not an ordinary device.
 fn billboard_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
     for dev in snap.devices() {
+        // Deliberately an interface check rather than `kind()`. A Billboard is
+        // a symptom marker, not an identity: a dock that also exposes storage
+        // classifies as storage, and asking "what is this device" would then
+        // lose the failure report the class exists to carry.
         if !dev.has_interface_class(CLASS_BILLBOARD) {
             continue;
         }

@@ -16,7 +16,8 @@
 //! The exonerations are what give a clean verdict something to cite. Without
 //! them "nothing found" is an assertion; with them it is a summary.
 
-use crate::diag::{CLASS_MASS_STORAGE, SVID_DISPLAYPORT, watts};
+use crate::diag::{SVID_DISPLAYPORT, watts};
+use crate::kind::DeviceKind;
 use crate::model::{
     Confidence, Finding, Outcome, Severity, Snapshot, Subject, UsbDevice, Verdict,
 };
@@ -352,7 +353,7 @@ fn owning_device<'a>(snap: &'a Snapshot, block_name: &str) -> Option<&'a UsbDevi
     let path = block.sysfs_path.to_string_lossy().to_string();
     snap.devices()
         .into_iter()
-        .filter(|d| d.has_interface_class(CLASS_MASS_STORAGE))
+        .filter(|d| d.kind().asserted() == Some(DeviceKind::Storage))
         .find(|d| path.contains(&format!("/{}/", d.sysfs_name)))
 }
 

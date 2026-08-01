@@ -8,6 +8,7 @@ use std::fmt::Write as _;
 
 use usb_probe::diag::{milliamps, volts, watts};
 use usb_probe::model::*;
+use usb_probe::kind::DeviceKind;
 use usb_probe::usb::class_name;
 
 const WIDTH: usize = 96;
@@ -1264,7 +1265,14 @@ fn drivers_of(dev: &UsbDevice) -> String {
 }
 
 fn device_detail(dev: &UsbDevice) -> String {
-    let mut parts = vec![format!("USB {}", dev.usb_version.as_deref().unwrap_or("?"))];
+    let kind = dev.kind();
+    let mut parts = Vec::new();
+    // What it is, before what it implements. The raw class codes stay below as
+    // the evidence for it.
+    if kind.is_known() {
+        parts.push(kind.kind.label().to_string());
+    }
+    parts.push(format!("USB {}", dev.usb_version.as_deref().unwrap_or("?")));
     if let (Some(tx), Some(rx)) = (dev.tx_lanes, dev.rx_lanes) {
         parts.push(format!("lanes tx{tx}/rx{rx}"));
     }
@@ -1275,7 +1283,10 @@ fn device_detail(dev: &UsbDevice) -> String {
         parts.push("self-powered".into());
     }
     if let Some(c) = dev.device_class {
-        if c != 0 {
+        // The raw class is evidence for the kind, so it is worth printing —
+        // unless it is the same statement twice, which on a hub gave "hub" the
+        // kind, "hub" the class and "if0:hub" the interface.
+        if c != 0 && DeviceKind::from_class(c) != Some(kind.kind) {
             parts.push(class_name(c).to_string());
         }
     }

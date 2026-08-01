@@ -241,8 +241,17 @@ impl AppModel {
             Subject::Device(n) => snap
                 .device(n)
                 .map(|d| {
-                    let speed = d.speed.as_ref().map(|s| s.label.clone()).unwrap_or_default();
-                    format!("{n} \u{00b7} {speed}")
+                    let mut bits = vec![n.clone()];
+                    // With its provenance, per §8: a kind the user set must not
+                    // look like one the device declared.
+                    let kind = d.kind();
+                    if kind.is_known() {
+                        bits.push(kind.describe());
+                    }
+                    if let Some(s) = &d.speed {
+                        bits.push(s.label.clone());
+                    }
+                    bits.join(" \u{00b7} ")
                 })
                 .unwrap_or_else(|| n.clone()),
         }

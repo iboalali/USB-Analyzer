@@ -513,41 +513,52 @@ Untestable here. UCSI exposes no cable node — `/sys/class/typec/` has ports an
 and no `port0-cable` — so every line of this is dead code on this machine and gets
 fixtures, not a live check. Same category as #12 and #23.
 
-### Classify devices, but only let a guess suppress a finding
+### Classify devices, but only let a guess suppress a finding — **done**
 
-`usbeehive` carries a 28-kind taxonomy — Camera, Gamepad, Keyboard, SecurityKey,
-SmartcardReader, Phone, VideoCapture, Storage, Hub — built from class codes plus
-product-string heuristics. We classify by USB class code alone.
+`kind.rs`. `DeviceKind` (15 kinds) plus `KindSource` (`class` | `heuristic` | `user`),
+and `Kind::asserted()` as the single place the suppress-only rule is enforced: it returns
+a kind **only** when the device's own descriptors said so, and it is the only accessor a
+rule may use as grounds for a new finding. `Kind::kind` is the best available answer,
+guesses included, and is for display and for staying quiet.
 
-This is not decoration. What a device *is* changes what an observation *means*: 480 Mbps
-is correct for a keyboard and a fault for an external SSD; 900 mA is a phone charging and
-a mouse malfunctioning. The taxonomy is a rule input, which is exactly why it is
-dangerous.
+The asymmetry is not stylistic. A wrong guess that suppresses costs a missed detection. A
+wrong guess that accuses costs a false accusation against hardware the user then goes and
+replaces — the failure this whole project exists to avoid. Only one is recoverable.
 
-**The constraint that makes it safe: a classification may suppress or soften a finding,
-never create one.** The asymmetry is not stylistic. A wrong guess that suppresses costs a
-missed detection — bad. A wrong guess that accuses costs a false accusation against
-hardware the user then replaces — the failure this whole project is built to avoid. Only
-one of those is recoverable, so guesses may only ever push toward silence.
+**Computed, not stored.** `usb_version_num` is the precedent for a derived field living in
+the struct, but it is a parse of one attribute and cannot drift. A classification reads
+`device_class`, the interface list and `is_root_hub` together, and the test builders mutate
+all three after construction — `root_hub_version` sets `device_class` on an already-built
+device. A stored kind would have been silently stale there, so it is a method.
 
-That splits the taxonomy in two, and the split should be in the type, not in a comment:
+**Billboard deliberately stays a raw interface check.** It is the one class code left in the
+rule engine. A Billboard is a symptom, not an identity: a dock that also exposes storage
+classifies as storage, and asking "what is this device" would lose the failure report the
+class exists to carry. Everything that genuinely asks what a device *is* now goes through
+`kind`, including the GUI's hub-collapsing, which had grown its own copy of the hub class
+code.
 
-- **Class-code derived** — from `bDeviceClass` / `bInterfaceClass`. Not a guess; the
-  device asserts it. May feed any rule.
-- **String-heuristic derived** — "this product string contains *webcam*". A guess, and it
-  must be marked as one so a rule cannot silently treat it as fact.
+**Composite devices are ranked, not first-wins.** A webcam is video plus audio plus HID; a
+headset is audio plus HID. Interface order must not decide the answer, so the kinds have a
+total order and the most specific wins — with a test asserting the order is total and
+another asserting enumeration order is irrelevant.
 
-Start with the class-code half only. It covers hubs, HID, storage, audio, video and
-Billboard, which is most of what the rules actually need, and it carries no risk. The
-string heuristics are worth having later, behind the suppress-only rule, and are worth
-nothing at all if that rule is not enforced by the types.
+**Against real hardware it names every attached device but one.** The hub, the Bluetooth
+radio (`bDeviceClass ef` deferring to three `0xe0` interfaces) and the smart-card reader all
+answer. The Goodix fingerprint reader is `ef` over `ff` — Miscellaneous over Vendor
+Specific, the class-code equivalent of a shrug — and comes out `Unknown` rather than being
+forced into a bucket. That is the one device the string heuristics would be for.
 
-**On this machine the class code already answers 7 of 9 devices** — three hubs, a
-smartcard reader, two mass-storage devices, a Billboard adapter, and a wireless
-controller. Only the Goodix fingerprint reader is opaque, at `bDeviceClass ef` /
-`bInterfaceClass ff`: Miscellaneous over Vendor Specific, which is the class-code
-equivalent of a shrug. So the free half is most of the value, and the risky half is for
-one device.
+Rendering it turned up a small thing worth keeping: printing the kind next to the raw class
+gave a hub "hub" three times over. `DeviceKind::from_class` lets a renderer tell "this class
+code names the same thing" from "this class code declined to answer", so `miscellaneous`
+survives on the Bluetooth radio — where it explains *why* the device class deferred — and
+the duplicate `hub` does not.
+
+**The string-heuristic half is not built**, and no `KindSource::Heuristic` is produced yet.
+The enforcement point exists and is tested against a hand-made guess, so the half that
+carries risk cannot land without going through it. What it needs first is a second device
+worth guessing about; one fingerprint reader is not a corpus.
 
 ### Let the user correct a device's type, and remember it
 

@@ -478,6 +478,25 @@ Findings that only exist once a probe has been run:
 | `LINK_INTERMITTENT` | measured | The port was cycled and did not behave the same way twice. High when the device failed to re-appear at all, medium when it merely trained slower. |
 | `LINK_STABLE_UNDER_CYCLING` | measured | Info. Every cycle trained identically — which does not clear a cable, but does rule out intermittency, and a deliberate test should say something when it passes. |
 
+### What a device is
+
+`usb_probe::kind` classifies each device from its class codes — hub, storage,
+camera, smart-card reader, and so on — because what a device *is* changes what
+a reading means: 12 Mbps is correct for a keyboard and a fault for an external
+SSD.
+
+The taxonomy is a rule input, so it carries a rule of its own. `Kind::asserted()`
+returns a kind only when the device's own descriptors said so, and it is the
+only accessor a rule may use as grounds for a **new** finding; the plain kind,
+which will later include guesses and user corrections, is for display and for
+staying quiet. A wrong guess that suppresses costs a missed detection; a wrong
+guess that accuses costs a false accusation against hardware someone then
+replaces. Only one of those is recoverable.
+
+Every kind carries where it came from — declared by the device, guessed from its
+name, or set by you — and the UI shows it, because a belief the user cannot see
+is one they cannot correct.
+
 ### Exonerations
 
 These do not appear in `findings`. They live in a separate `exonerations` list, so that
@@ -510,7 +529,7 @@ on*, so grading one as minor would manufacture a problem out of a note.
 
 ```sh
 cargo build --release -p usbdiag     # ./target/release/usbdiag
-cargo test --workspace               # 253 tests
+cargo test --workspace               # 268 tests
 ```
 
 The CLI and the library have **no non-Rust dependencies**: `serde` and

@@ -14,13 +14,11 @@
 
 use relm4::gtk::{self, prelude::*};
 use relm4::Sender;
+use usb_probe::kind::DeviceKind;
 use usb_probe::model::{Outcome, Report, Severity, Subject, TypecPort, UsbDevice, Verdict};
 
 use crate::findings;
 use crate::Msg;
-
-/// USB class code for a hub.
-const CLASS_HUB: u8 = 0x09;
 
 /// Replace the sidebar's contents.
 pub fn build(
@@ -225,20 +223,31 @@ fn fact(report: &Report, subject: &Subject) -> String {
             let Some(d) = snap.device(name) else {
                 return String::new();
             };
-            if let Some(b) = snap.storage_on(d).first() {
-                return format!("storage \u{00b7} {}", b.label());
+            // What it is comes first: it is the thing a person scanning the
+            // list is actually looking for, and it makes the rest of the line
+            // mean something ("storage, via 2 hubs" reads differently from
+            // "keyboard, via 2 hubs").
+            let mut bits = Vec::new();
+            let kind = d.kind();
+            if kind.is_known() {
+                bits.push(kind.kind.label().to_string());
             }
-            if is_hub(d) && d.children.is_empty() {
-                return "nothing attached".into();
+            if let Some(b) = snap.storage_on(d).first() {
+                bits.push(b.label());
+            } else if is_hub(d) && d.children.is_empty() {
+                bits.push("nothing attached".into());
             }
             match hops(snap, d) {
-                0 => d
-                    .speed
-                    .as_ref()
-                    .map(|s| s.label.clone())
-                    .unwrap_or_else(|| "attached".into()),
-                n => format!("via {n} hub{}", if n == 1 { "" } else { "s" }),
+                0 if bits.is_empty() => bits.push(
+                    d.speed
+                        .as_ref()
+                        .map(|s| s.label.clone())
+                        .unwrap_or_else(|| "attached".into()),
+                ),
+                0 => {}
+                n => bits.push(format!("via {n} hub{}", if n == 1 { "" } else { "s" })),
             }
+            bits.join(" \u{00b7} ")
         }
     }
 }
@@ -334,7 +343,7 @@ fn device_meta(d: &UsbDevice) -> String {
 // ---------------------------------------------------------------------------
 
 pub fn is_hub(d: &UsbDevice) -> bool {
-    d.device_class == Some(CLASS_HUB) || d.has_interface_class(CLASS_HUB)
+    d.kind().kind == DeviceKind::Hub
 }
 
 /// How many hubs sit between this device and its root hub.
