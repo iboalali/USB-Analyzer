@@ -1239,6 +1239,63 @@ pub fn header(out: &mut String, snap: &Snapshot, t: &Theme) {
     let _ = writeln!(out);
 }
 
+/// What this run could and could not attempt.
+///
+/// Verbose only. On an ordinary desktop every active probe is out of reach and
+/// saying so on every run would be noise — but when someone is asking why a
+/// cable finding is only *inferred*, this is the answer, and it names the exact
+/// command that would change it.
+pub fn capabilities(out: &mut String, snap: &Snapshot, t: &Theme) {
+    if !t.verbose {
+        return;
+    }
+    let c = &snap.capabilities;
+    let _ = writeln!(out, "{}", t.heading("probe capabilities"));
+    let _ = writeln!(
+        out,
+        "  {}",
+        t.dim(&format!(
+            "running as uid {}{}",
+            c.effective_uid
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| "?".into()),
+            if c.is_root() { " (root)" } else { "" }
+        ))
+    );
+
+    for (name, iface) in [("usbmon", &c.usbmon), ("usbfs", &c.usbfs)] {
+        let mark = if iface.is_usable() {
+            t.green("✓")
+        } else {
+            t.dim("·")
+        };
+        row(
+            out,
+            t,
+            name,
+            &format!("{mark} {}", t.dim(iface.availability.explain())),
+        );
+    }
+
+    let _ = writeln!(out, "  {}", t.dim("probes"));
+    for p in usb_probe::caps::PROBES {
+        // The reason is already spelled out against the interface above; here
+        // only which interface is missing is worth repeating.
+        let (mark, note) = match c.blocker(p) {
+            None => (t.green("✓"), String::new()),
+            Some(_) => (t.dim("·"), format!("needs {}", p.needs.label())),
+        };
+        let line = format!(
+            "    {mark} {} {} {}",
+            t.bold(&format!("{:<16}", p.name)),
+            t.dim(&format!("{:<24}", format!("[{}]", p.class.label()))),
+            t.dim(&note),
+        );
+        let _ = writeln!(out, "{}", line.trim_end());
+    }
+    let _ = writeln!(out);
+}
+
 pub fn summary(out: &mut String, report: &Report, t: &Theme) {
     let mut counts: Vec<(Severity, usize)> = Vec::new();
     for s in [

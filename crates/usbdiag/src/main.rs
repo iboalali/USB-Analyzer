@@ -127,6 +127,7 @@ fn format_report(report: &Report, args: &Args) -> String {
         }
         Command::Diag => {
             render::findings(&mut out, report, &theme);
+            render::capabilities(&mut out, &report.snapshot, &theme);
             render::summary(&mut out, report, &theme);
         }
         Command::All | Command::Watch => {
@@ -138,6 +139,7 @@ fn format_report(report: &Report, args: &Args) -> String {
             render::devices(&mut out, &report.snapshot, &theme);
             render::storage(&mut out, report, &theme);
             render::findings(&mut out, report, &theme);
+            render::capabilities(&mut out, &report.snapshot, &theme);
             render::summary(&mut out, report, &theme);
             render::caveat(&mut out, &theme);
         }

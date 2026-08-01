@@ -13,6 +13,7 @@ use crate::vdo::{IdentityContext, PartialIdentity};
 pub fn empty_snapshot() -> Snapshot {
     Snapshot {
         captured_at_unix_ms: 0,
+        capabilities: crate::caps::Capabilities::default(),
         host: Host {
             kernel_release: Some("6.17.0-test".into()),
             product_name: Some("Test Machine".into()),

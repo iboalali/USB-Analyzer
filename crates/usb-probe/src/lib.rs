@@ -28,6 +28,7 @@
 //! reset-history rules; that is reported as a finding rather than hidden.
 
 pub mod block;
+pub mod caps;
 pub mod diag;
 pub mod drm;
 pub mod kernel;
@@ -101,6 +102,7 @@ pub fn capture_with_log(opts: Options, log: Option<KernelLog>) -> Snapshot {
     Snapshot {
         captured_at_unix_ms: now_ms(),
         host: read_host(),
+        capabilities: caps::detect(),
         buses: usb::read_buses(),
         ports,
         thunderbolt: thunderbolt::read(),

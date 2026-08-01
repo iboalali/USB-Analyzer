@@ -21,6 +21,9 @@ use serde::{Deserialize, Serialize};
 pub struct Snapshot {
     pub captured_at_unix_ms: u64,
     pub host: Host,
+    /// What this process is allowed to do — which probes are reachable, and
+    /// why the others are not.
+    pub capabilities: crate::caps::Capabilities,
     /// Root hubs, each with its device tree in `children`.
     pub buses: Vec<UsbDevice>,
     pub ports: Vec<TypecPort>,
