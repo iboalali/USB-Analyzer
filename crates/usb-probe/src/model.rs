@@ -1996,11 +1996,63 @@ impl Subject {
     }
 }
 
+/// A one-sentence answer for one subject, so that "nothing is wrong here" is
+/// something the tool *says* rather than something the user has to infer from
+/// an empty list.
+///
+/// **A headline is always either a finding's title, quoted verbatim, or the
+/// fixed [`Verdict::NOTHING_FOUND`] fallback.** Nothing else is permitted. That
+/// makes "a verdict never makes a claim the findings do not" a property of the
+/// construction rather than a rule someone has to remember: there is no code
+/// path that can compose a novel sentence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Verdict {
+    pub subject: Subject,
+    pub outcome: Outcome,
+    pub headline: String,
+    /// Codes of the findings and exonerations this rests on.
+    ///
+    /// Empty means the subject was examined and nothing fired either way —
+    /// which is a weaker clean bill of health than a non-empty one, and the
+    /// difference is worth showing.
+    pub because: Vec<String>,
+}
+
+impl Verdict {
+    pub const NOTHING_FOUND: &'static str = "Nothing wrong found";
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
+    /// Medium or worse. Something here needs attention.
+    Fault,
+    /// Low. Something is slightly off but not worth acting on.
+    Minor,
+    /// Nothing fired, or nothing above Info did.
+    ///
+    /// Info-only subjects are clear on purpose: Info means *worth knowing, not
+    /// worth acting on*, so grading one as `Minor` would manufacture a problem
+    /// out of a note.
+    Clear,
+}
+
 /// A snapshot plus its analysis — what a UI binds to.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
     pub snapshot: Snapshot,
     pub findings: Vec<Finding>,
+    /// Statements that a specific thing is *not* the problem.
+    ///
+    /// A separate list rather than a flag on [`Finding`], because the failure
+    /// mode to design against is an exoneration being counted as a fault —
+    /// swelling a clean report until it looks like a dirty one, or tripping an
+    /// exit code. Keeping them out of `findings` makes that impossible instead
+    /// of merely unlikely.
+    #[serde(default)]
+    pub exonerations: Vec<Finding>,
+    #[serde(default)]
+    pub verdicts: Vec<Verdict>,
 }
 
 impl Report {
@@ -2043,11 +2095,23 @@ impl Report {
             .collect();
         self.findings = keep;
 
+        let in_scope = |s: &Subject| match s {
+            Subject::Device(d) | Subject::Port(d) | Subject::Cable(d) => names.contains(d.as_str()),
+            Subject::Host => false,
+        };
+        self.exonerations.retain(|f| in_scope(&f.subject));
+        self.verdicts.retain(|v| in_scope(&v.subject));
+
         if let Some(t) = &mut self.snapshot.urb_traffic {
             t.devices
                 .retain(|s| addresses.contains(&(s.bus, s.device_address)));
         }
         self
+    }
+
+    /// The verdict for one subject, if one was reached.
+    pub fn verdict_for(&self, subject: &Subject) -> Option<&Verdict> {
+        self.verdicts.iter().find(|v| &v.subject == subject)
     }
 }
 
@@ -2282,6 +2346,24 @@ mod tests {
                 finding(Subject::Device("5-1.1".into())),
                 finding(Subject::Device("4-1".into())),
                 finding(Subject::Host),
+            ],
+            exonerations: vec![
+                finding(Subject::Device("5-1.1".into())),
+                finding(Subject::Device("4-1".into())),
+            ],
+            verdicts: vec![
+                Verdict {
+                    subject: Subject::Device("5-1.1".into()),
+                    outcome: Outcome::Clear,
+                    headline: Verdict::NOTHING_FOUND.into(),
+                    because: vec![],
+                },
+                Verdict {
+                    subject: Subject::Device("4-1".into()),
+                    outcome: Outcome::Clear,
+                    headline: Verdict::NOTHING_FOUND.into(),
+                    because: vec![],
+                },
             ],
         }
         .scoped_to("5-1");

@@ -141,6 +141,7 @@ fn format_report(report: &Report, args: &Args) -> String {
 
     let mut out = String::new();
     render::header(&mut out, &report.snapshot, &theme);
+    render::verdicts(&mut out, report, &theme);
     match args.command {
         Command::Ports => {
             render::ports(&mut out, &report.snapshot, &theme);
@@ -155,6 +156,7 @@ fn format_report(report: &Report, args: &Args) -> String {
             render::urb_traffic(&mut out, &report.snapshot, &theme);
         }
         Command::Diag => {
+            render::exonerations(&mut out, report, &theme);
             render::findings(&mut out, report, &theme);
             render::capabilities(&mut out, &report.snapshot, &theme);
             render::summary(&mut out, report, &theme);
@@ -168,6 +170,7 @@ fn format_report(report: &Report, args: &Args) -> String {
             render::devices(&mut out, &report.snapshot, &theme);
             render::storage(&mut out, report, &theme);
             render::urb_traffic(&mut out, &report.snapshot, &theme);
+            render::exonerations(&mut out, report, &theme);
             render::findings(&mut out, report, &theme);
             render::capabilities(&mut out, &report.snapshot, &theme);
             render::summary(&mut out, report, &theme);
@@ -312,6 +315,7 @@ fn probe(args: &Args, opts: Options) -> ExitCode {
     render::reenumeration(&mut out, &report.snapshot, &theme);
     render::throughput(&mut out, &report.snapshot, &theme);
     render::urb_traffic(&mut out, &report.snapshot, &theme);
+    render::exonerations(&mut out, &report, &theme);
     render::findings(&mut out, &report, &theme);
     render::summary(&mut out, &report, &theme);
     print!("{out}");
@@ -797,6 +801,8 @@ mod tests {
         let clean = Report {
             snapshot: snap.clone(),
             findings: vec![],
+            exonerations: vec![],
+            verdicts: vec![],
         };
         assert_eq!(format!("{:?}", exit_code(&clean)), format!("{:?}", ExitCode::SUCCESS));
 
@@ -812,6 +818,8 @@ mod tests {
                 evidence: vec![],
                 suggestion: None,
             }],
+            exonerations: vec![],
+            verdicts: vec![],
         };
         assert_eq!(
             format!("{:?}", exit_code(&info_only)),
@@ -830,6 +838,8 @@ mod tests {
                 evidence: vec![],
                 suggestion: None,
             }],
+            exonerations: vec![],
+            verdicts: vec![],
         };
         assert_eq!(format!("{:?}", exit_code(&bad)), format!("{:?}", ExitCode::from(1)));
     }

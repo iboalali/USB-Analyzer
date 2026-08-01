@@ -44,6 +44,7 @@ pub mod typec;
 pub mod usb;
 pub mod usbmon;
 pub mod vdo;
+pub mod verdict;
 
 #[cfg(test)]
 mod test_support;

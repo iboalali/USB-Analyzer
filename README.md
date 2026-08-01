@@ -61,7 +61,7 @@ An out-of-process front end gets the same abilities, and the shapes are meant to
 depended on:
 
 ```console
-$ usbdiag json                                     # snapshot + findings
+$ usbdiag json                                     # snapshot + findings + exonerations + verdicts
 $ usbdiag probe --json                             # {capabilities, probes[]}
 $ usbdiag probe NAME --dry-run --json              # the Plan, incl. side_effects
 $ usbdiag probe NAME --yes --force --json          # run it
@@ -444,11 +444,39 @@ Findings that only exist once a probe has been run:
 | `LINK_INTERMITTENT` | measured | The port was cycled and did not behave the same way twice. High when the device failed to re-appear at all, medium when it merely trained slower. |
 | `LINK_STABLE_UNDER_CYCLING` | measured | Info. Every cycle trained identically — which does not clear a cable, but does rule out intermittency, and a deliberate test should say something when it passes. |
 
+### Exonerations
+
+These do not appear in `findings`. They live in a separate `exonerations` list, so that
+saying *"this is fine"* can never inflate a fault count, trip the exit code, or be mistaken
+for an accusation. All are Info.
+
+| Code | Says |
+|---|---|
+| `CHARGING_AT_FULL_OFFER` | The contract reached the charger's best profile. Nothing on this port is holding power back; only a bigger charger would help. |
+| `CABLE_NOT_LIMITING` | Nothing was lost across the cable. Reachable **without an e-marker**, which matters: on UCSI the cable's identity is never exposed, so arithmetic on the contract is the only way to clear one. |
+| `LINK_AT_DEVICE_MAXIMUM` | Linked below the port's rate, but at the device's own ceiling. Restricted to `bcdUSB 3.0x`, the one version that names exactly one rate. |
+| `ALT_MODE_NOT_REQUESTED` | DisplayPort is offered and nothing asked for it — normal for a charger, and alarming in a raw capability dump. |
+| `MEDIUM_EXPLAINS_THROUGHPUT` | A measured read below the link rate, on media the kernel reports as rotating. The platters are the bottleneck, not the cable. Needs `probe throughput`. |
+
+### Verdicts
+
+One sentence per subject — host, each port, each cable, each non-root-hub device — in a
+`verdicts` list, with an `outcome` of `fault`, `minor` or `clear` and the codes it rests on.
+
+**A headline is always a finding's title quoted verbatim, or the fixed string
+`"Nothing wrong found"`.** There is no code path that composes a sentence of its own, so a
+verdict cannot state anything the findings do not. An empty `because` on a `clear` verdict
+is meaningful: the subject was examined and nothing fired either way, which is a weaker
+clean bill of health than one with an exoneration to cite.
+
+Info-only subjects are `clear`, not `minor`. Info means *worth knowing, not worth acting
+on*, so grading one as minor would manufacture a problem out of a note.
+
 ## Build
 
 ```sh
 cargo build --release        # ./target/release/usbdiag
-cargo test                   # 224 tests
+cargo test                   # 234 tests
 ```
 
 No non-Rust dependencies. Dependencies are `serde` and `serde_json` only; sysfs

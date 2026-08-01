@@ -343,25 +343,53 @@ narrow window) and closed the `--desktop`-mode question: no mode.
 
 The one piece of library work it depends on is below.
 
-### Say "not a cable problem" out loud
+### Say "not a cable problem" out loud — **done**
 
-The tool expresses "nothing is wrong here" as **silence**, and silence is not an answer —
-a clean report leaves the user unsure whether it looked. WhatCable on macOS handles this
-better with explicit exonerating verdicts (*"Device runs at 10 Gbps, this is the fastest
-it supports, not a cable problem"*), and it is the same discipline this tool already
-applies internally, just never surfaced.
+`verdict.rs`. Two halves that need each other: exonerations give a clean verdict something
+to cite, and without them "nothing found" is an assertion rather than a summary.
 
-- **A verdict per subject** — one plain sentence, before any detail. It belongs in
-  `usb-probe`, not the GUI: a headline derived from findings inside a renderer is a second
-  rule engine, and it will drift from the first.
-- **Exonerating findings** for the cases deliberately passed over: linked at the device's
-  own maximum; the medium explains the rate rather than the link; no alt mode was
-  requested, so none failing is correct; a 3 A cable is not the limit when the charger
-  only offers 60 W.
+**The headline invariant is structural, not a discipline.** A verdict headline is always a
+finding's title quoted verbatim, or the fixed `Verdict::NOTHING_FOUND`. There is no branch
+that composes a sentence, so "a verdict never makes a new claim" cannot be violated by
+someone editing a rule later. A test asserts it against a populated snapshot.
 
-Two risks. A verdict must summarise the findings and never make a new claim. And
-exonerations must not become noise — Info level, collapsed by default in the CLI, shown in
-the GUI only for the selected subject.
+**Exonerations are a separate list on `Report`, not a flag on `Finding`.** The failure mode
+worth designing against is one being counted as a fault — swelling a clean report until it
+looks dirty, or tripping the exit code. A separate `Vec` makes that impossible rather than
+unlikely, and cost nothing: 38 `Finding` literals stayed untouched.
+
+**Info-only subjects are `Clear`, not `Minor`.** Found while writing the first test. Info
+means worth knowing and not worth acting on, so grading such a subject as `Minor` invents a
+problem out of a note. `Minor` now requires Low or above.
+
+Five exonerations. `CHARGING_AT_FULL_OFFER` and `CABLE_NOT_LIMITING` fire when the contract
+equals the charger's best offer — the second is the sentence the tool exists to be able to
+say, and it needs **no e-marker**, which is the point on a UCSI platform where cable
+identity is never exposed. `LINK_AT_DEVICE_MAXIMUM`, `ALT_MODE_NOT_REQUESTED`, and
+`MEDIUM_EXPLAINS_THROUGHPUT`, the last reachable only after `probe throughput` and untested
+for the same reason as the rest of that path.
+
+**`bcdUSB` names a specification, not a rate — and this was nearly got wrong twice.** The
+guard was written for `2.00`, which 12 Mbps and 480 Mbps devices both claim. The first draft
+then mapped `>= 3.1` to 10 Gbps, and hardware here contradicts it: `6-1`, a VIA hub,
+declares `bcdUSB 3.10` and links at 5 Gbps into a 10 Gbps port. Only `3.0x` names exactly
+one rate, so everything else returns `None` and stays silent. Missing an exoneration costs
+nothing; a false "this is as fast as it gets" costs the user the actual fault.
+
+Three noise decisions, each from reading real output rather than reasoning about it:
+root hubs get no verdict (eight controllers nobody forms an opinion about); an empty port
+gets no alt-mode exoneration (a tautology, one per unused port); and a sinking port needed
+its own power statement, because the cable one lives on the cable subject and left port0
+headlined by DisplayPort while it was charging at 100 W.
+
+**Validated live.** With the charger attached, port0 read *"Charging at 100 W, the most this
+charger offers"* and its cable *"The cable is not what limits charging here"*. The charger
+was then unplugged mid-session and both correctly disappeared, `4-1`'s
+`LINK_AT_DEVICE_MAXIMUM` surviving unchanged.
+
+Still open: the CLI shows `clear` verdicts with an empty `because` only as a count. Whether
+a GUI should draw those differently from a cited `clear` is a real question — the data
+distinguishes them, see [`docs/01-gui-concept.md`](docs/01-gui-concept.md).
 
 ## Unprivileged work worth doing
 

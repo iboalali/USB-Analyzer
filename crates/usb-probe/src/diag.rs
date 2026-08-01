@@ -95,9 +95,13 @@ fn conf_rank(c: Confidence) -> u8 {
 /// Convenience wrapper: snapshot plus findings.
 pub fn report(snap: Snapshot) -> Report {
     let findings = analyze(&snap);
+    let exonerations = crate::verdict::exonerate(&snap, &findings);
+    let verdicts = crate::verdict::verdicts(&snap, &findings, &exonerations);
     Report {
         snapshot: snap,
         findings,
+        exonerations,
+        verdicts,
     }
 }
 
@@ -925,7 +929,7 @@ fn kernel_history_rules(snap: &Snapshot, dev: &UsbDevice, out: &mut Vec<Finding>
 }
 
 /// USB mass storage class code.
-const CLASS_MASS_STORAGE: u8 = 0x08;
+pub(crate) const CLASS_MASS_STORAGE: u8 = 0x08;
 /// USB Billboard class code — a device announcing a failed Alternate Mode.
 const CLASS_BILLBOARD: u8 = 0x11;
 /// USB hub class code.
@@ -1900,7 +1904,7 @@ fn corroborate_with_urb_errors(snap: &Snapshot, findings: &mut [Finding]) {
 }
 
 /// The SVID VESA assigned to DisplayPort Alternate Mode.
-const SVID_DISPLAYPORT: u16 = 0xff01;
+pub(crate) const SVID_DISPLAYPORT: u16 = 0xff01;
 
 /// Cross-check a DisplayPort Alt Mode against whether a picture came out.
 ///

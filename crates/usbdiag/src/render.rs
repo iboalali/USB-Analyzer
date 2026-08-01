@@ -73,6 +73,115 @@ impl Theme {
 // Findings
 // ---------------------------------------------------------------------------
 
+/// The answer, before the evidence.
+///
+/// Findings already list what is wrong. What this adds is the sentence for
+/// subjects where *nothing* is wrong, which the tool previously expressed by
+/// saying nothing at all — indistinguishable, from the outside, from not having
+/// looked.
+///
+/// So the default view leads with faults and then shows only the clean verdicts
+/// that have something to cite. A `Clear` with an empty `because` is real but
+/// unquotable, and printing nine of those would bury the four that mean
+/// something; they collapse to a count instead, and `-v` shows them all.
+pub fn verdicts(out: &mut String, report: &Report, t: &Theme) {
+    if report.verdicts.is_empty() {
+        return;
+    }
+    let (shown, silent): (Vec<_>, Vec<_>) = report
+        .verdicts
+        .iter()
+        .partition(|v| t.verbose || v.outcome != Outcome::Clear || !v.because.is_empty());
+
+    if shown.is_empty() && silent.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "{}", t.heading("verdict"));
+
+    let width = shown
+        .iter()
+        .map(|v| v.subject.display().chars().count())
+        .max()
+        .unwrap_or(0)
+        .clamp(6, 16);
+
+    for v in &shown {
+        let glyph = match v.outcome {
+            Outcome::Fault => t.red("✗"),
+            Outcome::Minor => t.yellow("·"),
+            Outcome::Clear => t.green("✓"),
+        };
+        let subject = v.subject.display();
+        let _ = writeln!(
+            out,
+            "  {glyph} {:width$}  {}",
+            t.bold(&subject),
+            v.headline,
+            // Padding is computed on the unstyled text; the escape codes in
+            // `t.bold` are zero-width on screen but not to `format!`.
+            width = width + (t.bold(&subject).len() - subject.chars().count())
+        );
+        if t.verbose && !v.because.is_empty() {
+            let _ = writeln!(
+                out,
+                "  {:width$}  {}",
+                "",
+                t.dim(&v.because.join(", ")),
+                width = width + 2
+            );
+        }
+    }
+
+    if !silent.is_empty() {
+        let _ = writeln!(
+            out,
+            "  {} {} other subject(s) examined, nothing found",
+            t.dim(" "),
+            silent.len()
+        );
+    }
+    let _ = writeln!(out);
+}
+
+/// Statements that a thing is *not* the problem.
+///
+/// Verbose only. These exist to make a clean verdict citable rather than to be
+/// read one by one, and at Info level in a list of faults they would be pure
+/// volume — the task that introduced them said so before they were written.
+pub fn exonerations(out: &mut String, report: &Report, t: &Theme) {
+    if !t.verbose || report.exonerations.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "{}", t.heading("ruled out"));
+    for f in &report.exonerations {
+        let _ = writeln!(
+            out,
+            "{} {} {}",
+            t.green("✓"),
+            t.bold(&f.subject.display()),
+            f.title
+        );
+        let indent = "         ";
+        for line in wrap(&f.detail, WIDTH - indent.len()) {
+            let _ = writeln!(out, "{indent}{}", t.dim(&line));
+        }
+        for (i, e) in f.evidence.iter().enumerate() {
+            let branch = if i + 1 == f.evidence.len() {
+                "└"
+            } else {
+                "├"
+            };
+            let _ = writeln!(out, "{indent}{} {}", t.dim(branch), t.dim(e));
+        }
+        let _ = writeln!(
+            out,
+            "{indent}{}",
+            t.dim(&format!("{} · {}", f.code, f.confidence.label()))
+        );
+        let _ = writeln!(out);
+    }
+}
+
 pub fn findings(out: &mut String, report: &Report, t: &Theme) {
     let _ = writeln!(out, "{}", t.heading("findings"));
     if report.findings.is_empty() {
