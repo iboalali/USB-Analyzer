@@ -28,9 +28,10 @@ on macOS (8 k stars). `usbeehive` is on crates.io at 0.11.0.
 
 Two of their decisions are worth adopting outright:
 
-- **`usbeehive` bundles a USB-IF vendor database.** That settles open question
-  §11.2 in the GUI concept — bundling is normal in this category, not a first
-  data file to agonise over.
+- **`usbeehive` resolves vendor IDs to names at all**, which we do not. It
+  bundles a USB-IF table to do it; the conclusion below is to read the system
+  one instead, but the feature is the point. Either way it settles open question
+  §11.2 in the GUI concept: a name for a bare VID is table stakes here.
 - **`usbeehive::cable::CableTrust`** flags a probably-counterfeit e-marker from
   three signals: a zero vendor ID in the ID Header VDO, a VID absent from the
   USB-IF database, and reserved bits set in the Cable VDO. Its doc comment says

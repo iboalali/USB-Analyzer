@@ -251,6 +251,8 @@ needs looking at rather than assuming.
   Settled by the mockups: no mode. The narrow window is the same widget tree
   under a breakpoint, and it costs nothing. A tray popover would be a genuinely
   different view — that is the thing to say no to, not the narrow width.
-- Whether to bundle `usb.ids` for vendor names where a device exposes no strings.
-  WhatCable bundles a merged USB-IF/`usb.ids` database; here it would be the
-  first data file in the project, and most devices already carry usable strings.
+- ~~Whether to bundle `usb.ids` for vendor names where a device exposes no
+  strings.~~ Settled: read the system copy, don't bundle anything. See
+  [`02-prior-art.md`](02-prior-art.md) and task #25. Most devices do carry
+  usable strings — but a cable e-marker never does, so this is the difference
+  between naming a cable and printing its VID in hex.
