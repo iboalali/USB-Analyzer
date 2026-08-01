@@ -1367,6 +1367,7 @@ pub fn capabilities(out: &mut String, snap: &Snapshot, t: &Theme) {
         ("usbmon", &c.usbmon),
         ("usbfs", &c.usbfs),
         ("disks", &c.block_read),
+        ("ports", &c.port_control),
     ] {
         let mark = if iface.is_usable() {
             t.green("✓")
@@ -1484,6 +1485,67 @@ pub fn throughput(out: &mut String, snap: &Snapshot, t: &Theme) {
     }
 }
 
+/// The per-cycle record from the re-enumeration probe.
+///
+/// Shows every attempt, not just the summary. A distribution like "18 at 5G, 2
+/// at 480M" is the finding, but seeing *which* attempts fell back is what tells
+/// someone whether it degrades over time or fails at random.
+pub fn reenumeration(out: &mut String, snap: &Snapshot, t: &Theme) {
+    let Some(run) = &snap.reenumeration else {
+        return;
+    };
+    let _ = writeln!(out, "{}", t.heading("port cycling"));
+    if let Some(e) = &run.error {
+        let _ = writeln!(out, "  {}\n", t.red(e));
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "  {} {}",
+        t.bold(&run.device),
+        t.dim(&format!("via {} — {} cycles", run.port, run.cycles.len()))
+    );
+
+    for c in &run.cycles {
+        let outcome = match (c.returned, &c.speed_mbps) {
+            (true, Some(mbps)) => {
+                let speed = LinkSpeed::from_mbps(*mbps);
+                let lanes = match (c.rx_lanes, c.tx_lanes) {
+                    (Some(rx), Some(tx)) if rx > 1 || tx > 1 => format!("  {rx}x{tx} lanes"),
+                    _ => String::new(),
+                };
+                let text = format!("{}{lanes}  after {} ms", speed.short(), c.returned_after_ms);
+                // Anything below the best seen is the interesting row.
+                match run.best_mbps() {
+                    Some(best) if *mbps < best => t.yellow(&text),
+                    _ => t.green(&text),
+                }
+            }
+            _ => t.red(c.error.as_deref().unwrap_or("did not return")),
+        };
+        let _ = writeln!(
+            out,
+            "    {} {}",
+            t.dim(&format!("{:>3}", c.index + 1)),
+            outcome
+        );
+    }
+
+    let _ = writeln!(out);
+    for (label, n) in run.speed_distribution() {
+        row(out, t, &label, &format!("{n} of {}", run.cycles.len()));
+    }
+    if run.failures() > 0 {
+        row(
+            out,
+            t,
+            "did not return",
+            &t.red(&format!("{} of {}", run.failures(), run.cycles.len())),
+        );
+    }
+    let _ = writeln!(out);
+}
+
 /// The probe catalogue: what exists, what this machine allows, and what each
 /// one would do to the bus.
 ///
@@ -1507,6 +1569,7 @@ pub fn probes(out: &mut String, snap: &Snapshot, t: &Theme) {
         ("usbmon", &c.usbmon),
         ("usbfs", &c.usbfs),
         ("disks", &c.block_read),
+        ("ports", &c.port_control),
     ] {
         let mark = if iface.is_usable() {
             t.green("✓")

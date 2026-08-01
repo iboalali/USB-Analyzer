@@ -48,6 +48,9 @@ pub struct Snapshot {
     /// means it was not attempted, which is not the same as nothing to say.
     #[serde(default)]
     pub throughput: Vec<ThroughputSample>,
+    /// Port-cycling results, present only when the re-enumeration probe ran.
+    #[serde(default)]
+    pub reenumeration: Option<ReenumerationRun>,
     pub kernel_log: KernelLog,
 }
 
@@ -1273,6 +1276,79 @@ impl ThroughputSample {
     /// that a filesystem's idle housekeeping does not invalidate a good sample.
     pub fn was_contended(&self) -> bool {
         self.contended_bytes.is_some_and(|b| b > 4_000_000)
+    }
+}
+
+/// The result of cycling a hub port repeatedly: the only way to see a link
+/// that works most of the time.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReenumerationRun {
+    pub device: String,
+    /// Short port name, e.g. `usb4-port1`.
+    pub port: String,
+    pub port_path: PathBuf,
+    pub requested_cycles: usize,
+    pub cycles: Vec<ReenumerationCycle>,
+    /// Set when the run could not start at all — most often because the device
+    /// was unplugged between the capture and the probe. Recorded rather than
+    /// left as an empty result, since "no cycles" and "nothing to report" would
+    /// otherwise look the same.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReenumerationCycle {
+    pub index: usize,
+    pub returned: bool,
+    pub returned_after_ms: u64,
+    pub speed_mbps: Option<f64>,
+    pub rx_lanes: Option<u32>,
+    pub tx_lanes: Option<u32>,
+    pub error: Option<String>,
+}
+
+impl ReenumerationRun {
+    /// Cycles where the device came back at all.
+    pub fn successes(&self) -> usize {
+        self.cycles.iter().filter(|c| c.returned).count()
+    }
+
+    pub fn failures(&self) -> usize {
+        self.cycles.iter().filter(|c| !c.returned).count()
+    }
+
+    /// How often each negotiated speed came up, slowest first. This is the
+    /// evidence: one entry means a stable link, more than one means it varies.
+    pub fn speed_distribution(&self) -> Vec<(String, usize)> {
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut order: BTreeMap<String, i64> = BTreeMap::new();
+        for mbps in self.cycles.iter().filter_map(|c| c.speed_mbps) {
+            let label = LinkSpeed::from_mbps(mbps).short();
+            *counts.entry(label.clone()).or_default() += 1;
+            order.insert(label, mbps as i64);
+        }
+        let mut out: Vec<(String, usize)> = counts.into_iter().collect();
+        out.sort_by_key(|(label, _)| order.get(label).copied().unwrap_or(0));
+        out
+    }
+
+    /// The fastest rate ever reached, which is what the link is *capable* of
+    /// and therefore the yardstick every slower cycle fell short of.
+    pub fn best_mbps(&self) -> Option<f64> {
+        self.cycles
+            .iter()
+            .filter_map(|c| c.speed_mbps)
+            .fold(None, |acc: Option<f64>, m| {
+                Some(acc.map_or(m, |a| a.max(m)))
+            })
+    }
+
+    /// A link that did not do the same thing every time.
+    ///
+    /// Needs more than one cycle to mean anything: a single attempt cannot
+    /// disagree with itself.
+    pub fn is_intermittent(&self) -> bool {
+        self.cycles.len() > 1 && (self.failures() > 0 || self.speed_distribution().len() > 1)
     }
 }
 

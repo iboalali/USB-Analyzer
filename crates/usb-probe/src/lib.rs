@@ -36,6 +36,7 @@ pub mod model;
 pub mod monitor;
 pub mod pd;
 pub mod probe;
+pub mod reenumerate;
 pub mod sysfs;
 pub mod throughput;
 pub mod thunderbolt;
@@ -134,6 +135,7 @@ pub fn capture_with_log(opts: Options, log: Option<KernelLog>) -> Snapshot {
         // The throughput probe runs after a capture, never during one: it
         // costs seconds of wall-clock and must not happen by default.
         throughput: Vec::new(),
+        reenumeration: None,
         kernel_log: log.unwrap_or_else(|| kernel::collect(opts.kernel)),
     }
 }

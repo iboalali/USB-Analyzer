@@ -108,6 +108,11 @@ pub struct Capabilities {
     /// bridge as any other transfer, and needs no ioctl to do it.
     #[serde(default = "unprobed")]
     pub block_read: Interface,
+    /// A hub port's `disable` attribute — the one thing here that can take a
+    /// device off the bus and put it back, and the only way to test whether a
+    /// link trains reliably rather than merely once.
+    #[serde(default = "unprobed")]
+    pub port_control: Interface,
 }
 
 fn unprobed() -> Interface {
@@ -121,6 +126,7 @@ impl Default for Capabilities {
             usbmon: unprobed(),
             usbfs: unprobed(),
             block_read: unprobed(),
+            port_control: unprobed(),
         }
     }
 }
@@ -137,6 +143,7 @@ impl Capabilities {
             Requirement::Usbmon => &self.usbmon,
             Requirement::Usbfs => &self.usbfs,
             Requirement::BlockRead => &self.block_read,
+            Requirement::PortControl => &self.port_control,
         };
         if iface.is_usable() {
             return None;
@@ -203,6 +210,7 @@ pub enum Requirement {
     Usbmon,
     Usbfs,
     BlockRead,
+    PortControl,
 }
 
 impl Requirement {
@@ -212,6 +220,7 @@ impl Requirement {
             Requirement::Usbmon => "usbmon",
             Requirement::Usbfs => "usbfs write access",
             Requirement::BlockRead => "read access to raw disks",
+            Requirement::PortControl => "write access to hub port controls",
         }
     }
 }
@@ -269,10 +278,11 @@ pub const PROBES: &[ProbeInfo] = &[
     ProbeInfo {
         name: "reenumerate",
         class: ProbeClass::Disruptive,
-        needs: Requirement::Usbfs,
-        implemented: false,
-        summary: "Cycle the port repeatedly and record the distribution of negotiated \
-                  speeds. The only way to catch an intermittent link.",
+        needs: Requirement::PortControl,
+        implemented: true,
+        summary: "Cycle the hub port repeatedly and record the distribution of negotiated \
+                  speeds. The only way to catch a link that works most of the time. Takes \
+                  the device off the bus and back on again, once per cycle.",
     },
 ];
 
@@ -295,6 +305,7 @@ pub fn detect_in(root: &Path) -> Capabilities {
         usbmon: detect_usbmon(root),
         usbfs: detect_usbfs(root),
         block_read: detect_block_read(root),
+        port_control: detect_port_control(root),
     }
 }
 
@@ -523,6 +534,72 @@ fn detect_block_read(root: &Path) -> Interface {
             Some(node),
         ),
     }
+}
+
+/// Whether a hub port's `disable` attribute can be written.
+///
+/// Tested by **opening for append, not by writing**. Writing would cycle a
+/// port, which is precisely the thing that must never happen without consent —
+/// so this is the one place where detection-by-attempt has to stop short of the
+/// real attempt. Append mode is used rather than truncating write because
+/// truncation is itself a modification, and sysfs attributes are not files to
+/// be casually reshaped.
+fn detect_port_control(root: &Path) -> Interface {
+    let Some(node) = first_port_disable(root) else {
+        return Interface::new(
+            Availability::Unsupported(
+                "no hub port exposes a 'disable' attribute — this kernel cannot switch a \
+                 port off from userspace, so link stability cannot be tested"
+                    .into(),
+            ),
+            None,
+        );
+    };
+
+    match OpenOptions::new().append(true).open(&node) {
+        Ok(_) => Interface::new(Availability::Usable, Some(node)),
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => Interface::new(
+            Availability::Denied(format!(
+                "{} is not writable by this process — hub port controls are root-only",
+                node.display()
+            )),
+            Some(node),
+        ),
+        Err(e) => Interface::new(
+            Availability::Denied(format!("{}: {e}", node.display())),
+            Some(node),
+        ),
+    }
+}
+
+/// Any port `disable` file, found by walking hub interfaces. Only its
+/// writability is of interest — which port it belongs to does not matter.
+fn first_port_disable(root: &Path) -> Option<PathBuf> {
+    let mut devices = fsx::list_dir(root.join("sys/bus/usb/devices"));
+    devices.sort();
+    for dev in devices {
+        // Hub interface directories are the only place port dirs live.
+        let mut ifaces: Vec<PathBuf> = fsx::list_dir(&dev)
+            .into_iter()
+            .filter(|e| fsx::file_name(e).contains(':'))
+            .collect();
+        ifaces.sort();
+        for iface in ifaces {
+            let mut ports: Vec<PathBuf> = fsx::list_dir(&iface)
+                .into_iter()
+                .filter(|e| fsx::file_name(e).contains("-port"))
+                .collect();
+            ports.sort();
+            if let Some(found) = ports
+                .into_iter()
+                .map(|p| p.join("disable"))
+                .find(|p| p.exists())
+            {
+                return Some(found);
+            }
+        }
+    }
+    None
 }
 
 /// The first `/dev/sd*` whole disk — no partitions, since a partition may be
@@ -756,19 +833,29 @@ mod tests {
         let caps = detect_in(&root);
         assert_eq!(caps.usbfs.availability, Availability::Usable);
 
+        // usbfs unlocks nothing on its own any more: throughput reads raw
+        // disks and reenumerate writes a hub port control.
         let names: Vec<&str> = caps.runnable().iter().map(|p| p.name).collect();
-        assert!(names.contains(&"reenumerate"), "{names:?}");
-        // No disk node in this root, so the throughput probe stays blocked.
         assert!(!names.contains(&"throughput"), "{names:?}");
-        // usbmon is still absent, so its probe stays blocked too.
+        assert!(!names.contains(&"reenumerate"), "{names:?}");
         assert!(!names.contains(&"urb-errors"), "{names:?}");
 
-        // Add a readable disk and only that probe changes.
+        // A readable disk unlocks exactly one of them.
         fs::write(root.join("dev/sda"), b"").unwrap();
         let caps = detect_in(&root);
         assert_eq!(caps.block_read.availability, Availability::Usable);
         let names: Vec<&str> = caps.runnable().iter().map(|p| p.name).collect();
         assert!(names.contains(&"throughput"), "{names:?}");
+        assert!(!names.contains(&"reenumerate"), "{names:?}");
+
+        // And a writable port control unlocks the other.
+        let port = root.join("sys/bus/usb/devices/usb1/1-0:1.0/usb1-port1");
+        fs::create_dir_all(&port).unwrap();
+        fs::write(port.join("disable"), "0\n").unwrap();
+        let caps = detect_in(&root);
+        assert_eq!(caps.port_control.availability, Availability::Usable);
+        let names: Vec<&str> = caps.runnable().iter().map(|p| p.name).collect();
+        assert!(names.contains(&"reenumerate"), "{names:?}");
         assert!(!names.contains(&"urb-errors"), "{names:?}");
 
         let _ = fs::remove_dir_all(&root);
@@ -814,6 +901,7 @@ mod tests {
             usbmon: Interface::new(Availability::NotLoaded("module not loaded".into()), None),
             usbfs: Interface::new(Availability::Usable, None),
             block_read: Interface::new(Availability::Usable, None),
+            port_control: Interface::new(Availability::Usable, None),
         };
         let why = caps.blocker(probe("urb-errors").unwrap()).unwrap();
         assert!(why.contains("urb-errors") && why.contains("usbmon"), "{why}");

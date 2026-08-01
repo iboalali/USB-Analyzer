@@ -42,6 +42,7 @@ struct Args {
     probe: Option<String>,
     target: Option<String>,
     duration_ms: u64,
+    cycles: usize,
     consented: bool,
     forced: bool,
 }
@@ -59,6 +60,7 @@ impl Default for Args {
             probe: None,
             target: None,
             duration_ms: DEFAULT_PROBE_MS,
+            cycles: usb_probe::probe::DEFAULT_CYCLES,
             consented: false,
             forced: false,
         }
@@ -220,6 +222,7 @@ fn probe(args: &Args, opts: Options) -> ExitCode {
         name,
         target: args.target.as_deref(),
         window: Duration::from_millis(args.duration_ms),
+        cycles: args.cycles,
         consented: args.consented,
         accepts_disruption: args.forced,
     };
@@ -262,6 +265,7 @@ fn probe(args: &Args, opts: Options) -> ExitCode {
         ));
     }
     out.push('\n');
+    render::reenumeration(&mut out, &report.snapshot, &theme);
     render::throughput(&mut out, &report.snapshot, &theme);
     render::urb_traffic(&mut out, &report.snapshot, &theme);
     render::findings(&mut out, &report, &theme);
@@ -305,6 +309,37 @@ fn confirm_interactively(
 
     let target = request.target.unwrap_or("this device");
     eprintln!("{}", refusal.message());
+
+    // Everything that will drop, named before the yes rather than after it.
+    // That is the whole point of a second confirmation: the first yes is to the
+    // idea, this one is to the consequences.
+    if let Ok(preview) = usb_probe::probe::plan(
+        caps,
+        snapshot,
+        &usb_probe::probe::Request {
+            accepts_disruption: true,
+            ..request.clone()
+        },
+    ) {
+        for effect in &preview.side_effects {
+            eprintln!("  · {effect}");
+        }
+        // Printed now, while it still can be. A process killed with the port
+        // down cannot print anything, and putting it back by hand needs the
+        // path.
+        if let Some(port) = preview
+            .target
+            .as_ref()
+            .and_then(|t| usb_probe::reenumerate::port_for(&t.sysfs_name))
+        {
+            eprintln!(
+                "  · if this is killed mid-cycle the port can be left disabled. \
+                 To undo that:\n    {}",
+                port.recovery_command()
+            );
+        }
+    }
+
     eprint!("Type the target name ({target}) to continue, anything else to stop: ");
     let _ = std::io::stderr().flush();
 
@@ -479,6 +514,16 @@ fn parse(argv: &[String]) -> Result<Option<Args>, String> {
                     return Err("--duration must be at least 100 ms to measure anything".into());
                 }
             }
+            "--cycles" => {
+                i += 1;
+                let v = argv.get(i).ok_or("--cycles needs a count")?;
+                args.cycles = v.parse().map_err(|_| format!("not a count: {v}"))?;
+                if args.cycles < 2 {
+                    return Err("--cycles must be at least 2 — one attempt cannot disagree \
+                                with itself"
+                        .into());
+                }
+            }
             "-y" | "--yes" => args.consented = true,
             "--force" => args.forced = true,
             _ if a.starts_with('-') => return Err(format!("unknown option: {a}")),
@@ -556,6 +601,8 @@ PROBE OPTIONS
         --target NAME   Scope a probe to one device: a sysfs name such as
                         6-1.2, or a disk such as sdb
         --duration MS   How long a sampling probe runs, default {DEFAULT_PROBE_MS}
+        --cycles N      How many times 'reenumerate' cycles the port, default
+                        20. More attempts find rarer faults
     -y, --yes           Consent to a disruptive probe
         --force         Accept the interruption without being asked. Needed
                         only when there is no terminal to ask on

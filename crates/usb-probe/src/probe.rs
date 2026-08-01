@@ -47,6 +47,10 @@ pub struct Request<'a> {
     pub target: Option<&'a str>,
     /// How long the probe should run, where it takes a window at all.
     pub window: Duration,
+    /// How many times to cycle the port, for the probe that cycles one.
+    /// Separate from `window` because a cycle takes as long as the hardware
+    /// takes; the useful control is how many attempts, not for how long.
+    pub cycles: usize,
     /// The user asked for something out of band, knowingly.
     pub consented: bool,
     /// The user separately accepted that this one interrupts the device.
@@ -59,11 +63,15 @@ impl<'a> Request<'a> {
             name,
             target: None,
             window,
+            cycles: DEFAULT_CYCLES,
             consented: false,
             accepts_disruption: false,
         }
     }
 }
+
+/// Enough attempts to see a one-in-ten fault, few enough to sit through.
+pub const DEFAULT_CYCLES: usize = 20;
 
 /// A device a probe has been pointed at, resolved against a real snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +80,9 @@ pub struct Target {
     pub label: String,
     /// Disks reached through this device, if any.
     pub blocks: Vec<String>,
+    /// A root hub has no upstream port of its own, and everything on the bus
+    /// hangs off it.
+    pub is_root_hub: bool,
 }
 
 /// An approved probe. Holding one means every check has already passed.
@@ -80,6 +91,11 @@ pub struct Plan {
     pub probe: &'static ProbeInfo,
     pub target: Option<Target>,
     pub window: Duration,
+    pub cycles: usize,
+    /// What else stops working while this runs. Not reasons to refuse — things
+    /// the user should know before saying yes the second time, which is what
+    /// the second confirmation is for.
+    pub side_effects: Vec<String>,
 }
 
 impl Plan {
@@ -94,12 +110,18 @@ impl Plan {
         if self.takes_a_window() {
             s.push_str(&format!(", for {:.1}s", self.window.as_secs_f64()));
         }
+        if self.probe.name == "reenumerate" {
+            s.push_str(&format!(", {} times", self.cycles));
+        }
         s.push_str(match self.probe.class {
             ProbeClass::Passive | ProbeClass::PrivilegedRead => ". Nothing on the bus changes.",
             ProbeClass::Disruptive => {
                 ". The device leaves the bus and comes back when this finishes."
             }
         });
+        for effect in &self.side_effects {
+            s.push_str(&format!("\n  · {effect}"));
+        }
         s
     }
 
@@ -153,6 +175,40 @@ pub fn run(plan: &Plan, base: Options) -> crate::model::Report {
         }
     }
 
+    if plan.probe.name == "reenumerate" {
+        // Both unwraps are structural: the gate refuses this probe without a
+        // target, and refuses a target with no hub port behind it.
+        if let Some(target) = &plan.target {
+            match crate::reenumerate::port_for(&target.sysfs_name) {
+                None => {
+                    // The gate already refused root hubs, so reaching here
+                    // means the device went away between capture and probe.
+                    snapshot.reenumeration = Some(crate::model::ReenumerationRun {
+                        device: target.sysfs_name.clone(),
+                        requested_cycles: plan.cycles,
+                        error: Some(format!(
+                            "{} has no hub port to cycle any more — it looks to have been \
+                             unplugged since the scan",
+                            target.sysfs_name
+                        )),
+                        ..Default::default()
+                    });
+                }
+                Some(port) => {
+                    let run = crate::reenumerate::cycle(&port, &target.sysfs_name, plan.cycles);
+                    snapshot.reenumeration = Some(run);
+                    // The device has been on and off the bus several times, so
+                    // everything read before is stale. Read it again.
+                    let fresh = crate::capture(base);
+                    snapshot = Snapshot {
+                        reenumeration: snapshot.reenumeration,
+                        ..fresh
+                    };
+                }
+            }
+        }
+    }
+
     crate::diag::report(snapshot)
 }
 
@@ -179,6 +235,17 @@ pub enum Refusal {
     InUse {
         target: String,
         holds: Vec<Hold>,
+    },
+    /// The other one it cannot lift: taking this device off the bus would
+    /// remove the user's means of stopping what happens next.
+    CriticalDevice {
+        target: String,
+        uses: Vec<String>,
+    },
+    /// A root hub: it has no upstream port to cycle, and everything on the bus
+    /// hangs off it.
+    WholeBus {
+        target: String,
     },
     /// The only recoverable one: the user has not said yes yet.
     NeedsConsent {
@@ -232,6 +299,18 @@ impl Refusal {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            Refusal::CriticalDevice { target, uses } => format!(
+                "refusing to cycle {target}: {}. Disabling that port takes the input device \
+                 with it, so if anything then goes wrong there is no key left to press. This \
+                 refusal cannot be overridden — move the device to another port, or name a \
+                 different target",
+                uses.join(", ")
+            ),
+            Refusal::WholeBus { target } => format!(
+                "{target} is a root hub. It has no upstream port to cycle, and cycling the \
+                 bus itself would take every device on it down at once — name one of the \
+                 devices below it instead"
+            ),
             Refusal::NeedsConsent { probe, what } => match what {
                 Consent::ToProbe => format!(
                     "'{}' does more than read the system's own records, so it needs to be \
@@ -261,13 +340,6 @@ pub fn plan(caps: &Capabilities, snap: &Snapshot, req: &Request) -> Result<Plan,
         });
     };
 
-    // Checked here rather than inside `approve`, and therefore first: telling
-    // someone to add --target to a probe that then turns out not to exist yet
-    // would send them down a dead end.
-    if !probe.implemented {
-        return Err(Refusal::NotImplemented(probe));
-    }
-
     // Read now, not at capture time. A filesystem can be mounted in between,
     // and the stale answer is the dangerous one.
     approve(probe, caps, snap, req, &block::holders())
@@ -285,8 +357,11 @@ fn approve(
     req: &Request,
     holders: &std::collections::BTreeMap<String, Vec<Hold>>,
 ) -> Result<Plan, Refusal> {
-    if let Some(why) = caps.blocker(probe) {
-        return Err(Refusal::Unavailable { probe, why });
+    // First of all the checks: telling someone to load a kernel module, or to
+    // add --target, for a probe that then turns out not to be written yet
+    // would send them down a dead end.
+    if !probe.implemented {
+        return Err(Refusal::NotImplemented(probe));
     }
 
     let disruptive = probe.class == ProbeClass::Disruptive;
@@ -298,8 +373,10 @@ fn approve(
         None => None,
     };
 
-    // Before consent, not after: being told the disk is mounted is more use
-    // than being told to confirm something that will then be refused anyway.
+    // Both absolute checks come before consent, not after: being told the disk
+    // is mounted is more use than being told to confirm something that would
+    // then be refused anyway.
+    let mut side_effects = Vec::new();
     if disruptive {
         if let Some(t) = &target {
             let holds: Vec<Hold> = t
@@ -315,7 +392,35 @@ fn approve(
                     holds,
                 });
             }
+
+            if t.is_root_hub {
+                return Err(Refusal::WholeBus {
+                    target: t.sysfs_name.clone(),
+                });
+            }
+
+            // The other thing consent cannot cover. Taking a keyboard off the
+            // bus removes the means of interrupting whatever happens next, so
+            // agreeing to it is not something a user can meaningfully do.
+            let inputs = crate::reenumerate::input_devices(snap, &t.sysfs_name);
+            if !inputs.is_empty() {
+                return Err(Refusal::CriticalDevice {
+                    target: t.sysfs_name.clone(),
+                    uses: inputs,
+                });
+            }
+
+            side_effects = crate::reenumerate::side_effects(snap, &t.sysfs_name);
         }
+    }
+
+    // Privilege is checked after everything about the request itself, because
+    // the request errors are the ones the user can fix without escalating.
+    // Answering "you need root" first costs them a sudo round trip to discover
+    // that the target was misspelled, or that the disk is mounted and it was
+    // never going to work at any privilege.
+    if let Some(why) = caps.blocker(probe) {
+        return Err(Refusal::Unavailable { probe, why });
     }
 
     // Only the disruptive class asks. A read-only probe was requested by name
@@ -339,6 +444,8 @@ fn approve(
         probe,
         target,
         window: req.window,
+        cycles: req.cycles.clamp(2, 100),
+        side_effects,
     })
 }
 
@@ -360,6 +467,7 @@ fn resolve_target(snap: &Snapshot, name: &str) -> Option<Target> {
             sysfs_name: dev.sysfs_name.clone(),
             label: dev.label(),
             blocks,
+            is_root_hub: dev.is_root_hub,
         });
     }
 
@@ -371,6 +479,7 @@ fn resolve_target(snap: &Snapshot, name: &str) -> Option<Target> {
             sysfs_name: dev.sysfs_name.clone(),
             label: dev.label(),
             blocks: blocks.iter().map(|b| b.name.clone()).collect(),
+            is_root_hub: dev.is_root_hub,
         })
 }
 
@@ -392,6 +501,10 @@ mod tests {
                 path: None,
             },
             block_read: Interface {
+                availability: usbfs.clone(),
+                path: None,
+            },
+            port_control: Interface {
                 availability: usbfs,
                 path: None,
             },
@@ -475,24 +588,50 @@ mod tests {
 
     /// A registered probe with no code behind it must say so, not fail
     /// obscurely somewhere further in.
+    /// Every registered probe is written now, so this is exercised through a
+    /// stand-in — the check has to keep working for the next probe that is
+    /// listed before it is built.
     #[test]
     fn an_unimplemented_probe_refuses_by_name() {
+        const UNWRITTEN: ProbeInfo = ProbeInfo {
+            name: "test-unwritten",
+            class: ProbeClass::Disruptive,
+            needs: crate::caps::Requirement::Usbfs,
+            implemented: false,
+            summary: "Registered but not built, used only by tests.",
+        };
         let caps = caps_with(Availability::Usable, Availability::Usable);
         let snap = snapshot_with_a_disk();
-        let e = plan(
+        let e = approve(
+            &UNWRITTEN,
             &caps,
             &snap,
             &Request {
                 target: Some("6-1"),
                 consented: true,
                 accepts_disruption: true,
-                ..Request::new("reenumerate", Duration::from_secs(1))
+                ..Request::new(UNWRITTEN.name, Duration::from_secs(1))
             },
+            &free(),
         )
         .unwrap_err();
         assert!(e.message().contains("not implemented"), "{}", e.message());
         // Consent given in full, and it still does not run.
         assert!(!e.is_recoverable());
+    }
+
+    /// Nothing in the registry should be advertised and then refused. When this
+    /// fires, either a probe was written and the flag not flipped, or one was
+    /// registered ahead of being built — the second is fine, and the test is
+    /// here so it is a deliberate choice rather than an oversight.
+    #[test]
+    fn every_registered_probe_is_implemented() {
+        let unwritten: Vec<&str> = crate::caps::PROBES
+            .iter()
+            .filter(|p| !p.implemented)
+            .map(|p| p.name)
+            .collect();
+        assert!(unwritten.is_empty(), "not implemented: {unwritten:?}");
     }
 
     #[test]
@@ -549,6 +688,22 @@ mod tests {
             accepts_disruption: true,
             ..Request::new(CYCLE.name, Duration::from_secs(1))
         }
+    }
+
+    /// A root hub is not a device you can cycle: it has no upstream port, and
+    /// everything on the bus is behind it.
+    #[test]
+    fn a_root_hub_is_refused_because_it_is_the_whole_bus() {
+        let caps = caps_with(Availability::Usable, Availability::Usable);
+        let snap = snapshot_with_a_disk();
+        let e = approve(&CYCLE, &caps, &snap, &cycle_request(Some("usb6")), &free()).unwrap_err();
+        assert!(matches!(e, Refusal::WholeBus { .. }), "{}", e.message());
+        assert!(
+            e.message().contains("every device on it"),
+            "{}",
+            e.message()
+        );
+        assert!(!e.is_recoverable());
     }
 
     #[test]
@@ -636,6 +791,57 @@ mod tests {
         assert!(e.message().contains("off the bus"), "{}", e.message());
     }
 
+    /// The second refusal consent cannot lift.
+    ///
+    /// Losing a keyboard is not like losing a filesystem — nothing is
+    /// destroyed — but it removes the means of stopping whatever happens next,
+    /// which is not something a user can meaningfully agree to in advance.
+    #[test]
+    fn a_keyboard_in_the_subtree_is_refused_whatever_consent_is_given() {
+        let caps = caps_with(Availability::Usable, Availability::Usable);
+        let mut snap = snapshot_with_a_disk();
+
+        let mut kbd = crate::test_support::device("6-1.1", " 2.00", 12.0, Some("6-1"));
+        kbd.product = Some("Compact Keyboard".into());
+        kbd.interfaces.push(crate::model::UsbInterface {
+            sysfs_name: "6-1.1:1.0".into(),
+            number: Some(0),
+            class: Some(0x03),
+            subclass: Some(1),
+            protocol: Some(1),
+            driver: Some("usbhid".into()),
+            description: None,
+        });
+        snap.buses[0].children[0].children.push(kbd);
+
+        let e = approve(&CYCLE, &caps, &snap, &cycle_request(Some("6-1")), &free()).unwrap_err();
+        let m = e.message();
+        assert!(m.contains("a keyboard"), "{m}");
+        assert!(m.contains("no key left to press"), "{m}");
+        assert!(m.contains("cannot be overridden"), "{m}");
+        assert!(!e.is_recoverable());
+
+        // A sibling with no keyboard under it is still fine.
+        assert!(approve(&CYCLE, &caps, &snap, &cycle_request(Some("6-1.1")), &free()).is_err());
+    }
+
+    /// Things that will drop and come back are warnings, not refusals — they
+    /// belong in the confirmation so the second yes is informed.
+    #[test]
+    fn a_disk_that_is_present_but_unmounted_is_a_warning_not_a_refusal() {
+        let caps = caps_with(Availability::Usable, Availability::Usable);
+        let snap = snapshot_with_a_disk();
+
+        let plan = approve(&CYCLE, &caps, &snap, &cycle_request(Some("6-1")), &free()).unwrap();
+        assert!(
+            plan.side_effects.iter().any(|e| e.contains("sdb")),
+            "{:?}",
+            plan.side_effects
+        );
+        // And it reaches the text the user actually sees.
+        assert!(plan.describe().contains("sdb"), "{}", plan.describe());
+    }
+
     /// Order matters. A mounted disk is reported as mounted even when the user
     /// has not consented yet — being told to confirm something that will then
     /// be refused anyway is the wrong answer.
@@ -659,17 +865,42 @@ mod tests {
         assert!(e.message().contains("swap"), "{}", e.message());
     }
 
-    /// And a missing interface outranks everything: there is no point asking
-    /// for consent to something this process could not do either way.
+    /// A missing interface outranks consent — there is no point asking to
+    /// confirm something this process could not do either way — but it does
+    /// *not* outrank anything wrong with the request itself.
+    ///
+    /// The order matters for a real reason: answering "you need root" to a
+    /// misspelled target, or to a disk that is mounted, sends the user off to
+    /// find sudo only to be refused again for a reason that was knowable all
+    /// along.
     #[test]
-    fn an_unusable_interface_outranks_consent_and_targeting() {
+    fn privilege_is_reported_after_the_request_is_found_to_be_sound() {
         let caps = caps_with(
             Availability::Usable,
             Availability::Denied("usbfs nodes are root-only".into()),
         );
         let snap = snapshot_with_a_disk();
-        let e = approve(&CYCLE, &caps, &snap, &cycle_request(None), &free()).unwrap_err();
+
+        // A sound request, no privilege: privilege is the answer.
+        let e = approve(&CYCLE, &caps, &snap, &cycle_request(Some("6-1")), &free()).unwrap_err();
         assert!(e.message().contains("root-only"), "{}", e.message());
+
+        // Missing target, no privilege: the target is the answer, since that
+        // is the part the user can fix from here.
+        let e = approve(&CYCLE, &caps, &snap, &cycle_request(None), &free()).unwrap_err();
+        assert!(e.message().contains("--target"), "{}", e.message());
+
+        // Mounted disk, no privilege: still the mount, because no amount of
+        // privilege was ever going to change it.
+        let mounted = held(
+            "sdb",
+            Hold {
+                via: "sdb1".into(),
+                kind: crate::block::HoldKind::Mounted("/media/stick".into()),
+            },
+        );
+        let e = approve(&CYCLE, &caps, &snap, &cycle_request(Some("6-1")), &mounted).unwrap_err();
+        assert!(matches!(e, Refusal::InUse { .. }), "{}", e.message());
     }
 
     #[test]

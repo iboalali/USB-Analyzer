@@ -49,6 +49,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Finding> {
     display_rules(snap, &mut f);
     urb_error_rules(snap, &mut f);
     throughput_rules(snap, &mut f);
+    reenumeration_rules(snap, &mut f);
     hub_port_rules(snap, &mut f);
 
     // One physical fault should read as one finding. Without this, a single
@@ -1739,6 +1740,123 @@ fn bytes_human(b: u64) -> String {
     format!("{b} B")
 }
 
+// ---------------------------------------------------------------------------
+// Re-enumeration cycling
+// ---------------------------------------------------------------------------
+
+/// Judge a port that was deliberately cycled.
+///
+/// This is the only rule in the file whose input was *produced* rather than
+/// observed, and that changes what can be said. Everywhere else the tool sees
+/// one sample of a link and has to hedge about whether it is typical. Here the
+/// link was asked the same question twenty times, so "it answers differently
+/// each time" is a fact about the link and not an inference from one reading.
+///
+/// A clean run is reported too. Twenty identical trainings do not prove a cable
+/// is good, but they do rule out intermittency, and eliminating a hypothesis is
+/// worth saying out loud — otherwise a user who ran the test learns nothing
+/// from it having passed.
+fn reenumeration_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
+    let Some(run) = &snap.reenumeration else {
+        return;
+    };
+    if run.cycles.is_empty() {
+        return;
+    }
+
+    let distribution = run.speed_distribution();
+    let mut evidence: Vec<String> = distribution
+        .iter()
+        .map(|(label, n)| format!("{n} of {} cycles trained at {label}", run.cycles.len()))
+        .collect();
+    if run.failures() > 0 {
+        evidence.push(format!(
+            "{} of {} cycles did not come back at all",
+            run.failures(),
+            run.cycles.len()
+        ));
+    }
+    evidence.push(format!("port {} ({})", run.port, run.port_path.display()));
+
+    if !run.is_intermittent() {
+        let what = distribution
+            .first()
+            .map(|(label, _)| label.clone())
+            .unwrap_or_else(|| "the same rate".into());
+        out.push(Finding {
+            code: "LINK_STABLE_UNDER_CYCLING".into(),
+            severity: Severity::Info,
+            confidence: Confidence::Measured,
+            subject: Subject::Device(run.device.clone()),
+            title: format!(
+                "{} trained at {what} on all {} attempts",
+                run.device,
+                run.cycles.len()
+            ),
+            detail: "The port was switched off and on repeatedly and the link came back the \
+                     same way every time. That does not prove the cable is good — a fault \
+                     that only appears under sustained load or at temperature would not show \
+                     here — but it does rule out the intermittent training that a single \
+                     reading can never distinguish from a stable one."
+                .to_string(),
+            evidence,
+            suggestion: None,
+        });
+        return;
+    }
+
+    // Something varied. Which thing decides how bad it is: a link that
+    // sometimes trains slower is degraded, one that sometimes does not appear
+    // is failing.
+    let never_returned = run.failures() > 0;
+    let best = run.best_mbps().map(LinkSpeed::from_mbps);
+    let title = match (&best, never_returned) {
+        (_, true) => format!(
+            "{} failed to re-appear on {} of {} attempts",
+            run.device,
+            run.failures(),
+            run.cycles.len()
+        ),
+        (Some(best), false) => format!(
+            "{} reached {} on only {} of {} attempts",
+            run.device,
+            best.short(),
+            distribution
+                .iter()
+                .find(|(l, _)| *l == best.short())
+                .map(|(_, n)| *n)
+                .unwrap_or(0),
+            run.cycles.len()
+        ),
+        (None, false) => format!("{} trained inconsistently", run.device),
+    };
+
+    out.push(Finding {
+        code: "LINK_INTERMITTENT".into(),
+        severity: if never_returned {
+            Severity::High
+        } else {
+            Severity::Medium
+        },
+        confidence: Confidence::Measured,
+        subject: Subject::Device(run.device.clone()),
+        title,
+        detail: "The same port was cycled repeatedly and did not behave the same way twice. \
+                 This is the fault that no single reading can find: every individual check \
+                 looks fine, and the link only fails some of the time. A device that \
+                 sometimes trains and sometimes does not is almost never a firmware problem \
+                 — it is a physical one, in the cable, the connector, or the socket."
+            .to_string(),
+        evidence,
+        suggestion: Some(
+            "Run this again with a different cable. Intermittency that disappears with the \
+             cable is the cable; intermittency that follows the device to another port is \
+             the device or its connector."
+                .into(),
+        ),
+    });
+}
+
 /// Let measured errors strengthen the findings they speak to.
 ///
 /// Deliberately does **not** promote anything to [`Confidence::Measured`].
@@ -2352,6 +2470,107 @@ mod tests {
             error: None,
         });
         snap
+    }
+
+    // -----------------------------------------------------------------------
+    // Re-enumeration cycling
+    // -----------------------------------------------------------------------
+
+    fn cycled(speeds: &[Option<f64>]) -> Snapshot {
+        let mut snap = empty_snapshot();
+        let mut bus = root_hub("usb4", 5000.0);
+        bus.children
+            .push(device("4-1", " 3.20", 5000.0, Some("usb4")));
+        snap.buses.push(bus);
+        snap.reenumeration = Some(ReenumerationRun {
+            device: "4-1".into(),
+            port: "usb4-port1".into(),
+            port_path: "/sys/devices/usb4/4-0:1.0/usb4-port1".into(),
+            requested_cycles: speeds.len(),
+            error: None,
+            cycles: speeds
+                .iter()
+                .enumerate()
+                .map(|(index, mbps)| ReenumerationCycle {
+                    index,
+                    returned: mbps.is_some(),
+                    returned_after_ms: 400,
+                    speed_mbps: *mbps,
+                    rx_lanes: Some(1),
+                    tx_lanes: Some(1),
+                    error: mbps.is_none().then(|| "did not come back".into()),
+                })
+                .collect(),
+        });
+        snap
+    }
+
+    /// A link that trains the same way every time is worth saying so about:
+    /// the user ran a deliberate test and needs to learn something from it
+    /// passing, not just from it failing.
+    #[test]
+    fn a_stable_link_produces_an_informational_result_not_silence() {
+        let f = analyze(&cycled(&[Some(5000.0); 20]));
+        let hit = f
+            .iter()
+            .find(|x| x.code == "LINK_STABLE_UNDER_CYCLING")
+            .unwrap_or_else(|| panic!("{:?}", codes(&f)));
+        assert_eq!(hit.severity, Severity::Info);
+        assert!(hit.title.contains("all 20 attempts"), "{}", hit.title);
+        // Info must not claim more than it can: cycling cannot clear a cable.
+        assert!(hit.detail.contains("does not prove"), "{}", hit.detail);
+        assert!(hit.suggestion.is_none(), "nothing to suggest about a pass");
+        assert!(!codes(&f).contains(&"LINK_INTERMITTENT"));
+    }
+
+    /// The whole reason this probe exists: every individual training looks
+    /// fine, and only the distribution shows the fault.
+    #[test]
+    fn a_link_that_sometimes_falls_back_is_caught() {
+        let mut speeds = vec![Some(5000.0); 17];
+        speeds.extend([Some(480.0); 3]);
+        let f = analyze(&cycled(&speeds));
+
+        let hit = f.iter().find(|x| x.code == "LINK_INTERMITTENT").unwrap();
+        assert_eq!(hit.severity, Severity::Medium);
+        assert_eq!(hit.confidence, Confidence::Measured);
+        assert!(hit.title.contains("only 17 of 20"), "{}", hit.title);
+        // The distribution is the evidence, and both rates must appear.
+        let ev = hit.evidence.join(" | ");
+        assert!(ev.contains("17 of 20 cycles trained at 5G"), "{ev}");
+        assert!(ev.contains("3 of 20 cycles trained at 480M"), "{ev}");
+        assert!(!codes(&f).contains(&"LINK_STABLE_UNDER_CYCLING"));
+    }
+
+    /// Not coming back at all is worse than coming back slow.
+    #[test]
+    fn a_device_that_vanishes_is_more_serious_than_one_that_downshifts() {
+        let mut speeds = vec![Some(5000.0); 18];
+        speeds.extend([None, None]);
+        let f = analyze(&cycled(&speeds));
+
+        let hit = f.iter().find(|x| x.code == "LINK_INTERMITTENT").unwrap();
+        assert_eq!(hit.severity, Severity::High);
+        assert!(
+            hit.title.contains("failed to re-appear on 2 of 20"),
+            "{}",
+            hit.title
+        );
+        assert!(hit
+            .evidence
+            .iter()
+            .any(|e| e.contains("did not come back at all")));
+    }
+
+    /// One cycle cannot disagree with itself, so it must never be reported as
+    /// intermittent — and the gate keeps `--cycles` above one for this reason.
+    #[test]
+    fn a_single_cycle_is_never_called_intermittent() {
+        for speed in [Some(5000.0), Some(480.0)] {
+            let snap = cycled(&[speed]);
+            assert!(!snap.reenumeration.as_ref().unwrap().is_intermittent());
+            assert!(!codes(&analyze(&snap)).contains(&"LINK_INTERMITTENT"));
+        }
     }
 
     /// The rule that would be easiest to get catastrophically wrong.

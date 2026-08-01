@@ -204,23 +204,59 @@ reported as a fault.
 The usbfs variant is still the only way to load a non-storage device. If that is ever
 wanted it should be a separate disruptive probe rather than a change to this one.
 
-### 5. Re-enumeration cycling — root, disruptive
+### 5. Re-enumeration cycling — root, disruptive — **done**
 
-The only test that finds intermittency. A cable that trains SuperSpeed 16 times out of
-20 is failing in a way no single passive read can reveal.
+The only test that finds intermittency. A cable that trains SuperSpeed 16 times out of 20
+is failing in a way no single passive read can reveal, because each individual reading
+looks fine. Twenty attempts and a distribution is the whole method.
 
-Write `1` then `0` to the hub port's `disable`
-(`/sys/bus/usb/devices/usbX/X-0:1.0/usbX-portN/disable`, verified writable), or issue
-`USBDEVFS_RESET`. Wait for re-enumeration, re-read speed and lane count, repeat ~10
-times, report the distribution.
+Writes `1` then `0` to the hub port's `disable`, waits for re-enumeration, records speed
+and lane count, repeats. `USBDEVFS_RESET` was the alternative and is refused for the same
+reason as everywhere else: it needs `ioctl`, which needs libc.
 
-New finding: `LINK_INTERMITTENT` (Measured) when the negotiated speed varies across
-cycles, with the distribution as evidence. A device that sometimes trains and sometimes
-does not is almost never a firmware problem.
+**The port is found through the device's own `port` symlink**, not by deriving a path
+from its name. Two things fall out of that for free: hub interface numbering never has to
+be guessed at, and a root hub has no `port` symlink at all — so cycling one, which would
+drop every device on that bus at once, fails at the first step rather than needing a
+special case. The gate refuses root hubs explicitly as well, so the user gets an
+explanation instead of a silent nothing.
 
-The most invasive of the three: it drops the device off the bus every cycle. Must refuse
-on a mounted filesystem or an input device the user may be typing on. Restore port state
-on every exit path including signals.
+`--cycles` is separate from `--duration` and defaults to 20. A cycle takes as long as the
+hardware takes, so the useful control is how many attempts, not for how long. The minimum
+is 2, enforced in the parser: one attempt cannot disagree with itself, and a run of one
+must never be reportable as intermittent.
+
+**A second refusal that consent cannot lift.** Alongside the mounted-filesystem check, a
+subtree containing an input device is refused outright. This is not about data — nothing
+is destroyed — it is that disabling the port a keyboard is on removes the means of
+stopping whatever happens next, which is not a thing a user can meaningfully agree to in
+advance. Everything else that will drop and come back — disks that are present but
+unmounted, network interfaces that are up and may be carrying the session — is a
+**warning, not a refusal**, printed as part of the confirmation. That is what the second
+confirmation is for: the first yes is to the idea, the second is to the consequences.
+
+Findings: `LINK_INTERMITTENT` (Measured; High when the device failed to re-appear at all,
+Medium when it merely trained slower) and `LINK_STABLE_UNDER_CYCLING` (Info). The clean
+result is reported deliberately — twenty identical trainings do not prove a cable is good,
+but they rule out intermittency, and a user who ran a deliberate test should learn
+something from it passing.
+
+**What cannot be guaranteed, stated plainly.** The port is restored by a guard whose
+`Drop` runs on every return, every error path and on a panic — all covered by tests. It
+does **not** run if the process is killed, because handling `SIGINT` needs a signal
+handler and therefore libc. Mitigations: the disabled window is 150 ms, and the exact
+command to re-enable a stuck port is printed *before* anything happens, since afterwards
+is precisely when it cannot be printed.
+
+**Refusal ordering changed while building this.** Privilege used to be checked before
+anything about the request. That meant an unprivileged user asking to cycle a mounted
+disk was told "you need root", went and found sudo, and only then learned the disk was
+mounted and it was never going to work. Request errors are deterministic and fixable
+without escalating, so they now come first; privilege is checked once the request is
+known to be sound.
+
+Every refusal path is verified against this machine, including the mounted-filesystem one
+firing for real on the SanDisk auto-mounted at `/media/iboalali/UNRAID`.
 
 ### 6. Document the root-probe design in the README
 
@@ -302,6 +338,13 @@ for. Listed here so the gap is not mistaken for coverage.
   not been run. `sudo ./target/debug/usbdiag probe throughput --duration 3000` settles it.
   The number to sanity-check is the SanDisk on `4-1`: a 5 Gbps link, so anything in the
   100–200 MB/s range is a healthy flash drive and must produce **no** finding.
+- **`probe reenumerate` actually cycling a port** — every refusal is verified on this
+  machine and the guard logic is covered by tests, including a panic mid-run, but no port
+  has been switched off in anger. Needs root and a target that is neither mounted nor an
+  input device: the Dell DA20 on `5-1.2` is the obvious candidate, since it carries no
+  storage. `sudo ./target/debug/usbdiag probe reenumerate --target 5-1.2 --yes --force`.
+  The expected result on healthy hardware is `LINK_STABLE_UNDER_CYCLING`, 20 of 20 at
+  12M — and the device must still be present afterwards.
 - **`probe urb-errors` end to end** — every refusal path was exercised against live
   hardware, but the run itself has not been: it needs `sudo modprobe usbmon` and root,
   and the machine has rebooted since the module was last loaded. The parser is validated
