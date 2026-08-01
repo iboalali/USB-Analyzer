@@ -466,6 +466,70 @@ Billboard, which is most of what the rules actually need, and it carries no risk
 string heuristics are worth having later, behind the suppress-only rule, and are worth
 nothing at all if that rule is not enforced by the types.
 
+**On this machine the class code already answers 7 of 9 devices** — three hubs, a
+smartcard reader, two mass-storage devices, a Billboard adapter, and a wireless
+controller. Only the Goodix fingerprint reader is opaque, at `bDeviceClass ef` /
+`bInterfaceClass ff`: Miscellaneous over Vendor Specific, which is the class-code
+equivalent of a shrug. So the free half is most of the value, and the risky half is for
+one device.
+
+### Let the user correct a device's type, and remember it
+
+Show the kind in the UI, and let it be overridden. Requested for the display; worth
+building for what the override unlocks.
+
+**This is not cosmetic.** Both storage devices here report class `08`, which says
+*storage* and nothing about **what kind**. `block::medium()` returns `Unknown` for
+nearly all USB because bridges omit VPD page B1h — which is exactly why
+`THROUGHPUT_FAR_BELOW_LINK` has to reason about "the slowest plausible medium" and
+`ROTATING_SHORTFALL` instead of a real threshold. A user who says *"that one is a
+spinning disk"* supplies a fact no amount of reading can recover, and the rule gets a
+yardstick. That is the case that justifies the feature.
+
+It also means **an override must be allowed to sharpen a finding, not merely suppress
+one** — the opposite of the rule above for string heuristics, and correctly so. A
+product-string guess may only suppress because the tool invented it. A user assertion is
+better evidence than anything on the wire: they are holding the object.
+
+**Scope: the model, with the unit as an escape hatch.** Default to `VID:PID`, so
+correcting one SanDisk Ultra corrects every SanDisk Ultra. Offer "just this one" via
+`VID:PID:serial` where a serial exists and is trustworthy.
+
+**Trustworthy is doing real work in that sentence.** Two of the six serials on this
+machine are placeholders — MediaTek reports `000000000`, the Dell DA20 reports
+`00000000000000000`. Key on those naively and correcting one adapter relabels every
+zero-serial device ever plugged in. Degenerate serials — all zeros, all one repeated
+character, shorter than a few characters — must be rejected as identifiers and fall back
+to model scope. The three genuine serials here (`4C530001010412118490`,
+`54B80A3FA797C091604B95`, `UID9802CAEE_XXXX_MOC_B`) show what a real one looks like.
+
+**Remember, never generalise.** A correction is a stored fact about one identity,
+applied on every future sighting. The tool does not mine corrections for patterns and
+start guessing — a rule inferred from user data would produce findings with no traceable
+cause, which is the one thing this project cannot afford. Every stored override is
+listable and deletable from the CLI, because a belief the user cannot inspect is a belief
+they cannot correct.
+
+**Provenance goes on the device kind, not in `Confidence`.** The confidence enum is about
+certainty and should stay three-valued; where a fact came from is a second axis, and
+conflating them would make a stale override invisible behind an `inferred` badge. So the
+device kind carries `source: class | heuristic | user`, the UI shows it per device where
+the user can act on it, and any finding that leans on a declaration cites it in evidence
+("medium: rotating — set by you") and is capped at `Inferred`. Measured means read off
+the hardware, and a declaration is not that however true it is.
+
+**This is the project's first persistent state**, which is worth being reluctant about.
+`$XDG_CONFIG_HOME/usbdiag/devices.json`, JSON because `serde_json` is already a
+dependency and the tree stays at 13 crates. Absent file means no overrides and no error.
+Hand-editable, listable (`usbdiag labels`), clearable. **Only an explicit command writes
+it** — no read path ever persists anything.
+
+It also changes what `capture()` *is*: currently a pure function of the machine, now a
+function of the machine and a config file. Two runs on identical hardware can differ. So
+`--no-overrides` must exist to get the unmodified view, and the JSON must carry the
+source field so a consumer can tell which is which. Without both, "why does it say that"
+becomes unanswerable, and bug reports become useless.
+
 ---
 
 ## Shipped but unverified against hardware

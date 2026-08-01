@@ -208,6 +208,12 @@ This is the constraint to hold hardest, because a GUI makes it trivial to break.
 - **Live faults surface as they happen.** An `AdwBanner` when an over-current or
   a drop arrives while the window is open. The tool is watching; it should react,
   not merely refresh.
+- **A device's kind shows where it came from.** Three sources, three
+  treatments: *asserted* by the class code, *guessed* from a product string, or
+  *set by you*. The guess gets the same hedged styling as a Heuristic finding,
+  and the override is editable in place — see tasks #26 and #27. A stored
+  override the user cannot see is a belief they cannot correct, and it will
+  outlive their memory of setting it.
 
 ---
 
