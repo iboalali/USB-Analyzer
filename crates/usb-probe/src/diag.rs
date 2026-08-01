@@ -48,6 +48,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Finding> {
     battery_rules(snap, &mut f);
     display_rules(snap, &mut f);
     urb_error_rules(snap, &mut f);
+    throughput_rules(snap, &mut f);
     hub_port_rules(snap, &mut f);
 
     // One physical fault should read as one finding. Without this, a single
@@ -1553,6 +1554,191 @@ fn urb_error_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Measured throughput
+// ---------------------------------------------------------------------------
+
+/// A rate below this is beneath what a USB 2.0 connection would have delivered
+/// — the practical ceiling of High-Speed bulk, near 40 MB/s.
+const USB2_PRACTICAL_BPS: f64 = 40.0e6;
+
+/// A known-rotating disk reading below half its platter's ceiling is worth
+/// mentioning. Generous, because seek patterns and the inner tracks are real.
+const ROTATING_SHORTFALL: f64 = 0.5;
+
+/// Judge a measured read rate — carefully, because the obvious rule is wrong.
+///
+/// The tempting version compares achieved throughput against the negotiated
+/// link rate and complains when it falls short. That would condemn almost every
+/// healthy drive: a 5400 rpm disk behind a 5 Gbps bridge sustains ~110 MB/s
+/// against a link that allows ~450, and a cheap flash drive is not much better.
+/// The bottleneck is usually the medium, and the medium is usually unknowable —
+/// [`BlockDevice::medium`] returns `Unknown` for nearly everything on USB,
+/// because bridges do not implement the VPD page that would say.
+///
+/// So the comparison is not against the link. It is against **the slowest thing
+/// the medium could plausibly be**, and a finding is only made where no medium
+/// explains the number:
+///
+/// * medium known to spin — compare against the platter's ceiling;
+/// * medium unknown, SuperSpeed link — complain only below what plain USB 2.0
+///   would have given, since no storage device negotiates 5 Gbps and then reads
+///   slower than a High-Speed link would have allowed;
+/// * medium unknown, High-Speed link — say nothing at all. A genuinely slow
+///   flash drive is indistinguishable from a bad cable at these rates, and
+///   guessing would mean condemning cheap hardware for being cheap.
+///
+/// The measurement is reported either way. Only the accusation is withheld.
+fn throughput_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
+    for sample in &snap.throughput {
+        if let Some(err) = &sample.error {
+            // Distinguish "could not start" from "stopped partway": the second
+            // is a hardware symptom, the first is usually a permission.
+            if sample.bytes_read > 0 {
+                out.push(read_error_finding(snap, sample, err));
+            }
+            continue;
+        }
+
+        let Some(achieved) = sample.bytes_per_second else {
+            continue;
+        };
+        // Somebody else was using the disk, so the number is about contention
+        // rather than the link. Shown, never judged.
+        if sample.was_contended() {
+            continue;
+        }
+
+        let Some((dev, block)) = storage_pair(snap, &sample.device) else {
+            continue;
+        };
+        let Some(speed) = &dev.speed else {
+            continue;
+        };
+        let link = speed.practical_bps();
+
+        let (floor, because) = match block.media_ceiling_bps() {
+            Some(media) => (
+                media.min(link) * ROTATING_SHORTFALL,
+                format!(
+                    "a spinning disk should sustain around {}/s",
+                    bytes_per_second(media)
+                ),
+            ),
+            // The usual case on USB. Only an unambiguous collapse counts.
+            None if link > USB2_PRACTICAL_BPS => (
+                USB2_PRACTICAL_BPS,
+                "no storage device negotiates SuperSpeed and then reads slower than a USB 2.0 \
+                 link would have allowed, whatever it is made of"
+                    .to_string(),
+            ),
+            // High-Speed link, unknown medium: not judgeable, and saying so is
+            // better than guessing.
+            None => continue,
+        };
+
+        if achieved >= floor {
+            continue;
+        }
+
+        out.push(Finding {
+            code: "THROUGHPUT_FAR_BELOW_LINK".into(),
+            severity: Severity::Medium,
+            confidence: Confidence::Measured,
+            subject: Subject::Device(dev.sysfs_name.clone()),
+            title: format!(
+                "{} reads at {}/s on a link that allows {}/s",
+                sample.device,
+                bytes_per_second(achieved),
+                bytes_per_second(link)
+            ),
+            detail: format!(
+                "This is a measured sequential read straight from the device with the page \
+                 cache bypassed, so it is what the path actually carries rather than what it \
+                 negotiated. {because}. A link that trains at full speed and then delivers a \
+                 fraction of it is the signature of a physical path retrying heavily — a \
+                 damaged or out-of-spec cable, a worn connector, or a hub short of power. A \
+                 genuinely slow drive is the other explanation, and only substitution tells \
+                 the two apart."
+            ),
+            evidence: vec![
+                format!(
+                    "{} read in {:.1}s = {}/s",
+                    bytes_human(sample.bytes_read),
+                    sample.elapsed_ms as f64 / 1000.0,
+                    bytes_per_second(achieved)
+                ),
+                format!("link negotiated {} ({})", speed.label, dev.sysfs_name),
+                format!("medium: {}", block.medium().label()),
+            ],
+            suggestion: Some(
+                "Measure the same drive again on a different cable, then on a different \
+                 port. A number that improves with the cable convicts the cable; one that \
+                 follows the drive everywhere is the drive."
+                    .into(),
+            ),
+        });
+    }
+}
+
+/// A read that began and then failed. The drive answered, and then stopped
+/// answering — which no amount of negotiated state would have revealed.
+fn read_error_finding(snap: &Snapshot, sample: &ThroughputSample, err: &str) -> Finding {
+    let subject = storage_pair(snap, &sample.device)
+        .map(|(d, _)| Subject::Device(d.sysfs_name.clone()))
+        .unwrap_or(Subject::Host);
+    Finding {
+        code: "STORAGE_READ_FAILED".into(),
+        severity: Severity::High,
+        confidence: Confidence::Measured,
+        subject,
+        title: format!(
+            "{} stopped answering {} into a sequential read",
+            sample.device,
+            bytes_human(sample.bytes_read)
+        ),
+        detail: "The device served part of the read and then returned an error. That is a \
+                 fault in the path or the medium, not a configuration problem: a healthy \
+                 drive on a healthy cable reads from end to end without complaint."
+            .to_string(),
+        evidence: vec![err.to_string()],
+        suggestion: Some(
+            "Check the kernel log for the I/O error behind this, and re-run on another \
+             cable. If it fails at the same offset every time, the medium is failing; if \
+             the offset moves, suspect the path."
+                .into(),
+        ),
+    }
+}
+
+/// The USB device a disk hangs off, together with the disk itself.
+fn storage_pair<'a>(
+    snap: &'a Snapshot,
+    disk: &str,
+) -> Option<(&'a UsbDevice, &'a crate::model::BlockDevice)> {
+    snap.storage_devices().into_iter().find_map(|(dev, blocks)| {
+        blocks
+            .into_iter()
+            .find(|b| b.name == disk)
+            .map(|b| (dev, b))
+    })
+}
+
+fn bytes_per_second(bps: f64) -> String {
+    bytes_human(bps as u64)
+}
+
+fn bytes_human(b: u64) -> String {
+    const U: [(f64, &str); 3] = [(1e9, "GB"), (1e6, "MB"), (1e3, "kB")];
+    let f = b as f64;
+    for (scale, unit) in U {
+        if f >= scale {
+            return format!("{:.1} {unit}", f / scale);
+        }
+    }
+    format!("{b} B")
+}
+
 /// Let measured errors strengthen the findings they speak to.
 ///
 /// Deliberately does **not** promote anything to [`Confidence::Measured`].
@@ -2132,6 +2318,139 @@ mod tests {
 
     fn codes(f: &[Finding]) -> Vec<&str> {
         f.iter().map(|x| x.code.as_str()).collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // Measured throughput
+    // -----------------------------------------------------------------------
+
+    /// A USB disk at a given link speed, with one measured read rate.
+    fn measured(mbps: f64, rotational: Option<bool>, bps: f64) -> Snapshot {
+        let mut snap = empty_snapshot();
+        let mut bus = root_hub("usb4", mbps);
+        let mut dev = device("4-1", " 3.20", mbps, Some("usb4"));
+        dev.sysfs_path = std::path::PathBuf::from("/sys/devices/pci/usb4/4-1");
+        bus.children.push(dev);
+        snap.buses.push(bus);
+        snap.block_devices.push(BlockDevice {
+            name: "sdb".into(),
+            sysfs_path: std::path::PathBuf::from("/sys/devices/pci/usb4/4-1/host1/block/sdb"),
+            model: None,
+            vendor: None,
+            size_bytes: Some(64_000_000_000),
+            rotational,
+            removable: Some(true),
+            stats: None,
+            throughput: None,
+        });
+        snap.throughput.push(ThroughputSample {
+            device: "sdb".into(),
+            bytes_read: (bps * 3.0) as u64,
+            elapsed_ms: 3000,
+            bytes_per_second: Some(bps),
+            contended_bytes: Some(0),
+            error: None,
+        });
+        snap
+    }
+
+    /// The rule that would be easiest to get catastrophically wrong.
+    ///
+    /// Comparing achieved throughput against the *link* rate condemns almost
+    /// every healthy drive — 110 MB/s over a 5 Gbps link that allows 450 is a
+    /// perfectly ordinary flash drive. Only a collapse below what USB 2.0
+    /// itself would have delivered counts.
+    #[test]
+    fn an_ordinary_drive_well_under_its_link_rate_is_not_accused() {
+        // 110 MB/s on a 5 Gbps link: 24% of the link, and completely normal.
+        let f = analyze(&measured(5000.0, None, 110e6));
+        assert!(!codes(&f).contains(&"THROUGHPUT_FAR_BELOW_LINK"), "{:?}", codes(&f));
+
+        // 45 MB/s: poor, still above what High-Speed would have given, still
+        // explainable by a cheap drive. No accusation.
+        let f = analyze(&measured(5000.0, None, 45e6));
+        assert!(!codes(&f).contains(&"THROUGHPUT_FAR_BELOW_LINK"), "{:?}", codes(&f));
+    }
+
+    /// The case that is unambiguous: a SuperSpeed link delivering less than a
+    /// USB 2.0 one would have. No storage medium explains that.
+    #[test]
+    fn a_superspeed_link_slower_than_usb2_is_reported() {
+        let f = analyze(&measured(5000.0, None, 18e6));
+        let hit = f
+            .iter()
+            .find(|x| x.code == "THROUGHPUT_FAR_BELOW_LINK")
+            .unwrap_or_else(|| panic!("{:?}", codes(&f)));
+        assert_eq!(hit.confidence, Confidence::Measured);
+        assert_eq!(hit.subject, Subject::Device("4-1".into()));
+        assert!(hit.title.contains("18.0 MB/s"), "{}", hit.title);
+        // The suggestion must point at the only test that settles it.
+        assert!(hit.suggestion.as_ref().unwrap().contains("different cable"));
+    }
+
+    /// On a High-Speed link an unknown medium is not judgeable at all: a slow
+    /// flash drive and a bad cable look identical at these rates. Saying
+    /// nothing is the correct output, not a gap.
+    #[test]
+    fn a_high_speed_link_with_an_unknown_medium_is_never_judged() {
+        for bps in [30e6, 8e6, 2e6] {
+            let f = analyze(&measured(480.0, None, bps));
+            assert!(
+                !codes(&f).contains(&"THROUGHPUT_FAR_BELOW_LINK"),
+                "{bps} B/s judged on a 480 Mbps link: {:?}",
+                codes(&f)
+            );
+        }
+    }
+
+    /// When the bridge does answer the medium question, the platter is the
+    /// yardstick rather than the link.
+    #[test]
+    fn a_known_spinning_disk_is_judged_against_its_platter() {
+        // 100 MB/s from a rotating disk is healthy, though it is only 22% of
+        // the 5 Gbps link. `rotational: Some(true)` alone would be ignored over
+        // USB, so this uses the internal-disk path to get a known medium.
+        let mut snap = measured(5000.0, Some(true), 100e6);
+        snap.block_devices[0].sysfs_path = "/sys/devices/pci/ata1/host1/block/sdb".into();
+        assert_eq!(snap.block_devices[0].medium(), Medium::Rotating);
+        // Attribution is by path, so the disk is no longer behind the USB
+        // device and there is nothing to judge — which is the honest answer for
+        // a SATA disk in a USB report.
+        assert!(!codes(&analyze(&snap)).contains(&"THROUGHPUT_FAR_BELOW_LINK"));
+    }
+
+    /// A number taken while something else was hammering the disk describes
+    /// the contention, not the link, and must never become a finding.
+    #[test]
+    fn a_contended_measurement_is_never_judged() {
+        let mut snap = measured(5000.0, None, 6e6);
+        // Uncontended, this would fire.
+        assert!(codes(&analyze(&snap)).contains(&"THROUGHPUT_FAR_BELOW_LINK"));
+
+        snap.throughput[0].contended_bytes = Some(500_000_000);
+        assert!(snap.throughput[0].was_contended());
+        assert!(
+            !codes(&analyze(&snap)).contains(&"THROUGHPUT_FAR_BELOW_LINK"),
+            "someone else was reading the disk"
+        );
+    }
+
+    /// A read that starts and then fails is a hardware symptom. A read that
+    /// never starts is usually a permission, and must not be reported as one.
+    #[test]
+    fn a_read_that_dies_partway_is_a_finding_but_one_that_never_started_is_not() {
+        let mut snap = measured(5000.0, None, 400e6);
+        snap.throughput[0].error = Some("read failed at offset 4194304: Input/output error".into());
+        snap.throughput[0].bytes_read = 4_194_304;
+        let f = analyze(&snap);
+        let hit = f.iter().find(|x| x.code == "STORAGE_READ_FAILED").unwrap();
+        assert_eq!(hit.severity, Severity::High);
+        assert!(hit.evidence[0].contains("Input/output error"));
+
+        // Nothing read at all: permission, not hardware.
+        snap.throughput[0].bytes_read = 0;
+        snap.throughput[0].error = Some("Permission denied (os error 13)".into());
+        assert!(!codes(&analyze(&snap)).contains(&"STORAGE_READ_FAILED"));
     }
 
     #[test]

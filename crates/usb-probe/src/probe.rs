@@ -111,23 +111,49 @@ impl Plan {
     ///
     /// The probes that are only a matter of *reading more* need no separate
     /// execution path — they are the ordinary capture with one more source
-    /// switched on. Returns `None` for a probe that has to act instead, which
-    /// today means none of them, since the two that would are not written yet.
-    pub fn options(&self, base: Options) -> Option<Options> {
+    /// switched on.
+    pub fn capture_options(&self, base: Options) -> Options {
         let ms = self.window.as_millis() as u64;
         match self.probe.name {
-            "snapshot" => Some(base),
-            "storage-sample" => Some(Options {
+            "storage-sample" => Options {
                 storage_sample_ms: ms,
                 ..base
-            }),
-            "urb-errors" => Some(Options {
+            },
+            "urb-errors" => Options {
                 urb_sample_ms: ms,
                 ..base
-            }),
-            _ => None,
+            },
+            _ => base,
         }
     }
+}
+
+/// Carry out an approved plan and analyse the result.
+///
+/// Takes a [`Plan`] rather than a name, so there is no way to reach this
+/// without having passed [`plan`] first — the type is the proof that consent,
+/// capability and the mounted-filesystem check have all already happened.
+pub fn run(plan: &Plan, base: Options) -> crate::model::Report {
+    let mut snapshot = crate::capture(plan.capture_options(base));
+
+    if plan.probe.name == "throughput" {
+        let only = plan.target.as_ref().map(|t| t.blocks.clone());
+        for disk in crate::throughput::targets(&snapshot, only.as_deref()) {
+            match crate::throughput::measure(&disk, plan.window) {
+                Ok(sample) => snapshot.throughput.push(sample),
+                // A disk that cannot be opened is reported as a sample that
+                // failed, not omitted — a silently missing row reads as "there
+                // was nothing to measure".
+                Err(e) => snapshot.throughput.push(crate::model::ThroughputSample {
+                    device: disk,
+                    error: Some(e.to_string()),
+                    ..Default::default()
+                }),
+            }
+        }
+    }
+
+    crate::diag::report(snapshot)
 }
 
 /// Why a probe will not run. Every variant names the thing that would fix it,
@@ -362,6 +388,10 @@ mod tests {
                 path: None,
             },
             usbfs: Interface {
+                availability: usbfs.clone(),
+                path: None,
+            },
+            block_read: Interface {
                 availability: usbfs,
                 path: None,
             },
@@ -421,7 +451,7 @@ mod tests {
         assert_eq!(p.probe.class, ProbeClass::PrivilegedRead);
         assert!(p.describe().contains("for 3.0s"), "{}", p.describe());
 
-        let opts = p.options(Options::default()).unwrap();
+        let opts = p.capture_options(Options::default());
         assert_eq!(opts.urb_sample_ms, 3000);
         // And it must not quietly switch on anything else.
         assert_eq!(opts.storage_sample_ms, 0);
@@ -456,7 +486,7 @@ mod tests {
                 target: Some("6-1"),
                 consented: true,
                 accepts_disruption: true,
-                ..Request::new("throughput", Duration::from_secs(1))
+                ..Request::new("reenumerate", Duration::from_secs(1))
             },
         )
         .unwrap_err();

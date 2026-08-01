@@ -30,6 +30,7 @@ pub fn empty_snapshot() -> Snapshot {
         uptime_s: None,
         orphan_pd: Vec::new(),
         urb_traffic: None,
+        throughput: Vec::new(),
         kernel_log: KernelLog {
             source: KernelLogSource::Journalctl,
             note: None,

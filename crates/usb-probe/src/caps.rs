@@ -103,14 +103,24 @@ pub struct Capabilities {
     /// usbfs device nodes — the only way to issue transfers from userspace,
     /// and therefore the only way to load a link deliberately.
     pub usbfs: Interface,
+    /// Raw block device nodes, opened with direct I/O. The way this crate
+    /// puts a link under load: reading `/dev/sdX` drives the same cable and
+    /// bridge as any other transfer, and needs no ioctl to do it.
+    #[serde(default = "unprobed")]
+    pub block_read: Interface,
+}
+
+fn unprobed() -> Interface {
+    Interface::new(Availability::Unknown("not probed".into()), None)
 }
 
 impl Default for Capabilities {
     fn default() -> Self {
         Self {
             effective_uid: None,
-            usbmon: Interface::new(Availability::Unknown("not probed".into()), None),
-            usbfs: Interface::new(Availability::Unknown("not probed".into()), None),
+            usbmon: unprobed(),
+            usbfs: unprobed(),
+            block_read: unprobed(),
         }
     }
 }
@@ -126,6 +136,7 @@ impl Capabilities {
             Requirement::Nothing => return None,
             Requirement::Usbmon => &self.usbmon,
             Requirement::Usbfs => &self.usbfs,
+            Requirement::BlockRead => &self.block_read,
         };
         if iface.is_usable() {
             return None;
@@ -191,6 +202,7 @@ pub enum Requirement {
     Nothing,
     Usbmon,
     Usbfs,
+    BlockRead,
 }
 
 impl Requirement {
@@ -199,6 +211,7 @@ impl Requirement {
             Requirement::Nothing => "nothing",
             Requirement::Usbmon => "usbmon",
             Requirement::Usbfs => "usbfs write access",
+            Requirement::BlockRead => "read access to raw disks",
         }
     }
 }
@@ -246,11 +259,12 @@ pub const PROBES: &[ProbeInfo] = &[
     },
     ProbeInfo {
         name: "throughput",
-        class: ProbeClass::Disruptive,
-        needs: Requirement::Usbfs,
-        implemented: false,
-        summary: "Drive bulk transfers and compare achieved throughput against what \
-                  both the link rate and the storage medium allow.",
+        class: ProbeClass::PrivilegedRead,
+        needs: Requirement::BlockRead,
+        implemented: true,
+        summary: "Read a USB disk flat out with direct I/O and compare what it achieves \
+                  against what the link and the medium allow. Reads only: nothing is \
+                  written, no driver is detached, and the device stays on the bus.",
     },
     ProbeInfo {
         name: "reenumerate",
@@ -280,6 +294,7 @@ pub fn detect_in(root: &Path) -> Capabilities {
         effective_uid: read_effective_uid(root),
         usbmon: detect_usbmon(root),
         usbfs: detect_usbfs(root),
+        block_read: detect_block_read(root),
     }
 }
 
@@ -453,6 +468,75 @@ fn detect_usbfs(root: &Path) -> Interface {
             Some(node),
         ),
     }
+}
+
+/// Whether a raw disk can be opened for reading with direct I/O.
+///
+/// Two separate barriers, and they have completely different fixes, so they
+/// are reported apart:
+///
+/// * **The architecture.** `O_DIRECT` is not the same number everywhere, and
+///   Linux discards `open` flags it does not recognise *without an error*. On a
+///   build where the value is unknown the measurement is not merely unavailable
+///   — attempting it would silently read the page cache and report tens of
+///   gigabytes per second over a USB cable. No privilege fixes that, so it is
+///   `Unsupported`.
+/// * **Permission.** `/dev/sd*` is `root:disk` mode 0660 on a stock system.
+///
+/// Opening a block device read-only has no effect on it whatsoever, which is
+/// what makes attempting it a fair test.
+fn detect_block_read(root: &Path) -> Interface {
+    if crate::throughput::O_DIRECT.is_none() {
+        return Interface::new(
+            Availability::Unsupported(
+                "O_DIRECT's value is not known for this architecture, and reading without it \
+                 would measure the page cache rather than the link"
+                    .into(),
+            ),
+            None,
+        );
+    }
+
+    let Some(node) = first_disk_node(root) else {
+        return Interface::new(
+            Availability::Unsupported(
+                "no raw disk nodes under /dev — there is nothing whose throughput could be \
+                 measured"
+                    .into(),
+            ),
+            None,
+        );
+    };
+
+    match OpenOptions::new().read(true).open(&node) {
+        Ok(_) => Interface::new(Availability::Usable, Some(node)),
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => Interface::new(
+            Availability::Denied(format!(
+                "{} is not readable by this process — raw disks are root:disk mode 0660, so \
+                 this needs root or membership of the disk group",
+                node.display()
+            )),
+            Some(node),
+        ),
+        Err(e) => Interface::new(
+            Availability::Denied(format!("{}: {e}", node.display())),
+            Some(node),
+        ),
+    }
+}
+
+/// The first `/dev/sd*` whole disk — no partitions, since a partition may be
+/// absent while the disk is not.
+fn first_disk_node(root: &Path) -> Option<PathBuf> {
+    let mut disks: Vec<PathBuf> = fsx::list_dir(root.join("dev"))
+        .into_iter()
+        .filter(|e| {
+            let n = fsx::file_name(e);
+            n.starts_with("sd") && n.len() > 2 && !n.ends_with(|c: char| c.is_ascii_digit())
+        })
+        .collect();
+    disks.sort();
+    disks.into_iter().next()
 }
 
 /// The first root hub node: `/dev/bus/usb/<bus>/001`.
@@ -661,8 +745,11 @@ mod tests {
 
     /// A writable node means the probes that need it can run — which on a real
     /// system means root, and in this test means an ordinary file.
+    ///
+    /// Each interface unlocks only its own probes. `throughput` reads raw disks
+    /// rather than usbfs, so a writable usbfs node must not unlock it.
     #[test]
-    fn a_writable_usbfs_node_unlocks_the_disruptive_probes() {
+    fn each_interface_unlocks_only_the_probes_that_need_it() {
         let root = fake_root("usbfs", None, "");
         fs::write(root.join("dev/bus/usb/001/001"), b"").unwrap();
 
@@ -670,10 +757,32 @@ mod tests {
         assert_eq!(caps.usbfs.availability, Availability::Usable);
 
         let names: Vec<&str> = caps.runnable().iter().map(|p| p.name).collect();
-        assert!(names.contains(&"throughput"), "{names:?}");
         assert!(names.contains(&"reenumerate"), "{names:?}");
-        // usbmon is still absent, so its probe stays blocked.
+        // No disk node in this root, so the throughput probe stays blocked.
+        assert!(!names.contains(&"throughput"), "{names:?}");
+        // usbmon is still absent, so its probe stays blocked too.
         assert!(!names.contains(&"urb-errors"), "{names:?}");
+
+        // Add a readable disk and only that probe changes.
+        fs::write(root.join("dev/sda"), b"").unwrap();
+        let caps = detect_in(&root);
+        assert_eq!(caps.block_read.availability, Availability::Usable);
+        let names: Vec<&str> = caps.runnable().iter().map(|p| p.name).collect();
+        assert!(names.contains(&"throughput"), "{names:?}");
+        assert!(!names.contains(&"urb-errors"), "{names:?}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A partition is not a disk. Picking `sda1` when `sda` exists would test
+    /// access to something that may not be there on a different machine.
+    #[test]
+    fn disk_detection_skips_partitions() {
+        let root = fake_root("disks", None, "");
+        for n in ["sda1", "sdb", "sda"] {
+            fs::write(root.join("dev").join(n), b"").unwrap();
+        }
+        assert_eq!(first_disk_node(&root), Some(root.join("dev/sda")));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -704,6 +813,7 @@ mod tests {
             effective_uid: Some(1000),
             usbmon: Interface::new(Availability::NotLoaded("module not loaded".into()), None),
             usbfs: Interface::new(Availability::Usable, None),
+            block_read: Interface::new(Availability::Usable, None),
         };
         let why = caps.blocker(probe("urb-errors").unwrap()).unwrap();
         assert!(why.contains("urb-errors") && why.contains("usbmon"), "{why}");

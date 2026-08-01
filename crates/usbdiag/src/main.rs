@@ -240,14 +240,7 @@ fn probe(args: &Args, opts: Options) -> ExitCode {
 
     println!("{}", plan.describe());
 
-    let Some(probe_opts) = plan.options(opts) else {
-        // Unreachable while every implemented probe is a matter of reading
-        // more; the two that will act are refused as unimplemented above.
-        eprintln!("usbdiag: '{}' has no way to run yet", plan.probe.name);
-        return ExitCode::from(2);
-    };
-
-    let report = usb_probe::report(probe_opts);
+    let report = usb_probe::probe::run(&plan, opts);
     let scoped = plan.target.as_ref().map(|t| t.sysfs_name.clone());
     let report = match &scoped {
         Some(sysfs_name) => report.scoped_to(sysfs_name),
@@ -269,6 +262,7 @@ fn probe(args: &Args, opts: Options) -> ExitCode {
         ));
     }
     out.push('\n');
+    render::throughput(&mut out, &report.snapshot, &theme);
     render::urb_traffic(&mut out, &report.snapshot, &theme);
     render::findings(&mut out, &report, &theme);
     render::summary(&mut out, &report, &theme);

@@ -44,6 +44,10 @@ pub struct Snapshot {
     /// URB accounting, present only when the privileged usbmon probe ran.
     /// `None` means it was not attempted, which is not the same as clean.
     pub urb_traffic: Option<UrbTraffic>,
+    /// Measured read rates, present only when the throughput probe ran. Empty
+    /// means it was not attempted, which is not the same as nothing to say.
+    #[serde(default)]
+    pub throughput: Vec<ThroughputSample>,
     pub kernel_log: KernelLog,
 }
 
@@ -619,6 +623,13 @@ pub struct LinkSpeed {
 }
 
 impl LinkSpeed {
+    /// Realistic sustained bytes/sec for this link rate, after protocol
+    /// overhead — nothing reaches the raw signalling rate. USB 2.0 bulk tops
+    /// out near 40 MB/s against a nominal 60; USB 3 gen 1 near 450 against 625.
+    pub fn practical_bps(&self) -> f64 {
+        practical_bps(self.mbps)
+    }
+
     pub fn from_mbps(mbps: f64) -> Self {
         let (class, label) = match mbps {
             m if m < 2.0 => (SpeedClass::Low, "Low-Speed 1.5 Mbps (USB 1.0)"),
@@ -1234,6 +1245,46 @@ impl BlockDevice {
     pub fn media_ceiling_bps(&self) -> Option<f64> {
         // ~120 MB/s is a generous figure for a 2.5" 5400 rpm drive.
         matches!(self.medium(), Medium::Rotating).then_some(120e6)
+    }
+}
+
+/// One measured read of a block device: the throughput probe's whole output.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ThroughputSample {
+    pub device: String,
+    pub bytes_read: u64,
+    pub elapsed_ms: u64,
+    /// `None` when nothing could be read at all.
+    pub bytes_per_second: Option<f64>,
+    /// Bytes the device served to something *else* during the window, or
+    /// `None` when the counters could not be read at both ends. A drive that
+    /// was busy measures slow for a reason that has nothing to do with its
+    /// cable, and a finding must not be made from a contended number.
+    pub contended_bytes: Option<u64>,
+    /// Set when the read stopped early. Kept rather than discarded: an I/O
+    /// error partway through a healthy-looking drive is itself the diagnosis.
+    pub error: Option<String>,
+}
+
+impl ThroughputSample {
+    /// Whether anything else was reading the device while it was measured.
+    ///
+    /// A small amount is background noise; the threshold is a few megabytes so
+    /// that a filesystem's idle housekeeping does not invalidate a good sample.
+    pub fn was_contended(&self) -> bool {
+        self.contended_bytes.is_some_and(|b| b > 4_000_000)
+    }
+}
+
+/// As [`LinkSpeed::practical_bps`], for a bare rate.
+pub fn practical_bps(mbps: f64) -> f64 {
+    match mbps {
+        m if m <= 12.0 => 1.0e6,
+        m if m <= 480.0 => 40.0e6,
+        m if m <= 5000.0 => 450.0e6,
+        m if m <= 10_000.0 => 950.0e6,
+        m if m <= 20_000.0 => 1900.0e6,
+        _ => 3500.0e6,
     }
 }
 

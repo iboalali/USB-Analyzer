@@ -84,6 +84,14 @@ pub fn sample(window: Duration) -> Vec<BlockDevice> {
     second
 }
 
+/// Counters for one block device, given its sysfs directory.
+///
+/// `/sys/class/block/<name>` works as well as `/sys/block/<name>`, which is why
+/// this takes a path rather than a name.
+pub fn stats_at(dir: &Path) -> Option<BlockStats> {
+    read_stats(dir)
+}
+
 /// `reads_completed reads_merged sectors_read ms_reading writes_completed
 ///  writes_merged sectors_written ms_writing ios_in_flight ...`
 fn read_stats(dir: &Path) -> Option<BlockStats> {

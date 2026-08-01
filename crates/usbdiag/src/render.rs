@@ -769,18 +769,9 @@ pub fn storage(out: &mut String, report: &Report, t: &Theme) {
     }
 }
 
-/// Realistic sustained throughput for a link rate, after protocol overhead.
-/// USB 2.0 bulk tops out near 40 MB/s; USB 3 gen 1 near 450 MB/s.
-fn practical_bps(mbps: f64) -> f64 {
-    match mbps {
-        m if m <= 12.0 => 1.0e6,
-        m if m <= 480.0 => 40.0e6,
-        m if m <= 5000.0 => 450.0e6,
-        m if m <= 10_000.0 => 950.0e6,
-        m if m <= 20_000.0 => 1900.0e6,
-        _ => 3500.0e6,
-    }
-}
+/// Realistic sustained throughput for a link rate. The rule engine judges
+/// measured rates against the same figures, so there is one definition.
+use usb_probe::model::practical_bps;
 
 fn bytes_human(b: u64) -> String {
     const U: [(f64, &str); 4] = [(1e12, "TB"), (1e9, "GB"), (1e6, "MB"), (1e3, "kB")];
@@ -1372,7 +1363,11 @@ pub fn capabilities(out: &mut String, snap: &Snapshot, t: &Theme) {
         ))
     );
 
-    for (name, iface) in [("usbmon", &c.usbmon), ("usbfs", &c.usbfs)] {
+    for (name, iface) in [
+        ("usbmon", &c.usbmon),
+        ("usbfs", &c.usbfs),
+        ("disks", &c.block_read),
+    ] {
         let mark = if iface.is_usable() {
             t.green("✓")
         } else {
@@ -1405,6 +1400,90 @@ pub fn capabilities(out: &mut String, snap: &Snapshot, t: &Theme) {
     let _ = writeln!(out);
 }
 
+/// Measured read rates from the throughput probe.
+///
+/// Always shows the number, including when the rule engine declined to judge
+/// it. "62 MB/s, medium unknown, no conclusion drawn" is a useful thing to have
+/// on screen; a measurement suppressed because it could not be interpreted is
+/// not.
+pub fn throughput(out: &mut String, snap: &Snapshot, t: &Theme) {
+    if snap.throughput.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "{}", t.heading("measured throughput"));
+
+    for s in &snap.throughput {
+        let owner = snap
+            .storage_devices()
+            .into_iter()
+            .find(|(_, b)| b.iter().any(|b| b.name == s.device))
+            .map(|(d, _)| format!("{}  {}", d.sysfs_name, d.label()));
+
+        let _ = writeln!(
+            out,
+            "  {} {}",
+            t.bold(&s.device),
+            t.dim(&owner.unwrap_or_else(|| "not attributed to a USB device".into()))
+        );
+
+        match (&s.error, s.bytes_per_second) {
+            (Some(e), _) => row(out, t, "failed", &t.red(e)),
+            (None, Some(bps)) => {
+                row(
+                    out,
+                    t,
+                    "read",
+                    &format!(
+                        "{} in {:.1}s  =  {}",
+                        bytes_human(s.bytes_read),
+                        s.elapsed_ms as f64 / 1000.0,
+                        t.bold(&format!("{}/s", bytes_human(bps as u64)))
+                    ),
+                );
+                if let Some(dev) = snap
+                    .storage_devices()
+                    .into_iter()
+                    .find(|(_, b)| b.iter().any(|b| b.name == s.device))
+                    .map(|(d, _)| d)
+                {
+                    if let Some(speed) = &dev.speed {
+                        let ceiling = speed.practical_bps();
+                        row(
+                            out,
+                            t,
+                            "link allows",
+                            &t.dim(&format!(
+                                "~{}/s at {}  —  {:.0}% of it",
+                                bytes_human(ceiling as u64),
+                                speed.label,
+                                bps / ceiling * 100.0
+                            )),
+                        );
+                    }
+                }
+            }
+            (None, None) => row(out, t, "read", &t.dim("nothing")),
+        }
+
+        // A contended sample is not wrong, it just is not about the link. Say
+        // so next to the number rather than quietly dropping it.
+        if s.was_contended() {
+            let other = s.contended_bytes.unwrap_or(0);
+            row(
+                out,
+                t,
+                "contended",
+                &t.yellow(&format!(
+                    "{} was served to something else during the window — this number is \
+                     about load, not the link",
+                    bytes_human(other)
+                )),
+            );
+        }
+        let _ = writeln!(out);
+    }
+}
+
 /// The probe catalogue: what exists, what this machine allows, and what each
 /// one would do to the bus.
 ///
@@ -1424,7 +1503,11 @@ pub fn probes(out: &mut String, snap: &Snapshot, t: &Theme) {
             if c.is_root() { " (root)" } else { "" },
         ))
     );
-    for (name, iface) in [("usbmon", &c.usbmon), ("usbfs", &c.usbfs)] {
+    for (name, iface) in [
+        ("usbmon", &c.usbmon),
+        ("usbfs", &c.usbfs),
+        ("disks", &c.block_read),
+    ] {
         let mark = if iface.is_usable() {
             t.green("✓")
         } else {

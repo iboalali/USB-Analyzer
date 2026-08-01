@@ -145,30 +145,64 @@ directly. Every synthetic snapshot in the suite happens to be flat, so it passed
 everywhere and then resolved nothing at all for `4-1` on a real machine. The fixtures
 involved are now nested.
 
-### 4. Throughput probe via usbfs — root, disruptive
+### 4. Throughput probe — root, read-only — **done**
 
-Measure what a link *achieves* against what it negotiated.
+Measures what a link *achieves* against what it negotiated: a sequential read of
+`/dev/sdX` with direct I/O, for a bounded window, compared against what the link and the
+medium allow.
 
-Open `/dev/bus/usb/BBB/DDD` and use `USBDEVFS_*` ioctls — prefer raw ioctls over libusb
-to keep the crate free of non-Rust dependencies. For mass storage, a SCSI READ over
-bulk-only transport is the cleanest read-only load.
+**Not usbfs, and not disruptive.** The original plan was `USBDEVFS_*` ioctls and a SCSI
+READ over bulk-only transport. That needs `ioctl`, which needs libc — a dependency this
+crate has already refused once, in writing, in `caps.rs`, as the reason the binary usbmon
+API is out of reach. There is no portable pure-Rust `ioctl`: inline assembly would work
+on x86_64 and break on aarch64, which is exactly where a USB diagnostic tool earns its
+keep. A block read is bottlenecked by the same chain — cable, bridge, media — costs
+nothing in dependencies, and because it detaches no driver it can run against a
+**mounted** drive, which is the state a drive is in when somebody says it is slow. What
+it gives up: it cannot load a device that is not storage, and the block layer's overhead
+is inside the number. Neither matters for the question being asked.
 
-**Must read `/sys/block/<dev>/queue/rotational` before judging anything.** A real device
-here proves why: the MEDION drive above is a 5400 rpm 2.5" disk (`rotational=1`) behind
-an ASMedia bridge on a 5 Gbps link. It sustains ~100–120 MB/s; the link allows ~400–500.
-A naive probe would report "110 MB/s on a 5 Gbps link" and condemn a healthy drive. So
-the baseline comes from the media, not the link:
+**`O_DIRECT` is the whole measurement, and it has two traps.** Without it the page cache
+answers and the probe reports several GB/s over a 480 Mbps link. Its value is *not the
+same on every architecture* — `0o40000` on x86 and ARM, `0o400000` on PowerPC — and Linux
+discards `open` flags it does not recognise **without an error**, so a wrong constant does
+not fail, it silently measures the cache. So the value is cfg-gated to architectures where
+it is known, anything else is reported `Unsupported` at any privilege, and then it is
+proved at runtime: a deliberately misaligned one-byte read is rejected with `EINVAL` under
+direct I/O and succeeds without it. If that read succeeds, no number is reported at all.
+Verified positively on this machine, not just asserted in the negative.
 
-- `rotational=1` → compare against ~150 MB/s, flag only when far below
-- `rotational=0` → compare against the link rate, allowing for cheap flash
-- media type unknown → emit no finding at all, and say so
+**The judging rule is where this could have gone badly wrong.** Comparing achieved
+throughput against the link rate would condemn nearly every healthy drive: 110 MB/s over a
+5 Gbps link that allows 450 is an ordinary flash drive. And the media baseline the original
+plan called for is mostly unavailable — `medium()` returns `Unknown` for almost everything
+on USB, because bridges do not implement VPD page B1h. Following the original spec
+literally ("media unknown → no finding") would have produced a **fourth unreachable rule**.
+So the comparison is against the slowest thing the medium could plausibly be:
 
-Disruptive: `USBDEVFS_DISCONNECT_CLAIM` takes the device from its driver for the
-duration. Restore it on every exit path including errors and signals — use a guard type
-so the restore cannot be skipped.
+- medium known to spin → the platter's ceiling, flagged below half of it
+- medium unknown on a SuperSpeed link → flagged only below ~40 MB/s, what plain USB 2.0
+  would have delivered. No storage device negotiates 5 Gbps and then reads slower than a
+  High-Speed link would have allowed, whatever it is made of
+- medium unknown on a High-Speed link → **no finding, deliberately.** A genuinely slow
+  flash drive and a bad cable are indistinguishable at those rates
 
-New finding: `THROUGHPUT_BELOW_LINK_RATE` (Measured), only when achieved throughput is
-far below what **both** the negotiated rate and the media type allow.
+The measurement is always shown. Only the accusation is withheld — a rate on screen with
+"no conclusion drawn" is useful; a measurement suppressed because it could not be
+interpreted is not.
+
+**Contention is measured, not assumed.** `/sys/block/<dev>/stat` is read either side of
+the window and our own bytes subtracted, so traffic that was not ours is visible. A
+contended sample is displayed with that caveat and never judged: it describes load, not
+the link.
+
+Findings: `THROUGHPUT_FAR_BELOW_LINK` (Measured, Medium) and `STORAGE_READ_FAILED`
+(Measured, High) — the second for a read that begins and then dies, which is a hardware
+symptom, as opposed to one that never starts, which is usually a permission and is not
+reported as a fault.
+
+The usbfs variant is still the only way to load a non-storage device. If that is ever
+wanted it should be a separate disruptive probe rather than a change to this one.
 
 ### 5. Re-enumeration cycling — root, disruptive
 
@@ -262,6 +296,12 @@ for. Listed here so the gap is not mistaken for coverage.
   a tcpm-based system populates partner alt modes properly; otherwise delete, since
   `BILLBOARD_ALT_MODE_FAILED` plus the DRM cross-check already covers "adapter attached,
   no picture" and fired correctly on this hardware.
+- **`probe throughput` against a real disk** — the O_DIRECT mechanism is proved on this
+  machine (the misaligned-read check passes positively on ext4) and every refusal path is
+  exercised unprivileged, but the measurement itself needs root to open `/dev/sdX` and has
+  not been run. `sudo ./target/debug/usbdiag probe throughput --duration 3000` settles it.
+  The number to sanity-check is the SanDisk on `4-1`: a 5 Gbps link, so anything in the
+  100–200 MB/s range is a healthy flash drive and must produce **no** finding.
 - **`probe urb-errors` end to end** — every refusal path was exercised against live
   hardware, but the run itself has not been: it needs `sudo modprobe usbmon` and root,
   and the machine has rebooted since the module was last loaded. The parser is validated

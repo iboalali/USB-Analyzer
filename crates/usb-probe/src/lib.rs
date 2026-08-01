@@ -37,6 +37,7 @@ pub mod monitor;
 pub mod pd;
 pub mod probe;
 pub mod sysfs;
+pub mod throughput;
 pub mod thunderbolt;
 pub mod typec;
 pub mod usb;
@@ -130,6 +131,9 @@ pub fn capture_with_log(opts: Options, log: Option<KernelLog>) -> Snapshot {
         uptime_s: read_uptime_s(),
         orphan_pd,
         urb_traffic,
+        // The throughput probe runs after a capture, never during one: it
+        // costs seconds of wall-clock and must not happen by default.
+        throughput: Vec::new(),
         kernel_log: log.unwrap_or_else(|| kernel::collect(opts.kernel)),
     }
 }
