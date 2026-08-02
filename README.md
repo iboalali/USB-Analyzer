@@ -530,6 +530,20 @@ on sight, never mined for patterns. Storage is
 `$XDG_CONFIG_HOME/usbdiag/devices.json`, plain JSON, safe to edit by hand, and
 written **only** by an explicit command.
 
+### Storage errors, without root
+
+`/sys/block/<dev>/device/` exposes the SCSI layer's own command counters, and
+unlike usbmon they are world-readable. `usbdiag devices --sample 2000` watches
+them over a window and reports what moved.
+
+Only the *delta* is judged. Two healthy flash drives here both sit at
+`ioerr_cnt = 2` straight out of discovery — the counter includes the kernel
+probing for optional features and being told no — so a rule on the absolute
+value would condemn every storage device on every machine. A timeout
+(`iotmo_cnt`) is treated as a transport failure in its own right; plain errors
+are graded against how much traffic there actually was, and an idle window is
+reported as idle rather than as clean.
+
 ### Exonerations
 
 These do not appear in `findings`. They live in a separate `exonerations` list, so that
@@ -562,7 +576,7 @@ on*, so grading one as minor would manufacture a problem out of a note.
 
 ```sh
 cargo build --release -p usbdiag     # ./target/release/usbdiag
-cargo test --workspace               # 296 tests
+cargo test --workspace               # 308 tests
 ```
 
 The CLI and the library have **no non-Rust dependencies**: `serde` and

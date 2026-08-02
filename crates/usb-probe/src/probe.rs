@@ -668,6 +668,8 @@ mod tests {
                 removable: None,
                 stats: None,
                 throughput: None,
+                scsi: None,
+                scsi_delta: None,
             }],
             ..crate::test_support::empty_snapshot()
         }

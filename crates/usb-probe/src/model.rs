@@ -1281,6 +1281,14 @@ pub struct BlockDevice {
     pub stats: Option<BlockStats>,
     /// Live rate, present only when the caller sampled over a time window.
     pub throughput: Option<Throughput>,
+    /// SCSI command counters, for devices that have them. `None` is normal:
+    /// NVMe has no such directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scsi: Option<ScsiCounters>,
+    /// What those counters did over a sampling window. Present only when the
+    /// caller sampled, and the only form of them a rule may judge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scsi_delta: Option<ScsiDelta>,
 }
 
 impl BlockDevice {
@@ -1326,6 +1334,71 @@ impl BlockDevice {
     /// rather than the bus, which is the whole reason to ask.
     pub fn media_ceiling_bps(&self) -> Option<f64> {
         self.medium().practical_ceiling_bps()
+    }
+}
+
+/// SCSI command accounting, from `/sys/block/<dev>/device/`.
+///
+/// World-readable, unlike usbmon — which matters, because usbmon needs root and
+/// most people running this will not have it. For USB storage these reach part
+/// of what `LINK_ERROR_RATE` reaches, for free.
+///
+/// **`ioerr_cnt` is not a bus-error counter.** It counts any command that did
+/// not return GOOD status, including the kernel probing for an optional feature
+/// and being told no. Two healthy flash drives on the development machine, both
+/// freshly plugged in and working perfectly, sat at exactly `ioerr_cnt = 2` —
+/// routine CHECK CONDITION replies from discovery. A rule firing on
+/// `ioerr_cnt > 0` would condemn every storage device on every machine, which
+/// is the same mistake usbmon's status classification exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScsiCounters {
+    pub iorequest_cnt: u64,
+    pub iodone_cnt: u64,
+    /// Commands that returned anything other than GOOD. See the caveat above.
+    pub ioerr_cnt: u64,
+    /// Commands that never came back. The closest thing here to a genuine
+    /// transport failure, and the only one worth its own weight.
+    pub iotmo_cnt: u64,
+    pub sampled_at_unix_ms: u64,
+}
+
+impl ScsiCounters {
+    /// What changed between two reads, or `None` if the counters went backwards
+    /// (the device was re-enumerated and its accounting reset).
+    pub fn delta(&self, before: &Self) -> Option<ScsiDelta> {
+        let window_ms = self.sampled_at_unix_ms.checked_sub(before.sampled_at_unix_ms)?;
+        Some(ScsiDelta {
+            requests: self.iorequest_cnt.checked_sub(before.iorequest_cnt)?,
+            errors: self.ioerr_cnt.checked_sub(before.ioerr_cnt)?,
+            timeouts: self.iotmo_cnt.checked_sub(before.iotmo_cnt)?,
+            window_ms,
+        })
+    }
+}
+
+/// The change in the SCSI counters across a sampling window.
+///
+/// The delta is the signal and the absolute count is not: the baseline is a
+/// fixed handful of errors from discovery, identical on healthy hardware, so
+/// only what happens *while watching* means anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ScsiDelta {
+    pub requests: u64,
+    pub errors: u64,
+    pub timeouts: u64,
+    pub window_ms: u64,
+}
+
+impl ScsiDelta {
+    /// Errors as a fraction of commands issued, or `None` when nothing was
+    /// issued — an idle window says nothing about health either way.
+    pub fn error_rate(&self) -> Option<f64> {
+        (self.requests > 0).then(|| self.errors as f64 / self.requests as f64)
+    }
+
+    /// Did anything at all go wrong in the window?
+    pub fn is_clean(&self) -> bool {
+        self.errors == 0 && self.timeouts == 0
     }
 }
 
@@ -2226,6 +2299,8 @@ mod tests {
             removable: Some(true),
             stats: None,
             throughput: None,
+            scsi: None,
+            scsi_delta: None,
         });
         let owner = snap.owner_of(&snap.block_devices[0]).expect("an owner");
         assert_eq!(owner.sysfs_name, "4-1");
@@ -2247,6 +2322,8 @@ mod tests {
             removable: Some(true),
             stats: None,
             throughput: None,
+            scsi: None,
+            scsi_delta: None,
         });
 
         let mut b = a.clone();
@@ -2349,6 +2426,8 @@ mod tests {
             removable: Some(true),
             stats: None,
             throughput: None,
+            scsi: None,
+            scsi_delta: None,
         }
     }
 

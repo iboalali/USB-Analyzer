@@ -50,6 +50,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Finding> {
     display_rules(snap, &mut f);
     urb_error_rules(snap, &mut f);
     throughput_rules(snap, &mut f);
+    scsi_error_rules(snap, &mut f);
     reenumeration_rules(snap, &mut f);
     hub_port_rules(snap, &mut f);
 
@@ -1733,6 +1734,97 @@ fn read_error_finding(snap: &Snapshot, sample: &ThroughputSample, err: &str) -> 
 }
 
 /// The USB device a disk hangs off, together with the disk itself.
+/// SCSI command errors seen *while watching*, from `/sys/block/<dev>/device/`.
+///
+/// The unprivileged half of what `LINK_ERROR_RATE` reaches through usbmon. It
+/// gets its own code rather than folding into that one, so the two sources are
+/// never conflated in evidence: one is URB status off the bus, this is the SCSI
+/// layer's own accounting, and they fail in different ways.
+///
+/// **Only the delta is judged.** The absolute counters cannot be: two healthy
+/// flash drives on the development machine both sat at exactly `ioerr_cnt = 2`
+/// straight out of discovery, so a rule on the absolute value would condemn
+/// every storage device on every machine. That means this fires only when the
+/// caller sampled over a window — the same shape as the throughput rules.
+fn scsi_error_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
+    for (dev, blocks) in snap.storage_devices() {
+        for block in blocks {
+            let Some(d) = &block.scsi_delta else { continue };
+            if d.is_clean() {
+                continue;
+            }
+
+            // A timeout is a command that never came back, which is a transport
+            // failure rather than a device declining something. An error is
+            // weaker on its own: at a low rate against real traffic it is
+            // ordinary, and with no traffic at all it means nothing.
+            let rate = d.error_rate();
+            let severity = match (d.timeouts, rate) {
+                (t, _) if t > 0 => Severity::High,
+                (_, Some(r)) if r >= 0.01 => Severity::Medium,
+                (_, Some(r)) if r > 0.0 => Severity::Low,
+                // Errors with no requests in the window: the counter moved
+                // because of something we did not see, so there is no rate to
+                // judge and nothing worth saying.
+                _ => continue,
+            };
+
+            let headline = if d.timeouts > 0 {
+                format!(
+                    "{} stopped answering {} command(s) while being watched",
+                    block.label(),
+                    d.timeouts
+                )
+            } else {
+                format!(
+                    "{} failed {} of {} commands while being watched",
+                    block.label(),
+                    d.errors,
+                    d.requests
+                )
+            };
+
+            let mut evidence = vec![format!(
+                "over {:.1}s: {} requests, {} errors, {} timeouts",
+                d.window_ms as f64 / 1000.0,
+                d.requests,
+                d.errors,
+                d.timeouts
+            )];
+            if let Some(c) = &block.scsi {
+                evidence.push(format!(
+                    "cumulative since attach: iorequest {} ioerr {} iotmo {} \u{2014} a small \
+                     non-zero ioerr is normal, it counts discovery probes too",
+                    c.iorequest_cnt, c.ioerr_cnt, c.iotmo_cnt
+                ));
+            }
+
+            out.push(Finding {
+                code: "STORAGE_IO_ERRORS".into(),
+                severity,
+                // The counters are read straight from the kernel. What they
+                // mean for the *cable* is the inference, and the detail says so
+                // rather than the confidence pretending otherwise.
+                confidence: Confidence::Measured,
+                subject: Subject::Device(dev.sysfs_name.clone()),
+                title: headline,
+                detail: "These are the SCSI layer's own counters, not the USB bus's, and they \
+                         moved during the sampling window rather than at discovery. Commands \
+                         that fail or time out on a drive that enumerated cleanly point at the \
+                         path rather than the negotiation — a marginal cable, a worn connector, \
+                         or a hub short of power. A failing drive is the other explanation."
+                    .into(),
+                evidence,
+                suggestion: Some(
+                    "Sample again on a different cable. Counters that stay clean convict the \
+                     cable; counters that follow the drive convict the drive."
+                        .into(),
+                ),
+            });
+        }
+    }
+}
+
 fn storage_pair<'a>(
     snap: &'a Snapshot,
     disk: &str,
@@ -2484,6 +2576,8 @@ mod tests {
             removable: Some(true),
             stats: None,
             throughput: None,
+            scsi: None,
+            scsi_delta: None,
         });
         snap.throughput.push(ThroughputSample {
             device: "sdb".into(),
@@ -2660,6 +2754,170 @@ mod tests {
         // device and there is nothing to judge — which is the honest answer for
         // a SATA disk in a USB report.
         assert!(!codes(&analyze(&snap)).contains(&"THROUGHPUT_FAR_BELOW_LINK"));
+    }
+
+    // -----------------------------------------------------------------------
+    // SCSI error counters
+    // -----------------------------------------------------------------------
+
+    /// A USB disk with a SCSI counter delta over a window.
+    fn scsi(requests: u64, errors: u64, timeouts: u64) -> Snapshot {
+        let mut snap = empty_snapshot();
+        let mut bus = root_hub("usb4", 5000.0);
+        let mut dev = device("4-1", " 3.20", 5000.0, Some("usb4"));
+        dev.sysfs_path = std::path::PathBuf::from("/sys/devices/pci/usb4/4-1");
+        bus.children.push(dev);
+        snap.buses.push(bus);
+        snap.block_devices.push(BlockDevice {
+            name: "sdb".into(),
+            sysfs_path: std::path::PathBuf::from("/sys/devices/pci/usb4/4-1/host1/block/sdb"),
+            model: Some("Ultra".into()),
+            vendor: Some("SanDisk".into()),
+            size_bytes: Some(64_000_000_000),
+            rotational: None,
+            removable: Some(true),
+            stats: None,
+            throughput: None,
+            // The real baseline from this machine: two errors from discovery.
+            scsi: Some(ScsiCounters {
+                iorequest_cnt: 0x243,
+                iodone_cnt: 0x243,
+                ioerr_cnt: 2,
+                iotmo_cnt: 0,
+                sampled_at_unix_ms: 1000,
+            }),
+            scsi_delta: Some(ScsiDelta {
+                requests,
+                errors,
+                timeouts,
+                window_ms: 3000,
+            }),
+        });
+        snap
+    }
+
+    /// The mistake the whole design exists to avoid. Two healthy flash drives
+    /// on this machine both read `ioerr_cnt = 2` straight out of discovery, so
+    /// a rule on the absolute count condemns every storage device everywhere.
+    #[test]
+    fn the_discovery_baseline_is_never_an_accusation() {
+        let snap = scsi(4000, 0, 0);
+        assert_eq!(snap.block_devices[0].scsi.unwrap().ioerr_cnt, 2);
+        assert!(!codes(&analyze(&snap)).contains(&"STORAGE_IO_ERRORS"));
+    }
+
+    /// Without a sampling window there is no delta, and the absolute counters
+    /// are not judgeable — so a plain capture must stay silent however many
+    /// errors are on the clock.
+    #[test]
+    fn an_unsampled_capture_never_fires_the_rule() {
+        let mut snap = scsi(0, 0, 0);
+        snap.block_devices[0].scsi_delta = None;
+        snap.block_devices[0].scsi = Some(ScsiCounters {
+            iorequest_cnt: 100_000,
+            iodone_cnt: 90_000,
+            ioerr_cnt: 9_000,
+            iotmo_cnt: 500,
+            sampled_at_unix_ms: 1000,
+        });
+        assert!(!codes(&analyze(&snap)).contains(&"STORAGE_IO_ERRORS"));
+    }
+
+    /// A timeout is a command that never came back — a transport failure, not
+    /// a device declining an optional feature.
+    #[test]
+    fn a_timeout_in_the_window_is_high() {
+        let f = analyze(&scsi(500, 0, 1));
+        let hit = f
+            .iter()
+            .find(|x| x.code == "STORAGE_IO_ERRORS")
+            .unwrap_or_else(|| panic!("{:?}", codes(&f)));
+        assert_eq!(hit.severity, Severity::High);
+        assert_eq!(hit.subject, Subject::Device("4-1".into()));
+        assert!(hit.title.contains("stopped answering"), "{}", hit.title);
+    }
+
+    #[test]
+    fn the_error_rate_decides_between_low_and_medium() {
+        // 5 of 5000 = 0.1%: real, but ordinary.
+        let low = analyze(&scsi(5000, 5, 0));
+        assert_eq!(
+            low.iter().find(|x| x.code == "STORAGE_IO_ERRORS").unwrap().severity,
+            Severity::Low
+        );
+        // 100 of 5000 = 2%: worth acting on.
+        let med = analyze(&scsi(5000, 100, 0));
+        assert_eq!(
+            med.iter().find(|x| x.code == "STORAGE_IO_ERRORS").unwrap().severity,
+            Severity::Medium
+        );
+    }
+
+    /// An idle window says nothing in either direction. Errors with no requests
+    /// mean the counter moved because of traffic we did not see, so there is no
+    /// rate to judge.
+    #[test]
+    fn errors_without_traffic_are_not_judged() {
+        assert!(!codes(&analyze(&scsi(0, 3, 0))).contains(&"STORAGE_IO_ERRORS"));
+        // ...but a timeout is a timeout whether or not we saw the traffic.
+        assert!(codes(&analyze(&scsi(0, 0, 1))).contains(&"STORAGE_IO_ERRORS"));
+    }
+
+    #[test]
+    fn a_clean_window_says_nothing() {
+        assert!(!codes(&analyze(&scsi(20_000, 0, 0))).contains(&"STORAGE_IO_ERRORS"));
+    }
+
+    /// The evidence has to carry the caveat, or the next reader repeats the
+    /// mistake this rule was written to avoid.
+    #[test]
+    fn the_evidence_says_a_small_nonzero_baseline_is_normal() {
+        let f = analyze(&scsi(5000, 100, 0));
+        let hit = f.iter().find(|x| x.code == "STORAGE_IO_ERRORS").unwrap();
+        assert!(
+            hit.evidence.iter().any(|e| e.contains("discovery probes")),
+            "{:?}",
+            hit.evidence
+        );
+        // And it must not be confused with the usbmon-derived rule.
+        assert!(!codes(&f).contains(&"LINK_ERROR_RATE"));
+    }
+
+    /// Counters reset when a device re-enumerates, and a negative delta is not
+    /// a fault — it is a new device wearing the same name.
+    #[test]
+    fn counters_going_backwards_produce_no_delta() {
+        let before = ScsiCounters {
+            iorequest_cnt: 5000,
+            iodone_cnt: 5000,
+            ioerr_cnt: 10,
+            iotmo_cnt: 1,
+            sampled_at_unix_ms: 1000,
+        };
+        let after = ScsiCounters {
+            iorequest_cnt: 12,
+            iodone_cnt: 12,
+            ioerr_cnt: 2,
+            iotmo_cnt: 0,
+            sampled_at_unix_ms: 4000,
+        };
+        assert_eq!(after.delta(&before), None);
+    }
+
+    #[test]
+    fn a_delta_reports_its_rate_only_when_there_was_traffic() {
+        let d = ScsiDelta {
+            requests: 200,
+            errors: 4,
+            timeouts: 0,
+            window_ms: 3000,
+        };
+        assert_eq!(d.error_rate(), Some(0.02));
+        assert!(!d.is_clean());
+
+        let idle = ScsiDelta::default();
+        assert_eq!(idle.error_rate(), None);
+        assert!(idle.is_clean());
     }
 
     /// The case the whole override feature exists for.

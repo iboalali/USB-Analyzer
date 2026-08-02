@@ -441,36 +441,46 @@ not support.
 
 ## Unprivileged work worth doing
 
-### Read SCSI error counters — a passive error signal for storage
+### Read SCSI error counters — a passive error signal for storage — **done**
 
-`/sys/block/<dev>/device/` exposes counters that are world-readable, unlike usbmon: 
-`iorequest_cnt`, `iodone_cnt`, `ioerr_cnt`, `iotmo_cnt`, `device_busy`, `device_blocked`.
-For USB storage this reaches part of what `LINK_ERROR_RATE` reaches, with no privilege at
-all — which matters, because usbmon needs root and most people running this will not have
-it.
+`ScsiCounters` / `ScsiDelta` on `BlockDevice`, read from `/sys/block/<dev>/device/`, plus
+the `STORAGE_IO_ERRORS` rule. World-readable, so this reaches part of what
+`LINK_ERROR_RATE` reaches with no privilege at all — which matters, because usbmon needs
+root and most people running this will not have it.
 
-**`ioerr_cnt` is not a bus-error counter**, and treating it as one would repeat exactly
-the mistake usbmon's classification exists to prevent. It counts any command that did not
-return GOOD status, including the kernel probing for optional features and being told no.
-From this machine, both drives freshly plugged in and working perfectly:
+**Only the delta is judged, and that is the whole design.** Two healthy flash drives on
+this machine both read `ioerr_cnt = 2` straight out of discovery: `ioerr_cnt` counts any
+command that did not return GOOD, including the kernel probing for an optional feature and
+being told no. A rule on the absolute value condemns every storage device on every machine.
+So the rule fires only on what moved during a sampling window, which means only when the
+caller passed `--sample` — the same shape as the throughput rules. Two tests pin it: one
+that the discovery baseline is never an accusation, one that an unsampled capture stays
+silent even with 9000 errors on the clock.
 
-```
-sda  SanDisk Ultra USB 3.0   iorequest 0x243  ioerr 0x2  iotmo 0x0
-sdb  TOSHIBA TransMemory     iorequest 0x20d  ioerr 0x2  iotmo 0x0
-```
+**A timeout carries its own weight.** `iotmo_cnt` is a command that never came back, which
+is a transport failure rather than a device declining something, so it goes straight to
+High. Errors alone are graded by rate against real traffic — 0.1 % is ordinary, 2 % is not
+— and errors with *no* requests in the window are not judged at all, because the counter
+moved for traffic nobody watched.
 
-Two healthy flash drives, both at exactly `ioerr_cnt=2` — routine CHECK CONDITION replies
-from discovery. A rule firing on `ioerr_cnt > 0` would condemn every storage device on
-every machine.
+**The counters are hex** (`0x243`), which is the kind of thing that fails silently: `0x243`
+read as decimal fails outright, but `0x20` read as 20 is wrong by a factor of sixteen and
+looks plausible. `read_hex_u64` and its own test.
 
-- the values are **hex** (`0x243`), not decimal
-- `iotmo_cnt` is the closest thing to a genuine transport failure and deserves its own
-  weight — a timeout means the device stopped answering
-- the signal is the **delta over a window**, not the absolute count, since the baseline is
-  a fixed handful from discovery. Sampling fits the existing shape of `block::sample()`
-- only SCSI-attached devices have these; NVMe has no such directory, so absence is normal
-- give it its own code (`STORAGE_IO_ERRORS`) rather than folding it into
-  `LINK_ERROR_RATE`, so the two sources are never conflated in evidence
+Its own code rather than folding into `LINK_ERROR_RATE`, so the two sources are never
+conflated: one is URB status off the bus, this is the SCSI layer's own accounting.
+
+The absolute counters are *shown* in the storage view, with the caveat attached — a small
+non-zero `ioerr` is what healthy looks like — and an idle sampling window is reported as
+idle rather than as clean, since a clean bill of health nobody earned is the failure mode
+this project keeps returning to.
+
+**Not yet seen against a real drive.** The reader is exercised end to end against a
+synthetic sysfs tree carrying the exact hex values captured from the SanDisk here, and the
+NVMe-has-no-such-directory case is covered, but no USB storage has been attached since the
+rule was written. `usbdiag devices --sample 2000` with a drive plugged in settles it; the
+expected result on healthy hardware is a `while watching` line reading *clean* and **no**
+finding.
 
 ### Name vendors from `usb.ids`, and flag e-markers that look counterfeit
 
@@ -542,6 +552,11 @@ code.
 headset is audio plus HID. Interface order must not decide the answer, so the kinds have a
 total order and the most specific wins — with a test asserting the order is total and
 another asserting enumeration order is irrelevant.
+
+**A composite device, validated live.** A Logitech StreamCam plugged in later is the case
+the ranking exists for: `bDeviceClass ef` defers, and the interface list is video, video,
+audio, audio, vendor-specific, HID. It comes out **camera**, which is what the synthetic
+test predicted and what a person would say.
 
 **Against real hardware it names every attached device but one.** The hub, the Bluetooth
 radio (`bDeviceClass ef` deferring to three `0xe0` interfaces) and the smart-card reader all

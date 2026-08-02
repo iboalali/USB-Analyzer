@@ -371,6 +371,8 @@ mod tests {
                 removable: None,
                 stats: None,
                 throughput: None,
+                scsi: None,
+                scsi_delta: None,
             });
         }
         assert_eq!(targets(&snap, None), ["sda", "sdb"], "internal disks are not ours");

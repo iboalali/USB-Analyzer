@@ -50,6 +50,19 @@ pub fn read_hex_u8(dir: impl AsRef<Path>, name: &str) -> Option<u8> {
     u8::from_str_radix(read_attr(dir, name)?.trim_start_matches("0x"), 16).ok()
 }
 
+/// Hex with a `0x` prefix, as the SCSI I/O counters are exposed
+/// (`iorequest_cnt` reads `0x243`).
+///
+/// Reading these as decimal is the obvious mistake and a silent one: `0x243`
+/// parses as nothing at all, but `0x20` would have to be rejected rather than
+/// read as 20, and a counter that is quietly wrong by a factor of sixteen is
+/// worse than one that is missing.
+pub fn read_hex_u64(dir: impl AsRef<Path>, name: &str) -> Option<u64> {
+    let raw = read_attr(dir, name)?;
+    let t = raw.trim_start_matches("0x").trim_start_matches("0X");
+    u64::from_str_radix(t, 16).ok()
+}
+
 /// Hex with an optional `0x` prefix, as Type-C VDOs are exposed.
 pub fn read_vdo(dir: impl AsRef<Path>, name: &str) -> Option<Vdo> {
     let raw = read_attr(dir, name)?;
@@ -167,6 +180,32 @@ mod tests {
         assert_eq!(read_bool(&dir, "flag"), Some(true));
         assert_eq!(read_bool(&dir, "junk"), None);
         assert_eq!(read_bool(&dir, "absent"), None);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The SCSI counters are hex with a `0x` prefix — `iorequest_cnt` on this
+    /// machine reads `0x243`. Parsing them as decimal is the silent version of
+    /// this mistake: `0x243` fails outright, but a value like `0x20` read as
+    /// decimal 20 would be wrong by a factor of sixteen and look plausible.
+    #[test]
+    fn scsi_counters_are_hex() {
+        let dir = std::env::temp_dir().join(format!("usbprobe-hex-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("iorequest_cnt"), "0x243\n").unwrap();
+        fs::write(dir.join("ioerr_cnt"), "0x2\n").unwrap();
+        fs::write(dir.join("iotmo_cnt"), "0x0\n").unwrap();
+        fs::write(dir.join("bare"), "20\n").unwrap();
+        fs::write(dir.join("junk"), "n/a\n").unwrap();
+
+        assert_eq!(read_hex_u64(&dir, "iorequest_cnt"), Some(0x243));
+        assert_eq!(read_hex_u64(&dir, "ioerr_cnt"), Some(2));
+        assert_eq!(read_hex_u64(&dir, "iotmo_cnt"), Some(0));
+        // No prefix is still hex here, which is what the kernel means.
+        assert_eq!(read_hex_u64(&dir, "bare"), Some(0x20));
+        assert_eq!(read_hex_u64(&dir, "junk"), None);
+        assert_eq!(read_hex_u64(&dir, "absent"), None);
 
         let _ = fs::remove_dir_all(&dir);
     }

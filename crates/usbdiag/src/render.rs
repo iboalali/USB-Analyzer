@@ -874,6 +874,66 @@ pub fn storage(out: &mut String, report: &Report, t: &Theme) {
                     )),
                 );
             }
+
+            // SCSI command accounting. Shown, never judged from the absolute
+            // value: a small non-zero `ioerr` is what a healthy drive looks
+            // like straight out of discovery. Only the sampled delta below is
+            // something the rule engine will act on.
+            if let Some(c) = &b.scsi {
+                let baseline = t.dim(if c.ioerr_cnt > 0 && c.iotmo_cnt == 0 {
+                    "  — a few errors here are normal, discovery counts too"
+                } else {
+                    ""
+                });
+                row(
+                    out,
+                    t,
+                    "scsi",
+                    &format!(
+                        "{}{baseline}",
+                        t.dim(&format!(
+                            "{} commands, {} errors, {} timeouts since attach",
+                            c.iorequest_cnt, c.ioerr_cnt, c.iotmo_cnt
+                        ))
+                    ),
+                );
+            }
+            match &b.scsi_delta {
+                Some(d) if !d.is_clean() => row(
+                    out,
+                    t,
+                    "while watching",
+                    &format!(
+                        "{}  {}",
+                        t.yellow(&format!(
+                            "{} errors, {} timeouts",
+                            d.errors, d.timeouts
+                        )),
+                        t.dim(&format!(
+                            "in {} commands over {} ms",
+                            d.requests, d.window_ms
+                        ))
+                    ),
+                ),
+                Some(d) if d.requests > 0 => row(
+                    out,
+                    t,
+                    "while watching",
+                    &t.dim(&format!(
+                        "clean — {} commands, none failed, over {} ms",
+                        d.requests, d.window_ms
+                    )),
+                ),
+                // An idle window proves nothing, and saying "clean" about one
+                // would be a clean bill of health nobody earned.
+                Some(d) => row(
+                    out,
+                    t,
+                    "while watching",
+                    &t.dim(&format!("idle — nothing was asked of it in {} ms", d.window_ms)),
+                ),
+                None => {}
+            }
             let _ = writeln!(out);
         }
     }

@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{BlockDevice, BlockStats, Throughput};
+use crate::model::{BlockDevice, BlockStats, ScsiCounters, Throughput};
 use crate::sysfs as fsx;
 
 const SYS_BLOCK: &str = "/sys/block";
@@ -58,6 +58,8 @@ pub fn read_from(dir: &Path) -> Vec<BlockDevice> {
             removable: fsx::read_flag(&entry, "removable"),
             stats: read_stats(&entry),
             throughput: None,
+            scsi: read_scsi(&entry.join("device")),
+            scsi_delta: None,
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -76,6 +78,10 @@ pub fn sample(window: Duration) -> Vec<BlockDevice> {
     for dev in &mut second {
         if let Some(prev) = first.iter().find(|d| d.name == dev.name) {
             dev.throughput = match (&dev.stats, &prev.stats) {
+                (Some(now), Some(before)) => now.delta(before),
+                _ => None,
+            };
+            dev.scsi_delta = match (&dev.scsi, &prev.scsi) {
                 (Some(now), Some(before)) => now.delta(before),
                 _ => None,
             };
@@ -113,6 +119,23 @@ fn read_stats(dir: &Path) -> Option<BlockStats> {
         sectors_written: f[6],
         ms_writing: f[7],
         ios_in_flight: f[8],
+        sampled_at_unix_ms: now_ms(),
+    })
+}
+
+/// SCSI command counters, for devices that are SCSI-attached.
+///
+/// `None` for anything else — NVMe has no such directory, so absence is the
+/// normal case and not a failure to report.
+fn read_scsi(dir: &Path) -> Option<ScsiCounters> {
+    // All four are hex with a `0x` prefix. If the first is missing this is not
+    // a SCSI device and there is nothing here at all.
+    let iorequest_cnt = fsx::read_hex_u64(dir, "iorequest_cnt")?;
+    Some(ScsiCounters {
+        iorequest_cnt,
+        iodone_cnt: fsx::read_hex_u64(dir, "iodone_cnt").unwrap_or(0),
+        ioerr_cnt: fsx::read_hex_u64(dir, "ioerr_cnt").unwrap_or(0),
+        iotmo_cnt: fsx::read_hex_u64(dir, "iotmo_cnt").unwrap_or(0),
         sampled_at_unix_ms: now_ms(),
     })
 }
@@ -338,6 +361,50 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    /// The SCSI counters as this machine actually exposes them: hex, `0x`
+    /// prefixed, in `device/`. The values are the ones captured from a SanDisk
+    /// Ultra freshly plugged in and working perfectly.
+    #[test]
+    fn reads_the_scsi_counters_as_hex() {
+        let base = std::env::temp_dir().join(format!("usbprobe-scsi-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let sdb = base.join("sdb");
+        fs::create_dir_all(sdb.join("queue")).unwrap();
+        fs::create_dir_all(sdb.join("device")).unwrap();
+        fs::write(sdb.join("size"), "125045424\n").unwrap();
+        fs::write(sdb.join("device/iorequest_cnt"), "0x243\n").unwrap();
+        fs::write(sdb.join("device/iodone_cnt"), "0x243\n").unwrap();
+        fs::write(sdb.join("device/ioerr_cnt"), "0x2\n").unwrap();
+        fs::write(sdb.join("device/iotmo_cnt"), "0x0\n").unwrap();
+
+        let blocks = read_from(&base);
+        let c = blocks[0].scsi.expect("SCSI counters");
+        assert_eq!(c.iorequest_cnt, 0x243, "0x243 is 579, not 243");
+        assert_eq!(c.ioerr_cnt, 2);
+        assert_eq!(c.iotmo_cnt, 0);
+        // Nothing is judged from a bare read.
+        assert_eq!(blocks[0].scsi_delta, None);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// NVMe has no `device/iorequest_cnt`, and this machine's only internal
+    /// disk is NVMe. Absence must be silent, not an error.
+    #[test]
+    fn a_device_without_scsi_counters_reports_none() {
+        let base = std::env::temp_dir().join(format!("usbprobe-nvme-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let d = base.join("nvme0n1");
+        fs::create_dir_all(d.join("device")).unwrap();
+        fs::write(d.join("size"), "1000215216\n").unwrap();
+
+        let blocks = read_from(&base);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].scsi, None);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn parses_a_real_stat_line_and_skips_virtual_devices() {
         let base = std::env::temp_dir().join(format!("usbprobe-blk-{}", std::process::id()));
@@ -499,6 +566,8 @@ mod tests {
             removable: None,
             stats: None,
             throughput: None,
+            scsi: None,
+            scsi_delta: None,
         }];
         assert_eq!(
             attached_to(&blocks, Path::new("/sys/devices/pci0000:00/usb4/4-1")).len(),
