@@ -467,11 +467,16 @@ fn partner_line(pt: &Partner) -> String {
     }
     if let Some(id) = &pt.identity {
         if let Some(vid) = id.decoded.vendor_id {
-            let mut s = format!("vid {vid:04x}");
-            if let Some(pid) = id.decoded.product_id {
-                s.push_str(&format!(":{pid:04x}"));
-            }
-            parts.push(s);
+            // A PD partner carries a vendor id and no string either, so the
+            // charger on the desk is nameable for the same reason a cable is.
+            let ids = match id.decoded.product_id {
+                Some(pid) => format!("{vid:04x}:{pid:04x}"),
+                None => format!("{vid:04x}"),
+            };
+            parts.push(match usb_probe::usbids::system().vendor(vid) {
+                Some(name) => format!("{name} ({ids})"),
+                None => format!("vid {ids}"),
+            });
         }
         if let Some(pt_name) = &id.decoded.product_type {
             parts.push(pt_name.clone());
@@ -628,7 +633,12 @@ fn cable_line(p: &TypecPort, t: &Theme) -> String {
             parts.push(term.clone());
         }
         if let Some(vid) = d.vendor_id {
-            parts.push(format!("vid {vid:04x}"));
+            // The case usb.ids exists for. An e-marker carries a vendor id and
+            // never a string, so without the database this is four hex digits.
+            parts.push(match usb_probe::usbids::system().vendor(vid) {
+                Some(name) => format!("{name} ({vid:04x})"),
+                None => format!("vid {vid:04x}"),
+            });
         }
         if let Some(v) = id.product_type_vdo1 {
             parts.push(t.dim(&format!("vdo1 {}", v.hex)));

@@ -229,7 +229,12 @@ pub fn charging_port(
         pd_revision: Some("3.0".into()),
         identity: Some(
             PartialIdentity {
-                id_header: Some(Vdo::new(0b011 << 27)),
+                // Product type 011 (Passive Cable) *and* a real registered
+                // vendor id. The low bits are not spare: they are the vendor,
+                // and leaving them zero made this "healthy cable" fixture
+                // declare vendor 0000 — which no vendor owns, and which the
+                // e-marker trust rule correctly treats as a signal.
+                id_header: Some(Vdo::new((0b011 << 27) | 0x05e3)),
                 product_type_vdo1: Some(Vdo::new(cable_vdo1(ma))),
                 ..Default::default()
             }

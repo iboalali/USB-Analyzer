@@ -530,6 +530,39 @@ on sight, never mined for patterns. Storage is
 `$XDG_CONFIG_HOME/usbdiag/devices.json`, plain JSON, safe to edit by hand, and
 written **only** by an explicit command.
 
+### Naming things
+
+Vendor names come from the system USB ID database (`/usr/share/misc/usb.ids`),
+read at runtime rather than bundled — it cannot go stale, adds no data file,
+and is better data than a bundled copy. It is consulted **only where sysfs said
+nothing**, which is the case that used to print four hex digits: a hub with no
+`manufacturer` string becomes *Genesys Logic, Inc. USB2.0 Hub*. It never
+overrides what the hardware reports, and it never doubles a brand that is
+already in the product string.
+
+The case it really exists for is the cable: an e-marker carries a vendor id in
+its ID Header VDO and never a string, so without the database there is nothing
+to print but hex.
+
+### When an e-marker looks odd
+
+`CABLE_IDENTITY_UNUSUAL` reports three weak signals — a vendor id of `0000`, a
+vendor the database does not list, and reserved bits set in the cable VDO.
+
+It is `heuristic` always, and capped at `low`. *"Your cable may be
+counterfeit"* is the most damaging sentence this tool could emit wrongly: a
+perfectly honest cable from a small manufacturer who never registered a vendor
+id trips two of the three signals, and the response to being told is to bin a
+working cable. So the word never appears, and the finding says the innocent
+explanation out loud.
+
+Two of the signals refuse to run rather than guess. The unknown-vendor check is
+skipped entirely when no database is installed, since then every vendor is
+unknown. The reserved-bits check is skipped unless the cable is known to be
+passive, because the passive and active VDO layouts put different fields at the
+same offsets — and even then it only examines bits reserved under *both* PD 2.0
+and PD 3.x, since PD 2.0 uses B4..B3 for SuperSpeed directionality.
+
 ### Storage errors, without root
 
 `/sys/block/<dev>/device/` exposes the SCSI layer's own command counters, and
@@ -576,7 +609,7 @@ on*, so grading one as minor would manufacture a problem out of a note.
 
 ```sh
 cargo build --release -p usbdiag     # ./target/release/usbdiag
-cargo test --workspace               # 308 tests
+cargo test --workspace               # 332 tests
 ```
 
 The CLI and the library have **no non-Rust dependencies**: `serde` and

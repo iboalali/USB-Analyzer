@@ -502,15 +502,40 @@ impl UsbDevice {
         }
     }
 
+    /// The best name available for this device.
+    ///
+    /// The sysfs strings first, because they are what the device says about
+    /// itself. Only where it says nothing does the USB-IF database get asked —
+    /// which is the exact case that used to print four hex digits, and where a
+    /// name genuinely adds something. Never the other way round: a database
+    /// entry must not override what the hardware reports.
     pub fn label(&self) -> String {
         match (&self.manufacturer, &self.product) {
             (Some(m), Some(p)) => format!("{m} {p}"),
-            (None, Some(p)) => p.clone(),
-            (Some(m), None) => m.clone(),
-            (None, None) => match (self.id_vendor, self.id_product) {
-                (Some(v), Some(p)) => format!("{v:04x}:{p:04x}"),
-                _ => self.sysfs_name.clone(),
+            (None, Some(p)) => match self.id_vendor.and_then(named_vendor) {
+                // A product string with no manufacturer is common, and on a hub
+                // "USB2.0 Hub" names nothing at all. But plenty of products
+                // already carry the brand — "Logitech StreamCam" must not
+                // become "Logitech, Inc. Logitech StreamCam".
+                Some(v) if !names_the_same_vendor(p, v) => format!("{v} {p}"),
+                _ => p.clone(),
             },
+            (Some(m), None) => m.clone(),
+            (None, None) => self.database_label(),
+        }
+    }
+
+    /// The name the USB-IF database gives, falling back to hex and then to the
+    /// kernel's own name for it.
+    fn database_label(&self) -> String {
+        let (Some(vid), Some(pid)) = (self.id_vendor, self.id_product) else {
+            return self.sysfs_name.clone();
+        };
+        let ids = crate::usbids::system();
+        match (ids.vendor(vid), ids.product(vid, pid)) {
+            (Some(v), Some(p)) => format!("{v} {p}"),
+            (Some(v), None) => format!("{v} {pid:04x}"),
+            _ => format!("{vid:04x}:{pid:04x}"),
         }
     }
 
@@ -616,6 +641,25 @@ impl UsbDevice {
         self.power_control.as_deref() == Some("auto")
             && self.suspend_ratio().is_some_and(|r| r > 0.9)
     }
+}
+
+/// The USB-IF name for a vendor id, when the system database has one.
+fn named_vendor(vid: u16) -> Option<&'static str> {
+    crate::usbids::system().vendor(vid)
+}
+
+/// Does this product string already say who made it?
+///
+/// Compared on the vendor's first word, since the database writes the legal
+/// name — `Logitech, Inc.` against a product called `Logitech StreamCam`.
+fn names_the_same_vendor(product: &str, vendor: &str) -> bool {
+    let Some(word) = vendor
+        .split(|c: char| !c.is_alphanumeric())
+        .find(|w| w.len() >= 3)
+    else {
+        return false;
+    };
+    product.to_lowercase().contains(&word.to_lowercase())
 }
 
 /// A downstream port on a hub or root hub.
@@ -2304,6 +2348,19 @@ mod tests {
         });
         let owner = snap.owner_of(&snap.block_devices[0]).expect("an owner");
         assert_eq!(owner.sysfs_name, "4-1");
+    }
+
+    /// A product string that already carries the brand must not have it added
+    /// again — a real case on this machine, where the webcam reports no
+    /// manufacturer and the product `Logitech StreamCam`.
+    #[test]
+    fn a_vendor_prefix_is_not_added_twice() {
+        assert!(names_the_same_vendor("Logitech StreamCam", "Logitech, Inc."));
+        assert!(names_the_same_vendor("SanDisk Ultra", "SanDisk Corp."));
+        // The hub genuinely says nothing about who made it.
+        assert!(!names_the_same_vendor("USB2.0 Hub", "Genesys Logic, Inc."));
+        // A two-letter first word must not match half the alphabet.
+        assert!(!names_the_same_vendor("Hub", "IC Habitat"));
     }
 
     /// The point of the fingerprint: a watcher must not repaint because time

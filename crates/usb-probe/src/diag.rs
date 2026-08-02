@@ -51,6 +51,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Finding> {
     urb_error_rules(snap, &mut f);
     throughput_rules(snap, &mut f);
     scsi_error_rules(snap, &mut f);
+    cable_trust_rules(snap, &mut f);
     reenumeration_rules(snap, &mut f);
     hub_port_rules(snap, &mut f);
 
@@ -1734,6 +1735,69 @@ fn read_error_finding(snap: &Snapshot, sample: &ThroughputSample, err: &str) -> 
 }
 
 /// The USB device a disk hangs off, together with the disk itself.
+/// Fields in a cable's e-marker that do not look like the vendor wrote them.
+///
+/// Capped at `Low` and always [`Confidence::Heuristic`], because *"your cable
+/// may be counterfeit"* is the most damaging sentence this tool could emit
+/// wrongly — a cheap-but-honest cable from an unregistered vendor trips two of
+/// the three signals on its own. The word never appears; the finding reports
+/// what is unusual and then says plainly that honest cheap cables look the same.
+///
+/// See [`crate::trust`] for why two of the three signals refuse to run unless
+/// their preconditions hold.
+fn cable_trust_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
+    let ids = crate::usbids::system();
+    for port in &snap.ports {
+        let Some(cable) = &port.cable else { continue };
+        let signals = crate::trust::signals(cable, ids);
+        if signals.is_empty() {
+            continue;
+        }
+
+        // One oddity is a note. Two or more is worth a second look, and is
+        // still not a verdict — Low is the ceiling by design.
+        let severity = if signals.len() >= 2 {
+            Severity::Low
+        } else {
+            Severity::Info
+        };
+
+        let mut evidence: Vec<String> = signals.iter().map(crate::trust::Signal::describe).collect();
+        if let Some(src) = &ids.source {
+            evidence.push(format!("vendor names from {}", src.display()));
+        } else {
+            evidence.push(
+                "no usb.ids installed, so the unknown-vendor check did not run".into(),
+            );
+        }
+
+        out.push(Finding {
+            code: "CABLE_IDENTITY_UNUSUAL".into(),
+            severity,
+            confidence: crate::trust::CONFIDENCE,
+            subject: Subject::Cable(port.name.clone()),
+            title: format!(
+                "This cable's e-marker has {} unusual field{}",
+                signals.len(),
+                if signals.len() == 1 { "" } else { "s" }
+            ),
+            detail: "An e-marker is written by whoever built the cable, and a well-made one \
+                     follows the specification closely. These fields do not. That is worth \
+                     knowing and it is not evidence of anything on its own: a perfectly \
+                     honest cable from a small manufacturer who never registered a vendor id \
+                     looks exactly like this, and so does one whose firmware was written \
+                     carelessly. Nothing here has been measured electrically."
+                .into(),
+            evidence,
+            suggestion: Some(
+                "Judge it on behaviour rather than on this. If the cable carries its rated \
+                 current and trains at its rated speed, these fields do not matter."
+                    .into(),
+            ),
+        });
+    }
+}
+
 /// SCSI command errors seen *while watching*, from `/sys/block/<dev>/device/`.
 ///
 /// The unprivileged half of what `LINK_ERROR_RATE` reaches through usbmon. It
@@ -2754,6 +2818,92 @@ mod tests {
         // device and there is nothing to judge — which is the honest answer for
         // a SATA disk in a USB report.
         assert!(!codes(&analyze(&snap)).contains(&"THROUGHPUT_FAR_BELOW_LINK"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Cable e-marker trust
+    // -----------------------------------------------------------------------
+
+    /// A port whose cable declares `vendor_id`, keeping everything else healthy.
+    fn cable_from_vendor(vendor_id: u16) -> Snapshot {
+        let mut snap = empty_snapshot();
+        let mut port = charging_port(100_000, Some(5000), 20_000, 5000);
+        if let Some(c) = port.cable.as_mut() {
+            let id = c.identity.as_mut().unwrap();
+            id.id_header = Some(Vdo::new((0b011 << 27) | vendor_id as u32));
+            id.decoded.vendor_id = Some(vendor_id);
+        }
+        snap.ports.push(port);
+        snap
+    }
+
+    /// The healthy fixture must stay silent, or every other cable test grows a
+    /// spurious finding.
+    #[test]
+    fn a_cable_from_a_registered_vendor_is_not_flagged() {
+        // Genesys Logic — a real id, present in the system database.
+        let f = analyze(&cable_from_vendor(0x05e3));
+        assert!(!codes(&f).contains(&"CABLE_IDENTITY_UNUSUAL"), "{:?}", codes(&f));
+    }
+
+    /// Vendor 0000 belongs to nobody.
+    #[test]
+    fn a_zero_vendor_id_is_an_info_note_and_nothing_stronger() {
+        let f = analyze(&cable_from_vendor(0));
+        let hit = f
+            .iter()
+            .find(|x| x.code == "CABLE_IDENTITY_UNUSUAL")
+            .unwrap_or_else(|| panic!("{:?}", codes(&f)));
+        assert_eq!(hit.severity, Severity::Info, "one signal is a note");
+        assert_eq!(hit.confidence, Confidence::Heuristic);
+        assert_eq!(hit.subject, Subject::Cable("port0".into()));
+    }
+
+    /// The sentence that must never be produced. A cheap honest cable trips
+    /// these signals, and the user's response to being accused is to bin a
+    /// working cable.
+    #[test]
+    fn the_finding_never_says_counterfeit() {
+        let f = analyze(&cable_from_vendor(0));
+        let hit = f.iter().find(|x| x.code == "CABLE_IDENTITY_UNUSUAL").unwrap();
+        let all = format!(
+            "{} {} {} {}",
+            hit.title,
+            hit.detail,
+            hit.evidence.join(" "),
+            hit.suggestion.clone().unwrap_or_default()
+        )
+        .to_lowercase();
+        for word in ["counterfeit", "fake", "clone", "fraud", "stolen"] {
+            assert!(!all.contains(word), "must not say {word}: {all}");
+        }
+        // And it must actively say the innocent explanation out loud.
+        assert!(all.contains("honest"), "{all}");
+    }
+
+    /// Severity is capped at Low however many signals fire, because none of
+    /// them is evidence of anything on its own.
+    #[test]
+    fn several_signals_reach_low_and_stop_there() {
+        let mut snap = cable_from_vendor(0);
+        // Add reserved bits on top of the zero vendor.
+        if let Some(c) = snap.ports[0].cable.as_mut() {
+            let id = c.identity.as_mut().unwrap();
+            let raw = id.product_type_vdo1.unwrap().raw;
+            id.product_type_vdo1 = Some(Vdo::new(raw | (1 << 17)));
+        }
+        let f = analyze(&snap);
+        let hit = f.iter().find(|x| x.code == "CABLE_IDENTITY_UNUSUAL").unwrap();
+        assert_eq!(hit.severity, Severity::Low);
+        assert_eq!(hit.confidence, Confidence::Heuristic);
+        assert!(hit.evidence.len() >= 2, "{:?}", hit.evidence);
+    }
+
+    #[test]
+    fn a_port_with_no_cable_node_is_never_flagged() {
+        let mut snap = empty_snapshot();
+        snap.ports.push(laptop_charger_port_100w());
+        assert!(!codes(&analyze(&snap)).contains(&"CABLE_IDENTITY_UNUSUAL"));
     }
 
     // -----------------------------------------------------------------------
@@ -4502,3 +4652,4 @@ mod tests {
         assert_eq!(milliamps(2250), "2.25 A");
     }
 }
+

@@ -482,46 +482,52 @@ rule was written. `usbdiag devices --sample 2000` with a drive plugged in settle
 expected result on healthy hardware is a `while watching` line reading *clean* and **no**
 finding.
 
-### Name vendors from `usb.ids`, and flag e-markers that look counterfeit
+### Name vendors from `usb.ids`, and flag e-markers that look counterfeit — **done**
 
-From [`docs/02-prior-art.md`](docs/02-prior-art.md). Two features, one item, because the
-second needs the first.
+`usbids.rs` and `trust.rs`, plus `CABLE_IDENTITY_UNUSUAL`.
 
-**Vendor names.** Device names come from the sysfs `manufacturer` and `product` strings,
-which is fine for devices and useless for cables: an e-marker carries a vendor ID in its
-ID Header VDO and never a string. On hardware that exposes a cable at all — not this
-laptop, see below — we would print `0x2109` where a name exists.
+**Vendor names, read not bundled.** `/usr/share/misc/usb.ids`, 728 KB, parsed once per
+process behind a `OnceLock` and only when something asks. It cannot go stale, adds no data
+file, raises no licence question, and is better data than a bundled table: it names
+`27c6  Shenzhen Goodix Technology Co.,Ltd.` where `usbeehive` falls back to hex. Absence is
+non-fatal — hex is the correct answer with no database installed.
 
-`usbeehive` solves this by bundling a USB-IF table. **Read the system database instead.**
-`/usr/share/hwdata/usb.ids` and `/usr/share/misc/usb.ids` are both present here, 25 627
-lines, shipped by `hwdata` and `usb.ids` respectively — packages already on any machine
-with `lsusb`. Reading at runtime beats bundling on every axis that matters: it cannot go
-stale, it adds no data file, and it raises no licence question. It is also simply better
-data — the system table names Goodix (`27c6  Shenzhen Goodix Technology Co.,Ltd.`) where
-`usbeehive::vendor::lookup(0x27c6)` falls back to hex. Absence must stay non-fatal: hex is
-the correct answer when the file is not installed, and the parse is two fields of a
-tab-indented text file, not a dependency.
+Two parsing traps, both tested. Everything after `C 00` is the device-class list and reuses
+the same indentation for entirely different numbers, so reading past it files audio class
+codes as vendors. And two-tab lines are interface names under a product, not products.
 
-**Counterfeit signals**, after `usbeehive::cable::CableTrust` (MIT). Three, none
-conclusive: a zero vendor ID in the ID Header VDO, a VID the database does not know, and
-reserved bits set in the Cable VDO.
+**The naming rule is: sysfs first, database only where sysfs said nothing.** A database
+entry must never override what the hardware reports. The visible win on this machine is the
+hub, whose `manufacturer` is absent entirely — `USB2.0 Hub` becomes `Genesys Logic, Inc.
+USB2.0 Hub`. That immediately produced its own bug: the webcam also reports no manufacturer
+and a product of `Logitech StreamCam`, which became `Logitech, Inc. Logitech StreamCam`. A
+product string that already carries the brand is left alone, matched on the vendor's first
+word of three characters or more.
 
-Three traps, in order of how badly each would misfire:
+**The trust signals are the most dangerous thing here**, and the design is about keeping
+them weak. Heuristic always, Info for one signal and Low for two or more, and the word
+*counterfeit* appears nowhere — there is a test asserting the output contains none of
+counterfeit/fake/clone/fraud/stolen and *does* contain the innocent explanation.
 
-- **This must be Heuristic, and Info or Low.** "Your cable may be counterfeit" is the
-  most damaging sentence this tool could emit wrongly, and all three signals are weak.
-  A cheap-but-honest cable from an unregistered vendor trips two of them.
-- **The reserved-bits check must inherit our PD-revision uncertainty.** `vdo.rs` already
-  refuses to guess between the PD 2.0 and 3.0 product-type encodings, reporting *"Passive
-  or Active Cable (ambiguous without PD revision)"*. The Cable VDO layout differs between
-  passive and active, so where the revision is unknown the check cannot run — it would
-  read reserved bits at the wrong offsets and fire on healthy PD 2.0 cables.
-- **The unknown-VID signal is only as good as `usb.ids`.** Suppress it entirely when the
-  file is missing, or every cable becomes suspicious on a minimal system.
+Both conditional signals refuse to run rather than guess:
 
-Untestable here. UCSI exposes no cable node — `/sys/class/typec/` has ports and partners
-and no `port0-cable` — so every line of this is dead code on this machine and gets
-fixtures, not a live check. Same category as #12 and #23.
+- **Unknown vendor** is gated on `UsbIds::available()`. With no database every vendor is
+  unknown and the signal would fire on every cable on the machine.
+- **Reserved bits** are gated on the cable being known *passive*. `vdo.rs` deliberately
+  reports "Passive or Active Cable (ambiguous without PD revision)" when it cannot tell, and
+  that uncertainty is inherited: the two VDO layouts put different fields at the same
+  offsets. Only bits reserved under *both* PD 2.0 and PD 3.x are examined — B20, B17, B8,
+  B7. B4..B3 are deliberately skipped and `bits_not_checked()` says so, because PD 2.0 uses
+  them for SuperSpeed directionality and a healthy PD 2.0 cable has them set.
+
+**Writing this exposed a fixture bug.** `test_support`'s "healthy e-marked cable" built its
+ID Header as `0b011 << 27` and left the low sixteen bits at zero — which is not spare space,
+it is the vendor id. The fixture had been declaring vendor 0000 all along, and the new rule
+correctly flagged it. It now carries a real registered id.
+
+Still untestable against hardware, as predicted: UCSI exposes no cable node, so every line
+of the trust half runs only against fixtures here. Same category as #12 and #23. The vendor
+naming half *is* live and validated against the four real vendors in this laptop.
 
 ### Classify devices, but only let a guess suppress a finding — **done**
 
