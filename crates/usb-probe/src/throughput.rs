@@ -258,6 +258,29 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// A scratch path next to the test binary, deliberately **not** in
+    /// `std::env::temp_dir()`.
+    ///
+    /// `/tmp` is tmpfs on a growing number of distributions, and tmpfs accepts
+    /// `O_DIRECT` while not enforcing any of its alignment rules — a misaligned
+    /// read simply succeeds. That makes the premise of
+    /// [`direct_io_is_detected_when_it_is_actually_on`] false there: on tmpfs it
+    /// cannot tell a filesystem that ignores `O_DIRECT` from an `O_DIRECT`
+    /// constant that is wrong for the architecture, which is the only thing it
+    /// exists to catch. `target/debug/deps` is on the same filesystem as the
+    /// checkout, already build output, and guaranteed to exist because the
+    /// running binary is in it.
+    ///
+    /// Found by CI: this passed on the 24.04 runner and failed on 26.04, which
+    /// differ in nothing that matters here except what `/tmp` is mounted as.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("usbprobe-{tag}-{}", std::process::id()))
+    }
+
     #[test]
     fn the_buffer_is_aligned_zeroed_and_the_right_size() {
         let mut buf = AlignedBuf::new(CHUNK).unwrap();
@@ -276,7 +299,7 @@ mod tests {
     /// would let the page cache be reported as link throughput.
     #[test]
     fn buffered_io_is_never_mistaken_for_direct() {
-        let path = std::env::temp_dir().join(format!("usbprobe-odirect-{}", std::process::id()));
+        let path = scratch("odirect");
         let mut f = File::create(&path).unwrap();
         f.write_all(&[0u8; 8192]).unwrap();
         drop(f);
@@ -303,7 +326,7 @@ mod tests {
         let Some(flag) = O_DIRECT else {
             return; // Nothing to prove on an architecture we refuse to guess at.
         };
-        let path = std::env::temp_dir().join(format!("usbprobe-direct-{}", std::process::id()));
+        let path = scratch("direct");
         let mut f = File::create(&path).unwrap();
         f.write_all(&[0u8; 65536]).unwrap();
         drop(f);
@@ -311,8 +334,12 @@ mod tests {
         if let Ok(direct) = OpenOptions::new().read(true).custom_flags(flag).open(&path) {
             assert!(
                 direct_io_is_in_force(&direct),
-                "O_DIRECT was accepted but a misaligned read still succeeded — the constant \
-                 is wrong for this architecture and every measurement would be the page cache"
+                "O_DIRECT was accepted but a misaligned read still succeeded, which has two \
+                 possible causes and this test cannot tell them apart. Either the constant is \
+                 wrong for this architecture and every measurement would be the page cache, or \
+                 {} is on a filesystem that accepts O_DIRECT without enforcing it — tmpfs does \
+                 exactly that, so check CARGO_TARGET_DIR before suspecting the constant",
+                path.display()
             );
             // An aligned read through the same handle must still work, or the
             // measurement loop could never make progress.
