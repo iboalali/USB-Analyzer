@@ -41,7 +41,7 @@
 //! machine.
 
 use relm4::gtk::{self, prelude::*};
-use usb_probe::caps::{ProbeClass, PROBES};
+use usb_probe::caps::{ProbeClass, Remedy, PROBES};
 use usb_probe::model::Snapshot;
 
 use crate::findings;
@@ -101,17 +101,24 @@ fn row(p: &usb_probe::caps::ProbeInfo, snap: &Snapshot) -> gtk::Box {
 
     head.append(&findings::chip(p.class.label(), &[class_css(p.class)]));
 
-    // Three distinguishable states, and the difference matters. "Not built yet"
-    // is a fact about this program; "cannot run here" is a fact about this
-    // machine; and only the third means it would work if asked.
+    // "Not built yet" is a fact about this program and comes first, because a
+    // probe that does not exist cannot be blocked by anything.
+    //
+    // Everything else names *what is missing*, from `Remedy`, rather than the
+    // flat "unavailable here" this started as. The distinction is not cosmetic:
+    // "needs something to run it on" is fixed by plugging a disk in, with no
+    // password and no reboot, and reads as a completely different instruction
+    // from "needs privilege". Collapsing them hid the one blocker on this
+    // machine a user could clear in five seconds.
     let (state, css) = if !p.implemented {
-        ("not built yet", "blocked")
-    } else if blocker.is_some() {
-        ("unavailable here", "blocked")
+        ("not built yet".to_string(), "blocked")
     } else {
-        ("ready", "ready")
+        match snap.capabilities.remedy(p) {
+            Remedy::Nothing => ("ready".to_string(), "ready"),
+            r => (format!("needs {}", r.label()), "blocked"),
+        }
     };
-    head.append(&findings::chip(state, &[css]));
+    head.append(&findings::chip(&state, &[css]));
     outer.append(&head);
 
     outer.append(&findings::paragraph(p.summary, &["dim"]));

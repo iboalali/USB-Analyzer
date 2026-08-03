@@ -25,10 +25,14 @@
 //! affects nothing — it claims no interface and detaches no driver — and the
 //! node chosen is a root hub, the least interesting device on any bus.
 //!
-//! # Four ways to be unavailable
+//! # Five ways to be unavailable
 //!
-//! They are kept apart because the fix differs completely: load a module, gain
-//! a privilege, rebuild a kernel, or nothing at all.
+//! They are kept apart because the fix differs completely: gain a privilege,
+//! load a module, rebuild a kernel, attach some hardware, or nothing at all.
+//! [`Availability::remedy`] is that axis made explicit, and the reason it is
+//! worth a type: an escalation prompt must appear only where privilege is what
+//! is missing. "Run this as root" is a false promise when the honest answer is
+//! "plug a disk in", and the user cannot tell the difference before clicking.
 
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
@@ -50,6 +54,16 @@ pub enum Availability {
     NotLoaded(String),
     /// This kernel was not built with it. Fix: a different kernel.
     Unsupported(String),
+    /// The interface works and there is nothing to point it at. Fix: attach
+    /// something.
+    ///
+    /// **Nothing about this machine is wrong**, which is why it cannot share a
+    /// variant with any of the above. Reporting "no USB disk is attached" as
+    /// [`Unsupported`](Availability::Unsupported) told the user their kernel was
+    /// deficient when all they had to do was plug a drive in — and it is the one
+    /// state here that changes on the next uevent rather than on the next
+    /// reboot.
+    Absent(String),
     /// Cannot be determined — usually because the directory that would answer
     /// the question is itself unreadable. Fix: unknown, which is the point.
     Unknown(String),
@@ -67,8 +81,72 @@ impl Availability {
             Availability::Denied(w)
             | Availability::NotLoaded(w)
             | Availability::Unsupported(w)
+            | Availability::Absent(w)
             | Availability::Unknown(w) => w,
         }
+    }
+
+    /// What would make this usable.
+    ///
+    /// The question a front end actually needs, and the reason this exists: an
+    /// escalation prompt must only appear where privilege is the thing missing.
+    /// Offering to re-run something as root when the answer is "attach a disk"
+    /// is a promise that cannot be kept, and the user has no way to know that
+    /// before clicking.
+    pub fn remedy(&self) -> Remedy {
+        match self {
+            Availability::Usable => Remedy::Nothing,
+            Availability::Denied(_) => Remedy::Privilege,
+            Availability::NotLoaded(_) => Remedy::LoadModule,
+            Availability::Unsupported(_) => Remedy::DifferentKernel,
+            Availability::Absent(_) => Remedy::AttachTarget,
+            Availability::Unknown(_) => Remedy::Unclear,
+        }
+    }
+}
+
+/// What is missing, as opposed to what is broken.
+///
+/// Deliberately about the *fix* rather than the cause: that is the axis a user
+/// acts on, and grouping by it is what keeps "you need root" apart from "you
+/// need to plug something in".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Remedy {
+    /// Already usable.
+    Nothing,
+    /// Root, a group membership, or a capability bit.
+    Privilege,
+    /// A kernel module that is not loaded.
+    LoadModule,
+    /// A kernel built with something this one lacks.
+    DifferentKernel,
+    /// Hardware to run it against. The only one the user can fix by hand right
+    /// now, without privilege and without a reboot.
+    AttachTarget,
+    /// Undetermined, so no fix can be named.
+    Unclear,
+}
+
+impl Remedy {
+    /// The missing thing, phrased to follow "needs".
+    pub fn label(&self) -> &'static str {
+        match self {
+            Remedy::Nothing => "nothing",
+            Remedy::Privilege => "privilege",
+            Remedy::LoadModule => "a kernel module",
+            Remedy::DifferentKernel => "a different kernel",
+            Remedy::AttachTarget => "something to run it on",
+            Remedy::Unclear => "an unknown fix",
+        }
+    }
+
+    /// Whether running the same thing as root would change the answer.
+    ///
+    /// The gate for an escalation prompt. False for everything except
+    /// [`Remedy::Privilege`] — including [`Remedy::Unclear`], because "we could
+    /// not tell" is not grounds for asking someone for their password.
+    pub fn root_may_help(&self) -> bool {
+        matches!(self, Remedy::Privilege)
     }
 }
 
@@ -136,15 +214,33 @@ impl Capabilities {
         self.effective_uid == Some(0)
     }
 
+    /// The interface a probe depends on, or `None` when it needs none.
+    ///
+    /// Exists so a caller can ask about the *kind* of unavailability without
+    /// rebuilding this mapping for itself. A front end that mapped
+    /// [`Requirement`] to a field on its own side would be holding a second
+    /// opinion about what a probe needs, and would silently miss a variant added
+    /// here later.
+    pub fn interface_for(&self, probe: &ProbeInfo) -> Option<&Interface> {
+        match probe.needs {
+            Requirement::Nothing => None,
+            Requirement::Usbmon => Some(&self.usbmon),
+            Requirement::Usbfs => Some(&self.usbfs),
+            Requirement::BlockRead => Some(&self.block_read),
+            Requirement::PortControl => Some(&self.port_control),
+        }
+    }
+
+    /// What would make this probe runnable. [`Remedy::Nothing`] when it already
+    /// is, or when it needs no interface at all.
+    pub fn remedy(&self, probe: &ProbeInfo) -> Remedy {
+        self.interface_for(probe)
+            .map_or(Remedy::Nothing, |i| i.availability.remedy())
+    }
+
     /// Why this probe cannot run now, or `None` if it can.
     pub fn blocker(&self, probe: &ProbeInfo) -> Option<String> {
-        let iface = match probe.needs {
-            Requirement::Nothing => return None,
-            Requirement::Usbmon => &self.usbmon,
-            Requirement::Usbfs => &self.usbfs,
-            Requirement::BlockRead => &self.block_read,
-            Requirement::PortControl => &self.port_control,
-        };
+        let iface = self.interface_for(probe)?;
         if iface.is_usable() {
             return None;
         }
@@ -509,8 +605,11 @@ fn detect_block_read(root: &Path) -> Interface {
     }
 
     let Some(node) = first_disk_node(root) else {
+        // Absent, not Unsupported: O_DIRECT is fine and the kernel is fine,
+        // there is simply no disk. Plugging one in fixes it, and this is the
+        // only state in the enum that a uevent can change.
         return Interface::new(
-            Availability::Unsupported(
+            Availability::Absent(
                 "no raw disk nodes under /dev — there is nothing whose throughput could be \
                  measured"
                     .into(),
@@ -908,6 +1007,94 @@ mod tests {
         assert!(why.contains("module not loaded"), "{why}");
         assert!(caps.blocker(probe("throughput").unwrap()).is_none());
         assert!(caps.blocker(probe("snapshot").unwrap()).is_none());
+    }
+
+    /// The distinction the whole `Remedy` axis exists for. Both of these probes
+    /// are unavailable, and only one of them would be helped by a password.
+    #[test]
+    fn only_a_privilege_problem_invites_escalation() {
+        let caps = Capabilities {
+            effective_uid: Some(1000),
+            usbmon: Interface::new(Availability::Denied("needs root".into()), None),
+            usbfs: Interface::new(Availability::Usable, None),
+            // The case found by reading the GUI's probe panel on this laptop.
+            block_read: Interface::new(Availability::Absent("no disks".into()), None),
+            port_control: Interface::new(Availability::Usable, None),
+        };
+
+        let urb = probe("urb-errors").unwrap();
+        let thr = probe("throughput").unwrap();
+
+        // Both are blocked, so a front end keying off `blocker()` alone cannot
+        // tell them apart — which is exactly the bug this fixes.
+        assert!(caps.blocker(urb).is_some());
+        assert!(caps.blocker(thr).is_some());
+
+        assert_eq!(caps.remedy(urb), Remedy::Privilege);
+        assert_eq!(caps.remedy(thr), Remedy::AttachTarget);
+        assert!(caps.remedy(urb).root_may_help());
+        assert!(
+            !caps.remedy(thr).root_may_help(),
+            "no password attaches a disk"
+        );
+
+        // A probe needing no interface has nothing to fix.
+        assert_eq!(caps.remedy(probe("snapshot").unwrap()), Remedy::Nothing);
+        assert!(caps.interface_for(probe("snapshot").unwrap()).is_none());
+    }
+
+    /// "We could not tell" must not be grounds for asking for a password.
+    #[test]
+    fn an_undetermined_interface_does_not_invite_escalation() {
+        let caps = Capabilities::default(); // every interface Unknown("not probed")
+        for p in PROBES.iter().filter(|p| p.needs != Requirement::Nothing) {
+            assert_eq!(caps.remedy(p), Remedy::Unclear, "{}", p.name);
+            assert!(!caps.remedy(p).root_may_help(), "{}", p.name);
+        }
+    }
+
+    /// No disk attached is not a deficient kernel. This reported `Unsupported`
+    /// — *"this kernel was not built with it, fix: a different kernel"* — which
+    /// told the user to go and rebuild a kernel when the honest instruction was
+    /// to plug a drive in.
+    #[test]
+    fn a_machine_with_no_disks_is_absent_not_unsupported() {
+        let root = fake_root("nodisks", None, "");
+        let iface = detect_block_read(&root);
+        assert!(
+            matches!(iface.availability, Availability::Absent(_)),
+            "{:?}",
+            iface.availability
+        );
+        assert_eq!(iface.availability.remedy(), Remedy::AttachTarget);
+        assert!(iface.availability.explain().contains("no raw disk nodes"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Every variant names a distinct fix, and only one of them is a password.
+    #[test]
+    fn every_availability_names_what_would_fix_it() {
+        let all = [
+            (Availability::Usable, Remedy::Nothing),
+            (Availability::Denied(String::new()), Remedy::Privilege),
+            (Availability::NotLoaded(String::new()), Remedy::LoadModule),
+            (
+                Availability::Unsupported(String::new()),
+                Remedy::DifferentKernel,
+            ),
+            (Availability::Absent(String::new()), Remedy::AttachTarget),
+            (Availability::Unknown(String::new()), Remedy::Unclear),
+        ];
+        for (a, want) in &all {
+            assert_eq!(&a.remedy(), want, "{a:?}");
+            assert!(!a.remedy().label().is_empty());
+        }
+        let escalating: Vec<Remedy> = all
+            .iter()
+            .map(|(a, _)| a.remedy())
+            .filter(Remedy::root_may_help)
+            .collect();
+        assert_eq!(escalating, vec![Remedy::Privilege]);
     }
 
     /// Detection against the real machine must not panic, whatever it finds.

@@ -1588,10 +1588,13 @@ pub fn capabilities(out: &mut String, snap: &Snapshot, t: &Theme) {
     let _ = writeln!(out, "  {}", t.dim("probes"));
     for p in usb_probe::caps::PROBES {
         // The reason is already spelled out against the interface above; here
-        // only which interface is missing is worth repeating.
+        // only what is missing is worth repeating — and that is the *remedy*,
+        // not the requirement. `needs read access to raw disks` reads as a
+        // permission problem even when the true answer is that no disk is
+        // attached, which no amount of access would change.
         let (mark, note) = match c.blocker(p) {
             None => (t.green("✓"), String::new()),
-            Some(_) => (t.dim("·"), format!("needs {}", p.needs.label())),
+            Some(_) => (t.dim("·"), format!("needs {}", c.remedy(p).label())),
         };
         let line = format!(
             "    {mark} {} {} {}",
@@ -1795,7 +1798,9 @@ pub fn probes(out: &mut String, snap: &Snapshot, t: &Theme) {
     for p in usb_probe::caps::PROBES {
         let (mark, status) = match (p.implemented, c.blocker(p)) {
             (false, _) => (t.dim("·"), t.dim("not implemented yet")),
-            (true, Some(_)) => (t.dim("·"), t.yellow(&format!("needs {}", p.needs.label()))),
+            // The remedy, not the requirement — see the note in the status
+            // block above.
+            (true, Some(_)) => (t.dim("·"), t.yellow(&format!("needs {}", c.remedy(p).label()))),
             (true, None) => (t.green("✓"), t.green("ready")),
         };
         let _ = writeln!(

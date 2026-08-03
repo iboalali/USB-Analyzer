@@ -410,6 +410,32 @@ palette: a disruptive probe is a stronger kind of action, not a worse one.
 Live, this machine reports **2 of 5 can run here** — and reading it surfaced something that
 matters for the next item. See below.
 
+### Tell privilege apart from absence — **done**
+
+Found by reading the probe panel on this laptop, and it turned out to be worse than the flat
+chip that prompted it. "No USB disk attached" was reported as `Availability::Unsupported`,
+whose documented meaning is *"this kernel was not built with it. Fix: a different kernel."* So
+the tool told the user their kernel was deficient when the honest instruction was to plug a
+drive in — and `Absent` is the one state in that enum a **uevent** can clear rather than a
+reboot.
+
+`Availability::Absent` is the fifth variant, and `Availability::remedy() -> Remedy` makes the
+axis explicit: privilege, a kernel module, a different kernel, something to run it on, or
+nothing. `Remedy::root_may_help()` is the escalation gate, true for exactly one variant —
+including **not** for `Unclear`, because "we could not tell" is not grounds for asking someone
+for their password.
+
+`Capabilities::interface_for()` came out of it too. Without it the GUI would have had to map
+`Requirement` to a field itself, which is a second opinion about what a probe needs and would
+silently miss a variant added later. `blocker()` now uses it as well, so the mapping exists
+once.
+
+**Both front ends were saying the misleading thing, not just the GUI.** The CLI's status column
+was `needs {requirement}`, which rendered as *"needs read access to raw disks"* on a machine
+with no disks — indistinguishable from a permission problem. Both now name the remedy: *needs a
+kernel module*, *needs something to run it on*, *needs privilege*. Three probes, three
+different instructions, where before all three read as "you are not allowed".
+
 ### Still out of v1
 
 `pkexec` escalation and the substitution workflow, both designed for in
@@ -417,14 +443,42 @@ matters for the next item. See below.
 strongest reason for the GUI to exist and deliberately comes last, since it depends on
 everything above.
 
-**One thing the panel exposed, worth settling before escalation is built.** Two of the three
-blockers here are about privilege; `throughput`'s is not. It reads *"no raw disk nodes under
-`/dev` — there is nothing whose throughput could be measured"*, which is an absence of
-**target**, not of permission, and no amount of `pkexec` will fix it. The panel currently
-renders both as the same `unavailable here` chip. A confirmation dialog that offers to
-escalate a probe which would still refuse afterwards is exactly the kind of false promise the
-rest of this project avoids, so the distinction probably needs to be visible in
-`Capabilities` rather than inferred from the wording of a sentence.
+The escalation prompt now has the gate it needs: offer it only where
+`Remedy::root_may_help()`, never on absence.
+
+### A settings page, and the first setting is a theme override
+
+There is nowhere in `usbdiag-gui` to change anything about the app itself. Add one — and the
+setting wanted now is a **theme override**: follow the desktop (today's only behaviour), or
+force light, or force dark.
+
+**This cuts against a stated design property, deliberately.** Every colour in `style.css` is a
+libadwaita *named* colour specifically so the app follows the system, and both schemes are
+screenshotted for that reason. An override does not undo that — `StyleManager::set_color_scheme`
+with `ForceLight`/`ForceDark`/`Default` moves the whole palette as one, which is exactly why the
+named colours were worth the discipline. What it does mean is that "follows the desktop" stops
+being an invariant and becomes a default.
+
+Three things to get right:
+
+- **The chain widget must repaint.** `crates/gui/src/chain.rs` reads
+  `StyleManager::default().is_dark()` inside its draw function, so an override that does not
+  trigger a redraw leaves a cairo widget in the old palette while every GTK widget around it has
+  moved. `connect_dark_notify` is the hook; the existing rebuild path may already cover it, which
+  needs checking rather than assuming.
+- **Where the preference lives is an open question.** GSettings is the idiomatic answer and costs
+  a schema that `install-local.sh` would have to compile and install, which turns a
+  copy-two-binaries script into something with a real install step. The alternative is a small
+  JSON beside the existing `$XDG_CONFIG_HOME/usbdiag/devices.json`. It must **not** go in
+  `devices.json` itself: that file is the library's, it is read by the CLI, and a GUI display
+  preference has no business in a capture.
+- **There is no menu to put it in.** The header bar has a refresh button and window controls and
+  nothing else, so this needs the conventional hamburger → *Settings* / *About*, which is also
+  where an About dialog would finally have a home.
+
+Worth noting for whoever builds it: `ADW_DEBUG_COLOR_SCHEME` is how `screenshot-app` already
+forces a scheme per process. That is the same mechanism from the outside, so the skill keeps
+working regardless, and can still shoot both schemes without touching the new setting.
 
 ### Say "not a cable problem" out loud — **done**
 
