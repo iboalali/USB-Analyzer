@@ -446,6 +446,36 @@ everything above.
 The escalation prompt now has the gate it needs: offer it only where
 `Remedy::root_may_help()`, never on absence.
 
+### A mouse was accusing the charger — **done**
+
+Reported from the running GUI: port0 warned that the charger was not supplying enough, when
+nothing was actually wrong. The complaint came with the right principle attached — *it should
+only be a warning if the power in is lower than the power out* — and chasing it found two
+stacked bugs, the first much worse than the symptom.
+
+**`read_batteries_from` collected every `type = Battery` in `/sys/class/power_supply`, with no
+`scope` filter.** A Logitech receiver publishes `hidpp_battery_10`, which the kernel marks
+`scope = Device` and which reads `Discharging` for as long as the mouse is awake. So
+`not_keeping_up()` was true whenever the mouse was in use, and that single boolean feeds **two**
+rules: it raised `BATTERY_DRAINING_ON_AC`, and — this is what was actually seen — it promoted
+`PD_SOURCE_BELOW_SINK_CAPABILITY` from Low to Medium. A mouse being moved turned a port into a
+warning.
+
+**And the principle was missing even for the right pack.** `BAT0` here reads `Not charging` at
+95%, which is what a full battery does: charge current tapers to zero as it fills, and firmware
+then lets it drift down a few percent before topping off again. `Battery::ESSENTIALLY_FULL_PCT`
+is that band. Unknown capacity is deliberately **not** treated as full, because absent data must
+not silence a pack that is measurably losing ground.
+
+`Battery::scope` and `is_system()` now carry the distinction, `not_keeping_up()` documents all
+three guards as the false accusations they each are, and the CLI stopped painting a mouse red as
+*"discharging on mains"* — a peripheral's cell has nothing to do with the mains, so it now says
+so.
+
+Live, port0 went from Medium to **Low**, reading *"Not a fault — the supply is simply smaller
+than the port's maximum"*, and `BATTERY_DRAINING_ON_AC` disappeared. The GUI now opens on the
+host's genuine `HIGH` instead of on a port that was never faulty.
+
 ### A settings page, and the first setting is a theme override
 
 There is nowhere in `usbdiag-gui` to change anything about the app itself. Add one — and the

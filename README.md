@@ -453,10 +453,10 @@ failing hub controller, or a marginal port produce identical evidence.
 | `CABLE_EMARKER_NOT_REPORTED` | inferred | Controller reports no e-marker, but a >3 A contract proves the cable is 5 A rated. |
 | `PD_NO_CONTRACT` | inferred | PD-capable device attached but no contract in effect. |
 | `SINK_UNDERPOWERED_NO_PD` | measured | This machine is drawing 5 V with no PD contract while advertising far higher sink capability — the "why is my laptop barely charging" case. |
-| `BATTERY_DRAINING_ON_AC` | measured | Mains present but the pack is not gaining — the supply is not keeping up with the load. |
+| `BATTERY_DRAINING_ON_AC` | measured | Mains present and the **system** pack losing ground. Peripheral batteries (`scope = Device`) are excluded, and a pack at 95% or more never fires it: charge current tapers to zero by design near full, so "not gaining" there is the charger working correctly. |
 | `PARTNER_NO_PD` | measured | Attached device speaks no PD at all, so the link is capped at 5 V. Info-level: normal for a watch charger or accessory being powered. |
 | `PD_CONTRACT_BELOW_OFFER` | measured | Took much less power than the source offered. |
-| `PD_SOURCE_BELOW_SINK_CAPABILITY` | measured | Charger smaller than the port can accept. |
+| `PD_SOURCE_BELOW_SINK_CAPABILITY` | measured | Charger smaller than the port can accept. **Low on its own** — a smaller supply is a fact, not a fault — and Medium only while the system battery is actually losing ground. |
 | `DP_ALTMODE_NOT_ACTIVE` | measured | DisplayPort advertised but not engaged. |
 | `DP_ALT_MODE_NO_OUTPUT` | inferred | The partner *entered* DisplayPort Alt Mode and the graphics driver still sees nothing on any DisplayPort output — a cable carrying power and USB data but no high-speed pairs. Untested against hardware. |
 | `PORT_OVER_CURRENT_COUNT` | measured | The port's current limiter actually fired. |

@@ -201,6 +201,11 @@ pub fn read_batteries_from(class: &Path) -> (Vec<crate::model::Battery>, Option<
 
                 batteries.push(crate::model::Battery {
                     name: fsx::file_name(&entry),
+                    // Kept rather than filtered out here: a peripheral's battery
+                    // is real data and worth showing. What matters is that
+                    // nothing mistakes it for the machine's own — see
+                    // `Battery::is_system`.
+                    scope: fsx::read_attr(&entry, "scope"),
                     status: fsx::read_attr(&entry, "status"),
                     capacity_pct: fsx::read_u32(&entry, "capacity"),
                     energy_now_wh: uv("energy_now").or_else(|| via_charge("charge_now")),

@@ -1633,6 +1633,15 @@ impl Throughput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Battery {
     pub name: String,
+    /// The kernel's own `scope`: `System` for the machine's pack, `Device` for a
+    /// peripheral's, absent on older drivers (which means system).
+    ///
+    /// **Not decoration.** A wireless mouse exposes a `power_supply` of
+    /// `type = Battery` that reads `Discharging` whenever it is in use, and
+    /// treating that as the machine's own battery made this tool blame the
+    /// charger for a mouse being awake. See [`Battery::is_system`].
+    #[serde(default)]
+    pub scope: Option<String>,
     /// `Charging` | `Discharging` | `Full` | `Not charging` | `Unknown`.
     pub status: Option<String>,
     pub capacity_pct: Option<u32>,
@@ -1647,6 +1656,12 @@ pub struct Battery {
 }
 
 impl Battery {
+    /// At or above this, a pack that is not gaining is not evidence of anything.
+    ///
+    /// The top of the charge curve, not a health judgement: the last few percent
+    /// go in at a trickle and firmware stops entirely for a while once there.
+    pub const ESSENTIALLY_FULL_PCT: u32 = 95;
+
     /// Capacity retained versus design, as a percentage.
     pub fn health_pct(&self) -> Option<f64> {
         let full = self.energy_full_wh?;
@@ -1676,12 +1691,46 @@ impl Battery {
         Some(self.deficit_wh()? / rate)
     }
 
-    /// True when mains power is present and the battery is still not gaining.
+    /// Whether this pack speaks for the machine.
     ///
-    /// Deliberately does not trust `status` alone: a real reading had
-    /// `status = Charging` with `power_now = 0` while the pack lost 13 Wh.
+    /// `Device` scope means a peripheral's own battery — a wireless mouse, a
+    /// headset, a stylus. Absent means system, which is what older drivers
+    /// report.
+    pub fn is_system(&self) -> bool {
+        !matches!(self.scope.as_deref(), Some("Device"))
+    }
+
+    /// True when the supply is genuinely failing to keep up: mains present, and
+    /// the machine's own pack losing ground.
+    ///
+    /// Three guards, and each one is a false accusation this rule has actually
+    /// made:
+    ///
+    /// 1. **Only the system battery counts.** A Logitech receiver's
+    ///    `hidpp_battery_*` reads `Discharging` the entire time the mouse is
+    ///    awake, which made the tool report a 65 W charger as failing to keep up
+    ///    with an idle laptop.
+    /// 2. **A nearly-full pack proves nothing.** Charge current tapers to zero by
+    ///    design as a battery fills, and firmware then lets it drift down a few
+    ///    percent before topping off again. "On mains and not gaining" at 97% is
+    ///    the charger working correctly. A conservation threshold — 60% or 80% on
+    ///    a ThinkPad — produces the same reading lower down, but there the status
+    ///    is `Not charging` rather than `Discharging`, so it never reaches here.
+    /// 3. **`status` alone is not enough.** A real reading had
+    ///    `status = Charging` with `power_now = 0` while the pack lost 13 Wh.
+    ///
+    /// What survives all three is the only thing worth reporting: more is going
+    /// out than is coming in.
     pub fn not_keeping_up(&self, mains_online: bool) -> bool {
-        if !mains_online {
+        if !mains_online || !self.is_system() {
+            return false;
+        }
+        // Unknown capacity is not treated as full: absent data must not silence a
+        // pack that is measurably losing ground.
+        if self
+            .capacity_pct
+            .is_some_and(|c| c >= Self::ESSENTIALLY_FULL_PCT)
+        {
             return false;
         }
         self.is_discharging() || (self.is_charging() && self.power_now_w == Some(0.0))

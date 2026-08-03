@@ -981,9 +981,12 @@ pub fn battery(out: &mut String, snap: &Snapshot, t: &Theme) {
     let mains = snap.mains_online.unwrap_or(false);
 
     for b in &snap.batteries {
+        // `mains` says nothing about a peripheral: a mouse runs off its own cell
+        // whatever the laptop is plugged into, so "discharging on mains" in red
+        // would be alarming and meaningless. Only the system pack gets that.
         let state = match b.status.as_deref() {
             Some("Charging") => t.green("charging"),
-            Some("Discharging") if mains => t.red("discharging on mains"),
+            Some("Discharging") if mains && b.is_system() => t.red("discharging on mains"),
             Some("Discharging") => "discharging".to_string(),
             Some(s) => s.to_string(),
             None => "?".into(),
@@ -993,10 +996,15 @@ pub fn battery(out: &mut String, snap: &Snapshot, t: &Theme) {
             "  {} {}  {}",
             t.bold(&b.name),
             state,
-            t.dim(&format!(
-                "mains {}",
-                if mains { "online" } else { "offline" }
-            ))
+            // Mains state is only relevant to the pack the mains charges. Saying
+            // "mains online" beside a mouse invites the reader to connect two
+            // facts that have nothing to do with each other — which is the
+            // mistake the rules themselves used to make.
+            t.dim(&if b.is_system() {
+                format!("mains {}", if mains { "online" } else { "offline" })
+            } else {
+                "a peripheral's own cell".to_string()
+            })
         );
 
         row(

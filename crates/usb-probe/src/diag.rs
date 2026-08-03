@@ -4477,6 +4477,7 @@ mod tests {
     fn battery(status: &str, power_w: f64, pct: u32) -> Battery {
         Battery {
             name: "BAT0".into(),
+            scope: None, // absent = the system's own pack, as older drivers report
             status: Some(status.into()),
             capacity_pct: Some(pct),
             energy_now_wh: Some(19.2),
@@ -4504,6 +4505,85 @@ mod tests {
         assert_eq!(hit.severity, Severity::Medium);
         assert_eq!(hit.confidence, Confidence::Measured);
         assert!(hit.detail.contains("not a contradiction"));
+    }
+
+    /// A wireless mouse is not this laptop's battery.
+    ///
+    /// The live false positive: `hidpp_battery_10` reads `Discharging` for as
+    /// long as the mouse is awake, so the tool reported a 65 W charger as failing
+    /// to keep up with an idle machine — and, worse, promoted the port's own
+    /// finding from Low to Medium on the strength of it.
+    #[test]
+    fn a_peripherals_battery_never_accuses_the_charger() {
+        let mut mouse = battery("Discharging", 0.0, 40);
+        mouse.name = "hidpp_battery_10".into();
+        mouse.scope = Some("Device".into());
+        assert!(!mouse.is_system());
+        assert!(!mouse.not_keeping_up(true));
+
+        let mut snap = empty_snapshot();
+        snap.mains_online = Some(true);
+        snap.batteries.push(mouse);
+        assert!(!codes(&analyze(&snap)).contains(&"BATTERY_DRAINING_ON_AC"));
+    }
+
+    /// The port finding must not be escalated by a peripheral either. This is
+    /// the one the user actually saw: a 65 W supply into a 100 W-capable port is
+    /// worth a note, and only becomes a warning when something is really losing
+    /// ground.
+    #[test]
+    fn a_smaller_charger_is_only_a_warning_when_the_machine_is_losing_ground() {
+        let mut mouse = battery("Discharging", 0.0, 40);
+        mouse.scope = Some("Device".into());
+
+        let mut snap = empty_snapshot();
+        snap.mains_online = Some(true);
+        snap.ports.push(official_charger_port_65w());
+        snap.batteries.push(mouse);
+        let with_mouse = analyze(&snap);
+        let hit = with_mouse
+            .iter()
+            .find(|x| x.code == "PD_SOURCE_BELOW_SINK_CAPABILITY")
+            .expect("the gap is still worth stating");
+        assert_eq!(
+            hit.severity,
+            Severity::Low,
+            "a mouse being awake must not make this a warning"
+        );
+
+        // Swap in a system pack that genuinely is losing ground and it escalates.
+        snap.batteries.clear();
+        snap.batteries.push(battery("Discharging", 12.0, 25));
+        let draining = analyze(&snap);
+        let hit = draining
+            .iter()
+            .find(|x| x.code == "PD_SOURCE_BELOW_SINK_CAPABILITY")
+            .unwrap();
+        assert_eq!(hit.severity, Severity::Medium);
+    }
+
+    /// A pack at the top of its charge curve is not evidence of a weak supply.
+    /// The last few percent go in at a trickle and firmware stops entirely for a
+    /// while once there, so "on mains and not gaining" at 97% is the charger
+    /// behaving correctly.
+    #[test]
+    fn an_essentially_full_battery_is_not_a_shortfall() {
+        for pct in [Battery::ESSENTIALLY_FULL_PCT, 97, 100] {
+            let b = battery("Discharging", 0.4, pct);
+            assert!(!b.not_keeping_up(true), "{pct}% must not accuse the supply");
+        }
+        // Just below the band, a real drain is still reported.
+        let b = battery("Discharging", 12.0, Battery::ESSENTIALLY_FULL_PCT - 1);
+        assert!(b.not_keeping_up(true));
+    }
+
+    /// Missing capacity must not be read as "full" — absent data cannot be
+    /// allowed to silence a pack that is measurably losing ground.
+    #[test]
+    fn an_unknown_capacity_does_not_silence_a_real_drain() {
+        let mut b = battery("Discharging", 12.0, 25);
+        b.capacity_pct = None;
+        assert!(b.not_keeping_up(true));
     }
 
     #[test]
