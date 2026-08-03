@@ -174,7 +174,10 @@ fn draw_columns(cr: &Context, chain: &Chain, p: &Palette, w: f64, _h: f64) {
             set(cr, p.marked);
             cr.select_font_face("Sans", FontSlant::Normal, FontWeight::Bold);
             cr.set_font_size(11.5);
-            show(cr, x, y + 2.0, &fit(cr, &format!("\u{25b2} the limit \u{00b7} {code}"), col));
+            let base = y + 2.0;
+            let ind = marker(cr, x, base, 11.5);
+            let text = fit(cr, &format!("the limit \u{00b7} {code}"), col - ind);
+            show(cr, x + ind, base, &text);
         }
 
         // Arrow into the next stage, on the bar's centre line.
@@ -183,6 +186,30 @@ fn draw_columns(cr: &Context, chain: &Chain, p: &Palette, w: f64, _h: f64) {
             arrow(cr, x + col + 6.0, 26.0 + 5.0, gap - 12.0);
         }
     }
+}
+
+/// The "this is the limit" triangle, filled as a path and returning the width
+/// the caller should indent its text by.
+///
+/// **Not a glyph, on purpose.** This was `\u{25b2}` and rendered as a
+/// missing-glyph box. Text here goes through cairo's *toy* API
+/// (`select_font_face` + `show_text`), which uses one font face and does no
+/// fallback of its own — and `Sans` resolves to Noto Sans, which has no
+/// Geometric Shapes block. Pango would have substituted another font; cairo
+/// draws the box. The between-stage [`arrow`] was always a path, which is
+/// exactly why it never had this problem.
+///
+/// `baseline` is the text baseline the triangle rests on, so it lines up with
+/// the label beside it however the font metrics fall.
+fn marker(cr: &Context, x: f64, baseline: f64, size: f64) -> f64 {
+    let w = size * 0.72;
+    let h = size * 0.62;
+    cr.move_to(x + w / 2.0, baseline - h);
+    cr.line_to(x + w, baseline);
+    cr.line_to(x, baseline);
+    cr.close_path();
+    let _ = cr.fill();
+    w + size * 0.3
 }
 
 fn arrow(cr: &Context, x: f64, y: f64, len: f64) {
@@ -216,15 +243,19 @@ fn draw_rows(cr: &Context, chain: &Chain, p: &Palette, w: f64) {
         show(cr, 0.0, y + 14.0, &fit(cr, &st.cap, cap_w - 8.0));
 
         cr.set_font_size(10.5);
-        set(cr, p.dimmer);
-        let sub = match &st.marked_by {
-            Some(code) => format!("\u{25b2} {code}"),
-            None => st.sub.clone(),
-        };
-        if st.marked_by.is_some() {
-            set(cr, p.marked);
+        let base = y + 29.0;
+        let avail = cap_w + bar_w - 8.0;
+        match &st.marked_by {
+            Some(code) => {
+                set(cr, p.marked);
+                let ind = marker(cr, 0.0, base, 10.5);
+                show(cr, ind, base, &fit(cr, code, avail - ind));
+            }
+            None => {
+                set(cr, p.dimmer);
+                show(cr, 0.0, base, &fit(cr, &st.sub, avail));
+            }
         }
-        show(cr, 0.0, y + 29.0, &fit(cr, &sub, cap_w + bar_w - 8.0));
 
         bar(
             cr,
