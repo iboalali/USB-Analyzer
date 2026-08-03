@@ -95,6 +95,16 @@ pub fn build(
         }
         container.append(&card);
     }
+
+    // Last, and only on the host: what the tool is permitted to do is a property
+    // of the machine, not of a device. Directly after the limits above on
+    // purpose — that card says what could not be determined and this one says
+    // what would determine it.
+    if matches!(subject, Subject::Host) {
+        if let Some(card) = crate::probes::card(&report.snapshot) {
+            container.append(&card);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

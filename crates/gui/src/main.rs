@@ -15,6 +15,7 @@ mod chain;
 mod detail;
 mod findings;
 mod monitor;
+mod probes;
 mod sidebar;
 
 use std::cell::Cell;

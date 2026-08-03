@@ -156,6 +156,7 @@ sidebar.rs   ports + device tree, severity dot per row, hub collapsing
 detail.rs    the selected subject: verdict, ruled out, findings, chain, silence
 chain.rs     draws a usb_probe::chain::Chain — cairo DrawingArea
 findings.rs  finding rows, and the enum → CSS vocabulary
+probes.rs    the probe catalogue on the host pane; displays blockers, runs nothing
 style.css
 ```
 
@@ -232,9 +233,14 @@ This is the constraint to hold hardest, because a GUI makes it trivial to break.
 
 ## 9. Out of v1, designed for
 
-- **Probe panel.** The catalogue JSON already carries every probe's class,
-  `ready` flag and `blocker`, so rows can be greyed with the reason in the
-  tooltip without the GUI knowing anything about capabilities.
+- ~~**Probe panel.**~~ **Built** — `crates/gui/src/probes.rs`, on the host pane,
+  and the prediction held: `Snapshot::capabilities` was already in the model and
+  already read by `detail.rs`, so the panel asks `Capabilities::blocker` and
+  displays the answer, knowing nothing about capabilities itself. It went on the
+  host pane rather than into a new view because what the tool is permitted to do
+  is a property of the machine, and the reason is dimmed inline rather than put
+  in a tooltip — a tooltip on a row that cannot be clicked is a reason nobody
+  will find. It runs nothing and says so; that waits on the item below.
 - **`pkexec` escalation**, with `--dry-run --json` populating the confirmation
   dialog from `side_effects`, and structured refusals rendered from `code` +
   `message` rather than parsed from prose.

@@ -382,12 +382,49 @@ Verified by screenshot in both colour schemes and at both widths (`.claude/skill
 accident, which is the best way: a dock was plugged in mid-session and the sidebar grew two
 buses and a storage row without being asked.
 
+### Probe panel — **done, and it runs nothing**
+
+`crates/gui/src/probes.rs`, on the host pane. §9 predicted this needed no new plumbing and
+that held exactly: `Snapshot::capabilities` was already in the model and already read by
+`detail.rs`, so the panel asks `Capabilities::blocker` and displays the answer. It adds no
+detection and no second opinion about what the machine allows.
+
+**It lives on the host pane rather than in a new view.** What the tool is *permitted* to do
+is a property of the computer, and the sidebar already has a row for that — so this costs no
+navigation and no second view model, which is the thing §5 warned against. It comes last,
+straight after *what cannot be answered here*, because the two read as one thought: here is
+what could not be determined, and here is what would determine it.
+
+**Nothing is run from it, and it says so in its first line.** Until `pkexec` escalation
+lands the app has no honest way to run a probe, and a row that looks clickable and does
+nothing is worse than a row that admits it. What it adds today is the answer to *"what could
+this tool do here, and why can it not right now"* — which the GUI could not previously give
+at all, since `cannot_answer` recommends `usbdiag probe throughput` without ever saying
+whether it could run on this machine.
+
+**Readiness is a chip, never a dot.** A dot in this app means severity. A machine that will
+not let a stranger read raw disks is not faulty, so putting readiness on the fault scale
+would quietly grade the computer. Same reason the class chips borrow the *confidence*
+palette: a disruptive probe is a stronger kind of action, not a worse one.
+
+Live, this machine reports **2 of 5 can run here** — and reading it surfaced something that
+matters for the next item. See below.
+
 ### Still out of v1
 
-Probe panel, `pkexec` escalation, and the substitution workflow — all designed for in
-[`docs/01-gui-concept.md`](docs/01-gui-concept.md) §9, none built. The substitution
-workflow is the strongest reason for the GUI to exist and deliberately comes last, since it
-depends on everything above.
+`pkexec` escalation and the substitution workflow, both designed for in
+[`docs/01-gui-concept.md`](docs/01-gui-concept.md) §9. The substitution workflow is the
+strongest reason for the GUI to exist and deliberately comes last, since it depends on
+everything above.
+
+**One thing the panel exposed, worth settling before escalation is built.** Two of the three
+blockers here are about privilege; `throughput`'s is not. It reads *"no raw disk nodes under
+`/dev` — there is nothing whose throughput could be measured"*, which is an absence of
+**target**, not of permission, and no amount of `pkexec` will fix it. The panel currently
+renders both as the same `unavailable here` chip. A confirmation dialog that offers to
+escalate a probe which would still refuse afterwards is exactly the kind of false promise the
+rest of this project avoids, so the distinction probably needs to be visible in
+`Capabilities` rather than inferred from the wording of a sentence.
 
 ### Say "not a cable problem" out loud — **done**
 

@@ -59,6 +59,31 @@
 .chip.subject   { font-weight: normal; font-family: monospace; }
 .chip.code      { font-family: monospace; font-weight: normal; font-size: 0.72em; }
 
+/* Probe readiness. Not on the severity scale: a machine that will not let a
+   probe run is not faulty, so this must not borrow the fault colours. `ready`
+   deliberately reuses @success_color and nothing else does — a blocked probe is
+   simply neutral, not warned about. */
+.chip.ready   { color: @success_color; background: alpha(@success_color, 0.13); }
+.chip.blocked { color: alpha(currentColor, 0.55); background: alpha(currentColor, 0.08); }
+
+/* ---------- probe catalogue (host pane) ---------- */
+
+.probe-row {
+    padding: 8px 0 2px 0;
+    border-top: 1px solid alpha(currentColor, 0.08);
+}
+
+.probe-name {
+    font-family: monospace;
+    font-weight: bold;
+}
+
+/* Dimmed as a whole, so a row that cannot run reads as unavailable at a glance
+   without any single element having to shout it. */
+.probe-row.unavailable { opacity: 0.62; }
+
+.probe-row .blocker { font-style: italic; }
+
 /* ---------- sidebar ---------- */
 
 .sidebar-list {
