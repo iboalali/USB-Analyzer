@@ -68,6 +68,9 @@ const LOG_REFRESH: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 enum Msg {
+    /// The monitor's subprocess handle, kept so that shutdown can end it. The
+    /// worker thread cannot do it itself — see [`monitor::Out::Started`].
+    MonitorStarted(usb_probe::monitor::Stopper),
     /// The monitor finished a wait. `events` of 0 is a bare fallback tick.
     Woke { events: usize },
     Source { live: bool, note: Option<String> },
@@ -140,6 +143,12 @@ struct AppModel {
     show_content: Cell<bool>,
 
     _monitor: WorkerController<monitor::MonitorWorker>,
+    /// Ends the monitor's `udevadm` subprocess at shutdown.
+    ///
+    /// Held here rather than left to the worker because the worker's thread is
+    /// permanently inside a blocking wait and so is never dropped; this lives on
+    /// the GTK thread, which does get to run. See [`Component::shutdown`].
+    stopper: Option<usb_probe::monitor::Stopper>,
 }
 
 impl AppModel {
@@ -495,6 +504,7 @@ impl Component for AppModel {
         let monitor = monitor::MonitorWorker::builder()
             .detach_worker(())
             .forward(sender.input_sender(), |out| match out {
+                monitor::Out::Started(stopper) => Msg::MonitorStarted(stopper),
                 monitor::Out::Source { live, note } => Msg::Source { live, note },
                 monitor::Out::Woke { events } => Msg::Woke { events },
             });
@@ -524,6 +534,7 @@ impl Component for AppModel {
             rendered: Cell::new(0),
             show_content: Cell::new(false),
             _monitor: monitor,
+            stopper: None,
         };
 
         let widgets = view_output!();
@@ -545,6 +556,7 @@ impl Component for AppModel {
 
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>, _root: &Self::Root) {
         match msg {
+            Msg::MonitorStarted(stopper) => self.stopper = Some(stopper),
             Msg::Woke { events } => self.start_capture(&sender, events > 0),
             Msg::Refresh => self.start_capture(&sender, true),
             Msg::Source { live, note } => {
@@ -566,6 +578,23 @@ impl Component for AppModel {
             }
             Msg::DismissBanner => self.banner_text = None,
             Msg::SetKind { device, kind } => self.set_kind(&device, kind, &sender),
+        }
+    }
+
+    /// End the `udevadm monitor` subprocess.
+    ///
+    /// The one place in this program that can. The worker owning the monitor is
+    /// always inside a blocking wait, so its thread is killed at exit without
+    /// running destructors and `Monitor`'s `Drop` never fires — which orphaned a
+    /// `udevadm monitor` on every single run, closing the window included.
+    ///
+    /// This covers the exits GTK tells us about. A `SIGKILL`, or a `SIGTERM` with
+    /// no handler, still leaves the child behind: nothing in-process can catch
+    /// those, and the usual answer — `PR_SET_PDEATHSIG` — needs `libc`, which
+    /// `usb-probe` deliberately does not depend on.
+    fn shutdown(&mut self, _widgets: &mut Self::Widgets, _output: relm4::Sender<Self::Output>) {
+        if let Some(stopper) = self.stopper.take() {
+            stopper.stop();
         }
     }
 

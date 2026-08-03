@@ -33,6 +33,21 @@ fi
 # Fresh instance under the software renderer + X11 backend.
 pkill -x usbdiag-gui 2>/dev/null || true
 
+# SIGTERM runs no destructors, so the app's `udevadm monitor` child survives the
+# pkill above and is reparented to init. The app cleans up correctly on a
+# *graceful* close (its shutdown hook ends the subprocess), but that is not what
+# this script does — so repeated captures used to leave a trail of stray
+# monitors, three of which were found idling hours later.
+#
+# Only orphans are reaped: a udevadm whose parent is still alive belongs to a
+# running instance, or to somebody's terminal, and is none of our business.
+for _p in $(pgrep -x udevadm 2>/dev/null); do
+  _ppid=$(awk '{print $4}' "/proc/$_p/stat" 2>/dev/null || echo 1)
+  if [[ ! -d "/proc/$_ppid" ]] || ! grep -qs usbdiag "/proc/$_ppid/comm" 2>/dev/null; then
+    grep -qs -- '--subsystem-match=typec' "/proc/$_p/cmdline" && kill "$_p" 2>/dev/null || true
+  fi
+done
+
 env_extra=()
 case "${SCHEME:-}" in
   # libadwaita honours this for a single process, so light and dark can be shot

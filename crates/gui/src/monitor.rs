@@ -32,6 +32,15 @@ pub enum In {
 
 #[derive(Debug)]
 pub enum Out {
+    /// The handle that ends the `udevadm monitor` subprocess, sent once.
+    ///
+    /// **This worker cannot clean up after itself.** Its `update` re-queues
+    /// `In::Wait` forever, so the thread is always inside a blocking wait when
+    /// the process exits — and a thread killed at exit runs no destructors, so
+    /// `Monitor`'s own `Drop` never fires and the child is orphaned. Handing the
+    /// stopper to the GTK thread, which *does* get to run at shutdown, is the
+    /// fix. Closing the window used to leak one `udevadm monitor` every time.
+    Started(usb_probe::monitor::Stopper),
     /// What the event source turned out to be, sent once the monitor starts.
     Source {
         live: bool,
@@ -65,6 +74,9 @@ impl Worker for MonitorWorker {
 
         let monitor = self.monitor.get_or_insert_with(|| {
             let m = Monitor::start();
+            // Before anything else: the GTK thread needs this to clean up, and
+            // every pass after this one is spent blocked inside the wait below.
+            let _ = sender.output(Out::Started(m.stopper()));
             let _ = sender.output(Out::Source {
                 live: m.source() == Source::Udev,
                 note: m.note().map(str::to_string),

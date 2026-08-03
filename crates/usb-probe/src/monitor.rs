@@ -36,6 +36,7 @@
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The subsystems whose events can change anything this crate reports.
@@ -74,9 +75,62 @@ pub enum Wake {
 
 pub struct Monitor {
     rx: Option<Receiver<DeviceEvent>>,
-    child: Option<Child>,
+    /// Shared so that [`Monitor::stopper`] can hand out the ability to end the
+    /// child without owning the monitor. See [`Stopper`] for why that is needed.
+    child: Arc<Mutex<Option<Child>>>,
     source: Source,
     note: Option<String>,
+}
+
+/// The ability to end the monitor's subprocess, detached from the monitor.
+///
+/// [`Monitor`] kills its child on drop, which is correct and, on its own, not
+/// enough: a caller that parks the monitor on a thread blocked in
+/// [`Monitor::wait_for_change`] never drops it, because the process exits with
+/// that thread still inside the call. Destructors do not run for a thread that
+/// is killed at exit, so the `udevadm monitor` child is orphaned and reparented
+/// to init — once per run of the program.
+///
+/// That is exactly the shape of `usbdiag-gui`'s worker, which is where this was
+/// found: closing the window left a stray `udevadm monitor` behind every single
+/// time. A `Stopper` can be held by whatever *does* get a chance to run at
+/// shutdown — the GTK thread — while the monitor itself stays on the worker.
+///
+/// Cheap to clone, safe to call more than once, and a no-op when the monitor was
+/// a timer with no subprocess at all.
+#[derive(Debug, Clone)]
+pub struct Stopper {
+    child: Arc<Mutex<Option<Child>>>,
+}
+
+impl Stopper {
+    /// End the subprocess now. Idempotent.
+    ///
+    /// Returns whether there was a live child to end, which is the only way a
+    /// caller — or a test — can tell "cleaned up" from "there was nothing to
+    /// clean up".
+    pub fn stop(&self) -> bool {
+        kill_child(&self.child)
+    }
+}
+
+/// Kill and reap, leaving nothing behind to kill twice. True if a child was
+/// there.
+fn kill_child(slot: &Arc<Mutex<Option<Child>>>) -> bool {
+    // A poisoned lock still has to be cleaned up: a panic elsewhere is no reason
+    // to leak a process, so the guard is taken either way.
+    let mut guard = match slot.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match guard.take() {
+        Some(mut child) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            true
+        }
+        None => false,
+    }
 }
 
 impl Monitor {
@@ -89,16 +143,25 @@ impl Monitor {
     pub fn start_with(subsystems: &[&str]) -> Self {
         match spawn_udevadm(subsystems) {
             Ok((child, stdout)) => {
-                let mut m = Self::from_stream(stdout);
-                m.child = Some(child);
+                let m = Self::from_stream(stdout);
+                *m.child.lock().expect("fresh mutex") = Some(child);
                 m
             }
             Err(e) => Self {
                 rx: None,
-                child: None,
+                child: Arc::default(),
                 source: Source::TimerOnly,
                 note: Some(format!("udevadm monitor unavailable ({e}); falling back to polling")),
             },
+        }
+    }
+
+    /// A handle that can end the subprocess from somewhere else.
+    ///
+    /// Give this to whatever will still be running at shutdown. See [`Stopper`].
+    pub fn stopper(&self) -> Stopper {
+        Stopper {
+            child: Arc::clone(&self.child),
         }
     }
 
@@ -122,7 +185,9 @@ impl Monitor {
         });
         Self {
             rx: Some(rx),
-            child: None,
+            // Empty, not absent: `start_with` fills it when there is a
+            // subprocess, and `from_stream` on its own has none to fill.
+            child: Arc::default(),
             source: Source::Udev,
             note: None,
         }
@@ -196,10 +261,11 @@ impl Drop for Monitor {
     fn drop(&mut self) {
         // Dropping the receiver ends the reader thread on its next send; killing
         // the child unblocks that read straight away.
-        if let Some(child) = &mut self.child {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        //
+        // Correct, and not sufficient by itself — a monitor parked on a thread
+        // that is still inside `wait_for_change` when the process exits is never
+        // dropped at all. [`Stopper`] exists for that case.
+        let _ = kill_child(&self.child);
     }
 }
 
@@ -317,6 +383,34 @@ mod tests {
         assert_eq!(m.source(), Source::TimerOnly);
         assert!(m.note().is_some(), "the downgrade must explain itself");
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// A monitor with no subprocess has nothing to stop, and saying so must not
+    /// be an error — `from_stream` is the netlink-shaped path with no child.
+    #[test]
+    fn stopping_a_monitor_with_no_subprocess_is_a_harmless_no_op() {
+        let m = Monitor::from_stream(std::io::Cursor::new(Vec::new()));
+        let s = m.stopper();
+        assert!(!s.stop(), "there was no child to end");
+        assert!(!s.stop(), "and still none the second time");
+    }
+
+    /// The leak this exists for: the GUI's worker thread is always inside a
+    /// blocking wait when the process exits, so `Monitor`'s `Drop` never runs and
+    /// the child is orphaned. A `Stopper` held elsewhere is the way out, so it
+    /// must work while the monitor is still very much alive.
+    #[test]
+    fn a_stopper_ends_the_subprocess_without_owning_the_monitor() {
+        let m = Monitor::start();
+        if m.source() != Source::Udev {
+            eprintln!("no udevadm here; nothing to stop");
+            return;
+        }
+        let s = m.stopper();
+        assert!(s.stop(), "the live child should have been ended");
+        assert!(!s.stop(), "idempotent: nothing left to end");
+        // The monitor is still owned here, and dropping it must not double-kill.
+        drop(m);
     }
 
     /// Starting must never fail, whatever the machine has installed.

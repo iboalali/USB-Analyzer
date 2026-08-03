@@ -476,6 +476,36 @@ Live, port0 went from Medium to **Low**, reading *"Not a fault — the supply is
 than the port's maximum"*, and `BATTERY_DRAINING_ON_AC` disappeared. The GUI now opens on the
 host's genuine `HIGH` instead of on a port that was never faulty.
 
+### The GUI orphaned a `udevadm monitor` on every run — **done**
+
+Found by answering "what is running in the shell": three stray `udevadm monitor` processes,
+reparented to systemd-user, idling for hours. One per earlier launch of the viewer.
+
+**The first explanation was wrong, and testing it is what found the bug.** `capture.sh` kills
+with `pkill -x`, so the obvious story was that SIGTERM skips destructors while a graceful close
+would run `Monitor::drop` and reap the child. So the window was closed by clicking its ✕
+instead — and the child survived that too.
+
+`Monitor::drop` is correct and simply unreachable. `MonitorWorker::update` re-queues `In::Wait`
+at the end of every pass, so the worker thread is permanently inside a blocking wait; at exit
+that thread is killed where it stands, `MonitorWorker` is never dropped, and the kill never
+happens. The cleanup was written in the one place guaranteed not to run.
+
+`monitor::Stopper` is the fix: a cloneable handle over the child, held by the **GTK thread**,
+which does get to run. The worker hands one over the instant the monitor starts, and
+`Component::shutdown` ends it. `stop()` returns whether there was a live child, which is the
+only way a test can tell "cleaned up" from "nothing to clean up".
+
+**What this does not cover, verified rather than assumed:** `SIGKILL`, and `SIGTERM` with no
+handler, still orphan the child — checked by `pkill`-ing the app afterwards and finding one
+left. Nothing in-process can catch those, and the usual answer, `PR_SET_PDEATHSIG`, needs
+`libc`, which `usb-probe` does not depend on and which decided the shape of two probes. So
+`capture.sh` now reaps orphans itself before launching, and only orphans: a `udevadm` whose
+parent is alive belongs to a running instance or to somebody's terminal.
+
+`usbdiag watch` was never affected. Ctrl-C signals the whole process group, so the shell reaps
+`udevadm` directly.
+
 ### A settings page, and the first setting is a theme override
 
 There is nowhere in `usbdiag-gui` to change anything about the app itself. Add one — and the
