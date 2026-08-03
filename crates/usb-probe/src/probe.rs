@@ -103,36 +103,117 @@ pub struct Plan {
     pub side_effects: Vec<String>,
 }
 
+fn takes_a_window(probe: &ProbeInfo) -> bool {
+    matches!(probe.name, "storage-sample" | "urb-errors")
+}
+
+/// The one sentence both [`Plan`] and [`Preview`] open with.
+///
+/// Shared rather than written twice: a confirmation dialog that described a
+/// probe differently from the run that follows it would be the most expensive
+/// possible place for the two to drift apart.
+fn describe_probe(
+    probe: &ProbeInfo,
+    target: &Option<Target>,
+    window: Duration,
+    cycles: usize,
+) -> String {
+    let mut s = format!("{} — {}", probe.name, probe.class.label());
+    if let Some(t) = target {
+        s.push_str(&format!(", on {} ({})", t.sysfs_name, t.label));
+    }
+    if takes_a_window(probe) {
+        s.push_str(&format!(", for {:.1}s", window.as_secs_f64()));
+    }
+    if probe.name == "reenumerate" {
+        s.push_str(&format!(", {cycles} times"));
+    }
+    s.push_str(match probe.class {
+        ProbeClass::Passive | ProbeClass::PrivilegedRead => ". Nothing on the bus changes.",
+        ProbeClass::Disruptive => ". The device leaves the bus and comes back when this finishes.",
+    });
+    s
+}
+
+/// What a probe *would* do, and what stands between it and doing it.
+///
+/// [`Plan`] deliberately means "approved" — holding one is proof every check
+/// passed — so this is a separate type rather than a `Plan` with the guarantee
+/// weakened. A front end needs to describe consequences **before** asking for a
+/// password or a confirmation, and [`plan`] cannot serve that: it refuses on
+/// missing privilege, so an unprivileged caller learns "needs root" and never
+/// learns what it was agreeing to.
+///
+/// That ordering is not a flaw in `plan` — the refusals it gives first are the
+/// ones the user can fix without escalating, which is worth more than a sudo
+/// round trip to discover a misspelled target. It is simply the wrong question
+/// for a confirmation dialog, so this asks a different one.
+///
+/// **Not runnable.** [`run`] takes a `Plan`, and the only way to get one is
+/// [`plan`], which refuses everything this records. Describing a probe can
+/// therefore never become a way of running it.
+#[derive(Debug, Clone, Serialize)]
+pub struct Preview {
+    pub probe: &'static ProbeInfo,
+    pub target: Option<Target>,
+    #[serde(rename = "window_ms", serialize_with = "millis")]
+    pub window: Duration,
+    pub cycles: usize,
+    pub side_effects: Vec<String>,
+    /// Why this process cannot run it. `None` means privilege is not the
+    /// obstacle — which is not the same as it being runnable, since consent may
+    /// still be outstanding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_by: Option<String>,
+    /// Consents not yet given. Empty for the read-only probes, which are
+    /// requested by name and leave nothing behind.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub awaiting: Vec<Consent>,
+}
+
+impl Preview {
+    /// True when nothing is outstanding, so [`plan`] would hand back a `Plan`.
+    pub fn runnable(&self) -> bool {
+        self.blocked_by.is_none() && self.awaiting.is_empty()
+    }
+
+    /// Whether escalating to root would clear the way.
+    ///
+    /// The gate for an escalation prompt, and the reason [`crate::caps::Remedy`]
+    /// exists: a probe blocked because no disk is attached must never be offered
+    /// a password dialog, since no password attaches a disk.
+    pub fn root_may_help(&self, caps: &Capabilities) -> bool {
+        self.blocked_by.is_some() && caps.remedy(self.probe).root_may_help()
+    }
+
+    /// The same sentence [`Plan::describe`] gives, plus what is outstanding.
+    pub fn describe(&self) -> String {
+        let mut s = describe_probe(self.probe, &self.target, self.window, self.cycles);
+        for effect in &self.side_effects {
+            s.push_str(&format!("\n  · {effect}"));
+        }
+        if let Some(why) = &self.blocked_by {
+            s.push_str(&format!("\n  ! cannot run as this process: {why}"));
+        }
+        for c in &self.awaiting {
+            s.push_str(&format!("\n  ? awaiting consent: {}", c.slug()));
+        }
+        s
+    }
+}
+
 impl Plan {
     /// What is about to happen, in the words the user should see before it
     /// does. Every probe says its class out loud, so "disruptive" is never a
     /// surprise discovered afterwards.
     pub fn describe(&self) -> String {
-        let mut s = format!("{} — {}", self.probe.name, self.probe.class.label());
-        if let Some(t) = &self.target {
-            s.push_str(&format!(", on {} ({})", t.sysfs_name, t.label));
-        }
-        if self.takes_a_window() {
-            s.push_str(&format!(", for {:.1}s", self.window.as_secs_f64()));
-        }
-        if self.probe.name == "reenumerate" {
-            s.push_str(&format!(", {} times", self.cycles));
-        }
-        s.push_str(match self.probe.class {
-            ProbeClass::Passive | ProbeClass::PrivilegedRead => ". Nothing on the bus changes.",
-            ProbeClass::Disruptive => {
-                ". The device leaves the bus and comes back when this finishes."
-            }
-        });
+        let mut s = describe_probe(self.probe, &self.target, self.window, self.cycles);
         for effect in &self.side_effects {
             s.push_str(&format!("\n  · {effect}"));
         }
         s
     }
 
-    fn takes_a_window(&self) -> bool {
-        matches!(self.probe.name, "storage-sample" | "urb-errors")
-    }
 
     /// Fold the plan into capture options.
     ///
@@ -388,12 +469,25 @@ impl Refusal {
 }
 
 /// Which of the two acts of consent is missing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The slugs match the `consent` field of [`RefusalReport`], so a front end that
+/// already branches on one can branch on the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Consent {
     /// Agreement to run an out-of-band probe at all.
     ToProbe,
     /// Separate acceptance that this one interrupts the device.
     ToDisrupt,
+}
+
+impl Consent {
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Consent::ToProbe => "to_probe",
+            Consent::ToDisrupt => "to_disrupt",
+        }
+    }
 }
 
 impl Refusal {
@@ -466,6 +560,18 @@ impl Refusal {
 /// filesystem can be mounted between capture and probe, and the stale answer is
 /// the dangerous one.
 pub fn plan(caps: &Capabilities, snap: &Snapshot, req: &Request) -> Result<Plan, Refusal> {
+    preview(caps, snap, req)?.approve()
+}
+
+/// Describe what the probe would do, without refusing for missing privilege or
+/// missing consent.
+///
+/// The call a front end makes *before* prompting for anything. See [`Preview`]
+/// for why this is a separate entry point rather than a flag on [`plan`], and
+/// note what it still refuses: a misspelled target, a mounted disk, a keyboard
+/// in the way. Those are facts about the request, and no password or dialog
+/// changes them.
+pub fn preview(caps: &Capabilities, snap: &Snapshot, req: &Request) -> Result<Preview, Refusal> {
     let Some(probe) = crate::caps::probe(req.name) else {
         return Err(Refusal::NoSuchProbe {
             name: req.name.to_string(),
@@ -476,6 +582,36 @@ pub fn plan(caps: &Capabilities, snap: &Snapshot, req: &Request) -> Result<Plan,
     // Read now, not at capture time. A filesystem can be mounted in between,
     // and the stale answer is the dangerous one.
     approve(probe, caps, snap, req, &block::holders())
+}
+
+impl Preview {
+    /// Turn a clear preview into a [`Plan`], or say what is in the way.
+    ///
+    /// The single place the two views are reconciled, so they cannot disagree
+    /// about what counts as approved. Privilege is reported before consent for
+    /// the same reason it is checked last: being asked to confirm something that
+    /// would then be refused anyway is worse than being told it cannot run.
+    pub fn approve(self) -> Result<Plan, Refusal> {
+        if let Some(why) = self.blocked_by {
+            return Err(Refusal::Unavailable {
+                probe: self.probe,
+                why,
+            });
+        }
+        if let Some(what) = self.awaiting.first().copied() {
+            return Err(Refusal::NeedsConsent {
+                probe: self.probe,
+                what,
+            });
+        }
+        Ok(Plan {
+            probe: self.probe,
+            target: self.target,
+            window: self.window,
+            cycles: self.cycles,
+            side_effects: self.side_effects,
+        })
+    }
 }
 
 /// The decision proper, with the disk state passed in.
@@ -489,7 +625,7 @@ fn approve(
     snap: &Snapshot,
     req: &Request,
     holders: &std::collections::BTreeMap<String, Vec<Hold>>,
-) -> Result<Plan, Refusal> {
+) -> Result<Preview, Refusal> {
     // First of all the checks: telling someone to load a kernel module, or to
     // add --target, for a probe that then turns out not to be written yet
     // would send them down a dead end.
@@ -547,38 +683,39 @@ fn approve(
         }
     }
 
-    // Privilege is checked after everything about the request itself, because
-    // the request errors are the ones the user can fix without escalating.
-    // Answering "you need root" first costs them a sudo round trip to discover
-    // that the target was misspelled, or that the disk is mounted and it was
-    // never going to work at any privilege.
-    if let Some(why) = caps.blocker(probe) {
-        return Err(Refusal::Unavailable { probe, why });
-    }
+    // Privilege and consent are *recorded* rather than raised, and [`plan`]
+    // turns them into refusals. Everything above this line is a fact about the
+    // request that no privilege and no amount of agreeing would change, which is
+    // why those stay hard errors even when only describing.
+    //
+    // Privilege comes after everything about the request itself, because the
+    // request errors are the ones the user can fix without escalating. Answering
+    // "you need root" first costs them a sudo round trip to discover that the
+    // target was misspelled, or that the disk is mounted and it was never going
+    // to work at any privilege.
+    let blocked_by = caps.blocker(probe);
 
     // Only the disruptive class asks. A read-only probe was requested by name
     // and leaves nothing behind, so a confirmation there would be ceremony —
-    // and the reflex it teaches is what makes the confirmation on this line
-    // worth anything.
-    if disruptive && !req.consented {
-        return Err(Refusal::NeedsConsent {
-            probe,
-            what: Consent::ToProbe,
-        });
-    }
-    if disruptive && !req.accepts_disruption {
-        return Err(Refusal::NeedsConsent {
-            probe,
-            what: Consent::ToDisrupt,
-        });
+    // and the reflex it teaches is what makes the confirmation worth anything.
+    let mut awaiting = Vec::new();
+    if disruptive {
+        if !req.consented {
+            awaiting.push(Consent::ToProbe);
+        }
+        if !req.accepts_disruption {
+            awaiting.push(Consent::ToDisrupt);
+        }
     }
 
-    Ok(Plan {
+    Ok(Preview {
         probe,
         target,
         window: req.window,
         cycles: req.cycles.clamp(2, 100),
         side_effects,
+        blocked_by,
+        awaiting,
     })
 }
 
@@ -618,6 +755,138 @@ fn resolve_target(snap: &Snapshot, name: &str) -> Option<Target> {
 
 #[cfg(test)]
 mod tests {
+    /// A preview must describe the probe *before* privilege or consent is
+    /// settled, because a confirmation dialog that cannot say what will happen is
+    /// worthless — and asking for a password first, to find out, is worse.
+    ///
+    /// This is the exact case that made the flow impossible: unprivileged,
+    /// `--dry-run` answered "needs root" and nothing else.
+    #[test]
+    fn a_preview_describes_a_probe_it_cannot_run() {
+        let caps = caps_with(
+            Availability::Usable,
+            Availability::Denied("hub port controls are root-only".into()),
+        );
+        let snap = snapshot_with_a_disk();
+        // Deliberately *not* `cycle_request`, which consents up front: the point
+        // is a preview taken before anything has been agreed to.
+        let bare = Request {
+            target: Some("6-1"),
+            ..Request::new(CYCLE.name, Duration::from_secs(1))
+        };
+        let p = approve(&CYCLE, &caps, &snap, &bare, &free()).unwrap();
+
+        // Everything the dialog needs is here, despite there being no privilege.
+        assert_eq!(p.target.as_ref().unwrap().sysfs_name, "6-1");
+        assert_eq!(p.cycles, DEFAULT_CYCLES);
+        assert!(p.describe().contains("disruptive"));
+        assert!(p.describe().contains("6-1"));
+
+        // And so is everything standing in the way.
+        assert!(p.blocked_by.as_deref().unwrap().contains("root-only"));
+        assert_eq!(p.awaiting, vec![Consent::ToProbe, Consent::ToDisrupt]);
+        assert!(!p.runnable());
+
+        // Root is the missing thing here, so an escalation prompt is honest.
+        assert!(p.root_may_help(&caps));
+    }
+
+    /// Describing must never become a way of running. The only route to a `Plan`
+    /// is through the conversion, and it refuses everything the preview recorded.
+    #[test]
+    fn a_preview_cannot_be_turned_into_a_run() {
+        let caps = caps_with(
+            Availability::Usable,
+            Availability::Denied("root-only".into()),
+        );
+        let snap = snapshot_with_a_disk();
+
+        let blocked = approve(&CYCLE, &caps, &snap, &cycle_request(Some("6-1")), &free()).unwrap();
+        assert!(matches!(
+            blocked.approve().unwrap_err(),
+            Refusal::Unavailable { .. }
+        ));
+
+        // Privileged but unconsented: the other half of the gate.
+        let caps = caps_with(Availability::Usable, Availability::Usable);
+        let bare = Request {
+            target: Some("6-1"),
+            ..Request::new(CYCLE.name, Duration::from_secs(1))
+        };
+        let unconsented = approve(&CYCLE, &caps, &snap, &bare, &free()).unwrap();
+        assert!(!unconsented.runnable());
+        assert!(matches!(
+            unconsented.approve().unwrap_err(),
+            Refusal::NeedsConsent {
+                what: Consent::ToProbe,
+                ..
+            }
+        ));
+    }
+
+    /// No password attaches a disk. The escalation prompt must stay shut for a
+    /// probe whose obstacle is an absent target, which is the distinction
+    /// `Remedy` was added for.
+    #[test]
+    fn an_absent_target_never_invites_escalation() {
+        let mut caps = caps_with(Availability::Usable, Availability::Usable);
+        caps.block_read = Interface {
+            availability: Availability::Absent("no raw disk nodes under /dev".into()),
+            path: None,
+        };
+        let snap = snapshot_with_a_disk();
+        let req = Request::new("throughput", Duration::from_secs(1));
+        let p = preview(&caps, &snap, &req).unwrap();
+
+        assert!(!p.runnable(), "it cannot run");
+        assert!(
+            !p.root_may_help(&caps),
+            "and root would not change that, so do not ask for a password"
+        );
+    }
+
+    /// A preview still refuses what no privilege and no consent could fix. These
+    /// are facts about the request, and softening them for the sake of a nicer
+    /// dialog would be the dangerous direction to soften in.
+    #[test]
+    fn a_preview_still_refuses_what_consent_cannot_lift() {
+        let caps = caps_with(Availability::Usable, Availability::Usable);
+        let snap = snapshot_with_a_disk();
+
+        // `CYCLE` is a stand-in outside the real registry, so these go through
+        // `approve` — the same decision path `preview` runs, minus the name
+        // lookup that `no_such_probe` already covers elsewhere.
+        let refuse = |target| {
+            approve(&CYCLE, &caps, &snap, &cycle_request(Some(target)), &free()).unwrap_err()
+        };
+
+        // A keyboard in the way: explicitly non-overridable.
+        let e = refuse("6-1.1");
+        assert!(!e.is_recoverable(), "{}", e.message());
+
+        // A misspelled target.
+        assert_eq!(refuse("nope").code(), "no_such_target");
+
+        // A whole bus.
+        assert_eq!(refuse("usb6").code(), "whole_bus");
+    }
+
+    /// The decision exactly as [`plan`] reports it: describe, then approve.
+    ///
+    /// Every test below went through `approve` directly before `Preview`
+    /// existed. Routing them through the conversion instead is the proof the
+    /// refactor changed no behaviour — the same inputs must still produce the
+    /// same refusals, in the same order.
+    fn decide(
+        probe: &'static ProbeInfo,
+        caps: &Capabilities,
+        snap: &Snapshot,
+        req: &Request,
+        holders: &std::collections::BTreeMap<String, Vec<Hold>>,
+    ) -> Result<Plan, Refusal> {
+        approve(probe, caps, snap, req, holders)?.approve()
+    }
+
     use super::*;
     use crate::caps::{Availability, Interface};
     use crate::model::BlockDevice;
@@ -737,7 +1006,7 @@ mod tests {
         };
         let caps = caps_with(Availability::Usable, Availability::Usable);
         let snap = snapshot_with_a_disk();
-        let e = approve(
+        let e = decide(
             &UNWRITTEN,
             &caps,
             &snap,
@@ -831,7 +1100,7 @@ mod tests {
     fn a_root_hub_is_refused_because_it_is_the_whole_bus() {
         let caps = caps_with(Availability::Usable, Availability::Usable);
         let snap = snapshot_with_a_disk();
-        let e = approve(&CYCLE, &caps, &snap, &cycle_request(Some("usb6")), &free()).unwrap_err();
+        let e = decide(&CYCLE, &caps, &snap, &cycle_request(Some("usb6")), &free()).unwrap_err();
         assert!(matches!(e, Refusal::WholeBus { .. }), "{}", e.message());
         assert!(
             e.message().contains("every device on it"),
@@ -845,12 +1114,12 @@ mod tests {
     fn a_disruptive_probe_must_be_pointed_at_one_device() {
         let caps = caps_with(Availability::Usable, Availability::Usable);
         let snap = snapshot_with_a_disk();
-        let e = approve(&CYCLE, &caps, &snap, &cycle_request(None), &free()).unwrap_err();
+        let e = decide(&CYCLE, &caps, &snap, &cycle_request(None), &free()).unwrap_err();
         assert!(e.message().contains("--target"), "{}", e.message());
         assert!(!e.is_recoverable());
 
         // Pointed at something, it is allowed — and says what it will do.
-        let p = approve(&CYCLE, &caps, &snap, &cycle_request(Some("6-1")), &free()).unwrap();
+        let p = decide(&CYCLE, &caps, &snap, &cycle_request(Some("6-1")), &free()).unwrap();
         assert!(p.describe().contains("leaves the bus"), "{}", p.describe());
         assert_eq!(p.target.unwrap().sysfs_name, "6-1");
     }
@@ -871,7 +1140,7 @@ mod tests {
         // Named as the disk, and named as the bus address: the same disk is
         // behind both, so both must refuse.
         for target in ["sdb", "6-1"] {
-            let e = approve(&CYCLE, &caps, &snap, &cycle_request(Some(target)), &mounted)
+            let e = decide(&CYCLE, &caps, &snap, &cycle_request(Some(target)), &mounted)
                 .unwrap_err();
             let m = e.message();
             assert!(m.contains("/media/stick"), "names where it is mounted: {m}");
@@ -883,7 +1152,7 @@ mod tests {
         }
 
         // Unmounted, the same request goes through.
-        assert!(approve(&CYCLE, &caps, &snap, &cycle_request(Some("sdb")), &free()).is_ok());
+        assert!(decide(&CYCLE, &caps, &snap, &cycle_request(Some("sdb")), &free()).is_ok());
     }
 
     /// Two acts, not one: agreeing to probe at all, and accepting that this
@@ -897,7 +1166,7 @@ mod tests {
             target: Some("6-1"),
             ..Request::new(CYCLE.name, Duration::from_secs(1))
         };
-        let e = approve(&CYCLE, &caps, &snap, &bare, &free()).unwrap_err();
+        let e = decide(&CYCLE, &caps, &snap, &bare, &free()).unwrap_err();
         assert!(matches!(
             e,
             Refusal::NeedsConsent {
@@ -911,7 +1180,7 @@ mod tests {
             consented: true,
             ..bare
         };
-        let e = approve(&CYCLE, &caps, &snap, &consented, &free()).unwrap_err();
+        let e = decide(&CYCLE, &caps, &snap, &consented, &free()).unwrap_err();
         assert!(
             matches!(
                 e,
@@ -949,7 +1218,7 @@ mod tests {
         });
         snap.buses[0].children[0].children.push(kbd);
 
-        let e = approve(&CYCLE, &caps, &snap, &cycle_request(Some("6-1")), &free()).unwrap_err();
+        let e = decide(&CYCLE, &caps, &snap, &cycle_request(Some("6-1")), &free()).unwrap_err();
         let m = e.message();
         assert!(m.contains("a keyboard"), "{m}");
         assert!(m.contains("no key left to press"), "{m}");
@@ -957,7 +1226,7 @@ mod tests {
         assert!(!e.is_recoverable());
 
         // A sibling with no keyboard under it is still fine.
-        assert!(approve(&CYCLE, &caps, &snap, &cycle_request(Some("6-1.1")), &free()).is_err());
+        assert!(decide(&CYCLE, &caps, &snap, &cycle_request(Some("6-1.1")), &free()).is_err());
     }
 
     /// Things that will drop and come back are warnings, not refusals — they
@@ -967,7 +1236,7 @@ mod tests {
         let caps = caps_with(Availability::Usable, Availability::Usable);
         let snap = snapshot_with_a_disk();
 
-        let plan = approve(&CYCLE, &caps, &snap, &cycle_request(Some("6-1")), &free()).unwrap();
+        let plan = decide(&CYCLE, &caps, &snap, &cycle_request(Some("6-1")), &free()).unwrap();
         assert!(
             plan.side_effects.iter().any(|e| e.contains("sdb")),
             "{:?}",
@@ -1008,12 +1277,12 @@ mod tests {
 
         let refusals = [
             plan(&caps, &snap, &Request::new("nope", Duration::ZERO)).unwrap_err(),
-            approve(&CYCLE, &caps, &snap, &cycle_request(None), &free()).unwrap_err(),
-            approve(&CYCLE, &caps, &snap, &cycle_request(Some("zz")), &free()).unwrap_err(),
-            approve(&CYCLE, &caps, &snap, &cycle_request(Some("usb6")), &free()).unwrap_err(),
-            approve(&CYCLE, &caps, &snap, &cycle_request(Some("6-1")), &mounted).unwrap_err(),
-            approve(&CYCLE, &caps, &snap, &bare, &free()).unwrap_err(),
-            approve(
+            decide(&CYCLE, &caps, &snap, &cycle_request(None), &free()).unwrap_err(),
+            decide(&CYCLE, &caps, &snap, &cycle_request(Some("zz")), &free()).unwrap_err(),
+            decide(&CYCLE, &caps, &snap, &cycle_request(Some("usb6")), &free()).unwrap_err(),
+            decide(&CYCLE, &caps, &snap, &cycle_request(Some("6-1")), &mounted).unwrap_err(),
+            decide(&CYCLE, &caps, &snap, &bare, &free()).unwrap_err(),
+            decide(
                 &CYCLE,
                 &caps,
                 &snap,
@@ -1065,7 +1334,7 @@ mod tests {
         );
 
         let v = json(
-            &approve(&CYCLE, &caps, &snap, &cycle_request(Some("6-1")), &mounted)
+            &decide(&CYCLE, &caps, &snap, &cycle_request(Some("6-1")), &mounted)
                 .unwrap_err()
                 .report(),
         );
@@ -1077,7 +1346,7 @@ mod tests {
 
         // Which of the two confirmations is missing, without parsing English.
         let v = json(
-            &approve(
+            &decide(
                 &CYCLE,
                 &caps,
                 &snap,
@@ -1115,7 +1384,7 @@ mod tests {
     fn a_plan_serialises_in_units_another_program_can_use() {
         let caps = caps_with(Availability::Usable, Availability::Usable);
         let snap = snapshot_with_a_disk();
-        let p = approve(&CYCLE, &caps, &snap, &cycle_request(Some("6-1")), &free()).unwrap();
+        let p = decide(&CYCLE, &caps, &snap, &cycle_request(Some("6-1")), &free()).unwrap();
 
         let v = json(&p);
         assert_eq!(v["window_ms"], 1000);
@@ -1169,7 +1438,7 @@ mod tests {
             target: Some("6-1"),
             ..Request::new(CYCLE.name, Duration::from_secs(1))
         };
-        let e = approve(&CYCLE, &caps, &snap, &bare, &mounted).unwrap_err();
+        let e = decide(&CYCLE, &caps, &snap, &bare, &mounted).unwrap_err();
         assert!(matches!(e, Refusal::InUse { .. }), "{}", e.message());
         assert!(e.message().contains("swap"), "{}", e.message());
     }
@@ -1191,12 +1460,12 @@ mod tests {
         let snap = snapshot_with_a_disk();
 
         // A sound request, no privilege: privilege is the answer.
-        let e = approve(&CYCLE, &caps, &snap, &cycle_request(Some("6-1")), &free()).unwrap_err();
+        let e = decide(&CYCLE, &caps, &snap, &cycle_request(Some("6-1")), &free()).unwrap_err();
         assert!(e.message().contains("root-only"), "{}", e.message());
 
         // Missing target, no privilege: the target is the answer, since that
         // is the part the user can fix from here.
-        let e = approve(&CYCLE, &caps, &snap, &cycle_request(None), &free()).unwrap_err();
+        let e = decide(&CYCLE, &caps, &snap, &cycle_request(None), &free()).unwrap_err();
         assert!(e.message().contains("--target"), "{}", e.message());
 
         // Mounted disk, no privilege: still the mount, because no amount of
@@ -1208,7 +1477,7 @@ mod tests {
                 kind: crate::block::HoldKind::Mounted("/media/stick".into()),
             },
         );
-        let e = approve(&CYCLE, &caps, &snap, &cycle_request(Some("6-1")), &mounted).unwrap_err();
+        let e = decide(&CYCLE, &caps, &snap, &cycle_request(Some("6-1")), &mounted).unwrap_err();
         assert!(matches!(e, Refusal::InUse { .. }), "{}", e.message());
     }
 

@@ -233,6 +233,24 @@ fn json_of<T: serde::Serialize>(v: &T) -> String {
 /// so that a GUI gets the same answer without reimplementing the safety rules.
 /// This function's job is to ask, print what was decided, and where the only
 /// thing missing is a human saying yes, ask the human.
+/// Print a refusal the way the caller asked for it, and exit 2.
+///
+/// JSON goes to **stdout**, because it is the answer to the question that was
+/// asked rather than a diagnostic about this process — a front end parses it the
+/// same way it parses a success.
+fn refuse(refusal: &usb_probe::probe::Refusal, json: bool) -> ExitCode {
+    if json {
+        print!("{}", json_of(&refusal.report()));
+        let _ = std::io::stdout().flush();
+    } else {
+        eprintln!("usbdiag: {}", refusal.message());
+        if let Some(hint) = flag_for(refusal) {
+            eprintln!("         {hint}");
+        }
+    }
+    ExitCode::from(2)
+}
+
 fn probe(args: &Args, opts: Options) -> ExitCode {
     let snapshot = usb_probe::capture(opts);
     let theme = Theme {
@@ -271,6 +289,28 @@ fn probe(args: &Args, opts: Options) -> ExitCode {
         accepts_disruption: args.forced,
     };
 
+    // --dry-run asks a different question, so it takes a different call.
+    // `plan` refuses on missing privilege, which means an unprivileged caller
+    // would be told "needs root" and never told what it was agreeing to — the
+    // wrong order for anything that has to show consequences before asking. This
+    // still refuses a misspelled target or a mounted disk: no password fixes
+    // those.
+    if args.dry_run {
+        return match usb_probe::probe::preview(&caps, &snapshot, &request) {
+            Ok(p) => {
+                if args.json {
+                    print!("{}", json_of(&p));
+                } else {
+                    println!("{}", p.describe());
+                    println!("(--dry-run: nothing was run)");
+                }
+                let _ = std::io::stdout().flush();
+                ExitCode::SUCCESS
+            }
+            Err(refusal) => refuse(&refusal, args.json),
+        };
+    }
+
     let decision = usb_probe::probe::plan(&caps, &snapshot, &request);
 
     // A machine is never prompted: it gets the refusal, decides for itself, and
@@ -288,34 +328,8 @@ fn probe(args: &Args, opts: Options) -> ExitCode {
 
     let plan = match decision {
         Ok(p) => p,
-        Err(refusal) => {
-            if args.json {
-                // On stdout, because it is the answer to the question that was
-                // asked — not a diagnostic about this process.
-                print!("{}", json_of(&refusal.report()));
-                let _ = std::io::stdout().flush();
-            } else {
-                eprintln!("usbdiag: {}", refusal.message());
-                if let Some(hint) = flag_for(&refusal) {
-                    eprintln!("         {hint}");
-                }
-            }
-            return ExitCode::from(2);
-        }
+        Err(refusal) => return refuse(&refusal, args.json),
     };
-
-    // Deciding is not doing. This is the call a front end makes to find out
-    // what it would be asking someone to agree to.
-    if args.dry_run {
-        if args.json {
-            print!("{}", json_of(&plan));
-        } else {
-            println!("{}", plan.describe());
-            println!("(--dry-run: nothing was run)");
-        }
-        let _ = std::io::stdout().flush();
-        return ExitCode::SUCCESS;
-    }
 
     if !args.json {
         println!("{}", plan.describe());

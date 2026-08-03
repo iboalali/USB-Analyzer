@@ -436,15 +436,61 @@ with no disks — indistinguishable from a permission problem. Both now name the
 kernel module*, *needs something to run it on*, *needs privilege*. Three probes, three
 different instructions, where before all three read as "you are not allowed".
 
+### Ask for root per probe, never for the app — **decided, slice 1 of 5 done**
+
+The app is never restarted and never holds privilege: one `pkexec usbdiag probe … --json` per
+run, as §9 planned. Two decisions taken: **ship a polkit action** (so one prompt covers a
+session) and **sticky results** (a probe reading is not erased by the next live capture).
+
+Three facts from this machine shaped the rest:
+
+- **There is no auth caching by default.** `pkaction --verbose org.freedesktop.policykit.exec`
+  reports `implicit active: auth_admin`, *not* `auth_admin_keep` — so plain `pkexec` prompts on
+  every single probe. One prompt per session needs our own action with `auth_admin_keep`, and
+  that file lives in `/usr/share/polkit-1/actions/`, which needs a root install.
+- **Escalating the user-local install is a footgun.** `install-local.sh` writes
+  `~/.local/bin/usbdiag`, user-owned and user-writable; running that as root means root executes
+  a binary anything running as you can rewrite first. So escalation must require a root-owned
+  system path — which is also where the policy file has to go. Both facts point the same way:
+  **escalation is a feature of the system install**, and the panel should say so as plainly as
+  it says *needs something to run it on*.
+- **`urb-errors` is not a privilege problem here.** Its remedy is `LoadModule`, so a password
+  would authenticate and the probe would still fail. Loading a kernel module is a different act
+  from reading one, and deserves its own consent rather than being smuggled into a probe run.
+  `root_may_help()` already returns false for it.
+
+**Slice 1 — `probe::Preview` — done.** The blocker was that `--dry-run` could not say what a
+probe would do: `plan` refuses on missing privilege, so unprivileged it answered *"needs root"*
+and nothing else. A dialog cannot show consequences with that, and authenticating first to find
+out is the wrong order.
+
+`Preview` is a second type rather than a `Plan` with `blocked_by` bolted on, because `Plan`'s
+guarantee is load-bearing — *"holding one means every check has already passed"* — and `run`
+takes a `Plan`. Describing a probe therefore cannot become a way of running one, structurally
+rather than by discipline. `approve` produces the `Preview`, `Preview::approve` converts it, and
+`plan` is now just those two composed, so the two views cannot drift.
+
+It still refuses what no password fixes: a misspelled target, a mounted disk, a keyboard in the
+way. And the existing 20 probe tests were re-pointed through the conversion, which is the proof
+the refactor changed no behaviour.
+
+Remaining slices, in order: **(2)** sticky results in the model; **(3)** cooperative cancel;
+**(4)** the confirmation dialog and `pkexec`; **(5)** the polkit action.
+
+Two constraints for (3) and (4) that are easy to design around and expensive to discover late:
+
+- **A cancel button cannot work by signalling.** An unprivileged parent may not kill a root
+  child, so `reenumerate` cannot be stopped from the GUI by force. It needs a cooperative stop —
+  watching stdin for EOF is the cheapest — which solves the second problem too.
+- **A root child outlives the GUI.** Close the window mid-cycle and a root process keeps cycling
+  a port unattended. It restores the port when it finishes, so it self-heals, but nothing can
+  stop it. Same family as the `udevadm` leak above, and worse.
+
 ### Still out of v1
 
-`pkexec` escalation and the substitution workflow, both designed for in
-[`docs/01-gui-concept.md`](docs/01-gui-concept.md) §9. The substitution workflow is the
-strongest reason for the GUI to exist and deliberately comes last, since it depends on
-everything above.
-
-The escalation prompt now has the gate it needs: offer it only where
-`Remedy::root_may_help()`, never on absence.
+The substitution workflow ([`docs/01-gui-concept.md`](docs/01-gui-concept.md) §9) — the
+strongest reason for the GUI to exist, and deliberately last, since it depends on everything
+above.
 
 ### A mouse was accusing the charger — **done**
 
