@@ -14,10 +14,27 @@
 # what the baseline leg exists to catch.
 name: CI
 
+# A commit that touches only prose cannot change what the compiler, the tests or
+# clippy think, so it does not spend both legs. The list is repeated rather than
+# shared because GitHub Actions does not support YAML anchors — keep the two in
+# step.
+#
+# Two consequences, both wanted. A docs-only push leaves the README badge showing
+# the previous run, which is the last real answer rather than a stale one. And
+# `workflow_dispatch` stays as the escape hatch for running this deliberately
+# against any commit, including one that would otherwise be skipped.
+#
+# The workflow file itself is not markdown, so editing CI always runs CI.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
   workflow_dispatch:
 
 # A newer push to the same branch makes an in-flight run obsolete.
