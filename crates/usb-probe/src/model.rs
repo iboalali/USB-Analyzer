@@ -509,8 +509,15 @@ impl UsbDevice {
     /// which is the exact case that used to print four hex digits, and where a
     /// name genuinely adds something. Never the other way round: a database
     /// entry must not override what the hardware reports.
+    ///
+    /// The vendor is dropped wherever the product already names it, from
+    /// *either* source. The database case was the obvious one, but a device
+    /// repeating its own brand in both of its own strings is the more common
+    /// one: `3-4` here reports manufacturer `Goodix Technology Co., Ltd.` and
+    /// product `Goodix USB2.0 MISC`.
     pub fn label(&self) -> String {
         match (&self.manufacturer, &self.product) {
+            (Some(m), Some(p)) if names_the_same_vendor(p, m) => p.clone(),
             (Some(m), Some(p)) => format!("{m} {p}"),
             (None, Some(p)) => match self.id_vendor.and_then(named_vendor) {
                 // A product string with no manufacturer is common, and on a hub
@@ -2361,6 +2368,25 @@ mod tests {
         assert!(!names_the_same_vendor("USB2.0 Hub", "Genesys Logic, Inc."));
         // A two-letter first word must not match half the alphabet.
         assert!(!names_the_same_vendor("Hub", "IC Habitat"));
+    }
+
+    /// The test above passed while the bug was live, because it only exercised
+    /// the helper. `label()` called it on the database branch and not on the
+    /// branch where the device supplies *both* strings itself — which is where
+    /// the doubling was actually visible: `3-4` on this machine reports
+    /// manufacturer `Goodix Technology Co., Ltd.` and product
+    /// `Goodix USB2.0 MISC`, and the GUI drew both.
+    #[test]
+    fn a_device_that_repeats_its_own_brand_is_named_once() {
+        let mut d = ts::device("3-4", "2.00", 12.0, Some("usb3"));
+        d.manufacturer = Some("Goodix Technology Co., Ltd.".into());
+        d.product = Some("Goodix USB2.0 MISC".into());
+        assert_eq!(d.label(), "Goodix USB2.0 MISC");
+
+        // A manufacturer the product does not name is still worth prefixing.
+        d.manufacturer = Some("Genesys Logic, Inc.".into());
+        d.product = Some("USB2.0 Hub".into());
+        assert_eq!(d.label(), "Genesys Logic, Inc. USB2.0 Hub");
     }
 
     /// The point of the fingerprint: a watcher must not repaint because time
