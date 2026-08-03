@@ -42,8 +42,17 @@ Commands (chain as many as you like, executed in order):
 | `click X Y`  | left-click at **window-relative** (X, Y); top-left incl. title bar is (0,0) |
 | `key NAME`   | tap an X keysym: `Return` `Escape` `Tab` `Left` `Right` …      |
 | `type TEXT`  | type a string (printable ASCII; shifted chars handled)        |
+| `scroll DIR X Y [N]` | wheel `up`/`down` N notches (default 3), pointer at (X, Y) |
 | `move X Y`   | move the window's top-left to screen (X, Y)                    |
 | `sleep SECS` | pause (float) so a capture / repaint settles                   |
+
+**`scroll` is how you see the bottom of a pane.** The detail pane is a
+`ScrolledWindow` and its content is routinely taller than a window that fits on
+this screen — the host pane ends with the *Active probes* card, which sits
+entirely below the fold at the default size, so a screenshot without scrolling
+silently omits it. Wheel events are routed by pointer **position**, not by focus,
+so give coordinates over the pane you mean: `scroll down 800 600 8` for the detail
+side. The same coordinates over the sidebar scroll the sidebar instead.
 
 Example — select the second sidebar row (a Type-C port), then look:
 ```sh

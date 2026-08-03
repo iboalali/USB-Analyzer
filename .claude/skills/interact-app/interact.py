@@ -120,6 +120,30 @@ def main():
                 kc, shift = _char_key(dpy, ch)
                 tap(kc, shift)
             print(f"type {text!r}")
+        elif cmd == "scroll":
+            # Wheel events are buttons 4 (up) and 5 (down) in X11. The pointer
+            # has to be *over* the widget that should scroll — GTK routes the
+            # event by position, not by focus — so this moves there first and
+            # leaves it there.
+            direction = args[i + 1]
+            rx, ry = int(args[i + 2]), int(args[i + 3])
+            i += 4
+            # Optional trailing count, defaulting to 3 notches.
+            count = 3
+            if i < len(args) and args[i].isdigit():
+                count = int(args[i])
+                i += 1
+            button = 4 if direction == "up" else 5
+            ax, ay = ox + rx, oy + ry
+            xtest.fake_input(dpy, X.MotionNotify, x=ax, y=ay, root=root)
+            dpy.sync(); time.sleep(0.12)
+            for _ in range(count):
+                xtest.fake_input(dpy, X.ButtonPress, button)
+                dpy.sync(); time.sleep(0.03)
+                xtest.fake_input(dpy, X.ButtonRelease, button)
+                dpy.sync(); time.sleep(0.06)
+            time.sleep(0.25)
+            print(f"scroll {direction} x{count} at ({rx},{ry})")
         elif cmd == "sleep":
             secs = float(args[i + 1])
             i += 2
