@@ -633,6 +633,47 @@ answer, and the model default is right far more often.
 
 ---
 
+## Hand out a binary, or keep handing out nothing? — **discuss first**
+
+**Nothing here is decided.** Written down while CI was being built, to be talked through
+rather than acted on.
+
+CI compiles both binaries and runs one of them, and then throws them away: `target/` dies
+with the runner and the only uploaded artifact is the smoke run's `snapshot.json`. So the
+pipeline currently answers *"does this compile, lint, test and run"* and says nothing about
+distribution. `scripts/install-local.sh` is still the only thing that produces a release
+build, and it runs on the user's own machine.
+
+The two binaries are not the same problem.
+
+- **`usbdiag` is a strong candidate for a static musl build.** It has no native
+  dependencies at all — that is why `throughput.rs` hand-defines `O_DIRECT` per
+  architecture instead of taking `libc`, and why the shipped tree is 13 crates. A single
+  file that can be copied onto whatever machine is misbehaving and run with nothing
+  installed is close to the ideal shape for this tool, since the machine in question is by
+  definition the one having trouble. `x86_64-unknown-linux-musl` should need no code
+  changes, but that is an expectation and not a result — build it before believing it.
+- **`usbdiag-gui` cannot be handed out the same way.** It links GTK4 and libadwaita
+  dynamically, so a build is only good for a matching distribution. That means per-distro
+  artifacts, or Flatpak — and [`docs/01-gui-concept.md`](docs/01-gui-concept.md) §10 already
+  argues Flatpak is the wrong primary target for something that reads `/sys` and
+  `/sys/kernel/debug`, because the sandbox has to be opened wide enough to be decorative.
+
+Open questions, all of them genuine:
+
+- Artifacts on every run, only on tags, or both? Per-run artifacts expire and are mostly
+  noise; tagged releases are the thing people can link to.
+- Does a `.deb` earn its maintenance, given `install-local.sh` already covers the native
+  path without root?
+- **arm64 is the interesting gap.** `ubuntu-24.04-arm` runners exist, and the `aarch64`
+  branch of the `O_DIRECT` constant ships today without ever having been compiled, let
+  alone run. A cross build would be worth more than a downloadable x86 binary.
+- Whether any of this should wait for the GUI's out-of-v1 work to land, since the
+  substitution workflow is the reason a non-developer would want a binary in the first
+  place.
+
+---
+
 ## Shipped but unverified against hardware
 
 Both are implemented, tested synthetically, and have never seen the situation they exist
