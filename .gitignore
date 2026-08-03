@@ -4,3 +4,8 @@
 # Screenshots, recordings and other session captures (never committed)
 /captures
 /docs/mockups/shots/
+
+# `usbdiag json > snapshot.json` — a dump of one particular machine's hardware.
+# CI writes one and uploads it as an artifact; running the same check locally
+# should not leave the tree dirty.
+/snapshot.json

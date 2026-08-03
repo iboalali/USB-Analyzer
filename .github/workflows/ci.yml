@@ -1,0 +1,130 @@
+# Build, test and lint the workspace on the Ubuntu the project targets, plus the
+# next LTS as an early warning.
+#
+# docs/01-gui-concept.md §10 asks for 24.04 and 26.04, and the two legs do not
+# carry equal weight. 24.04 is the floor and it gates: it ships GTK 4.14 and
+# libadwaita 1.5, which are exactly the versions crates/gui compiles against
+# (features v4_14 and v1_5), so it is the leg that can catch a call newer than
+# the baseline. Anything later only relaxes that. 26.04's runner image is still
+# marked *preview* upstream, so its leg reports without blocking — a preview
+# image that is withdrawn or half-built must not turn main red.
+#
+# Building the workspace is also the only check the GUI gets. It cannot be run
+# headlessly in any useful way, but a GTK4 binary that fails to link is exactly
+# what the baseline leg exists to catch.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch makes an in-flight run obsolete.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # A red build should mean the code is wrong, not that crates.io blinked.
+  CARGO_NET_RETRY: 3
+  RUSTUP_MAX_RETRIES: 3
+
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    # Advisory only on the preview image; see the header.
+    continue-on-error: ${{ matrix.preview }}
+    strategy:
+      # Never let the advisory leg cancel the one that gates.
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-24.04 (baseline)
+            os: ubuntu-24.04
+            preview: false
+          - name: ubuntu-26.04 (preview, advisory)
+            os: ubuntu-26.04
+            preview: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Only crates/gui needs anything from the system. usb-probe and usbdiag
+      # read /sys directly and pull in nothing native, which is the whole reason
+      # the shipped CLI is a 13-crate tree.
+      - name: Install GTK4 and libadwaita
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev libadwaita-1-dev
+
+      - name: Record what this run actually used
+        run: |
+          rustc --version
+          cargo --version
+          cargo clippy --version
+          pkg-config --modversion gtk4 libadwaita-1
+          # A missing usb.ids is not a failure (see usbids.rs), but it decides
+          # whether the two tests that read the real table run or skip, so the
+          # log should say which happened.
+          ls -l /usr/share/misc/usb.ids /usr/share/hwdata/usb.ids \
+            || echo "no usb.ids installed — the vendor-table tests will skip"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+
+      # --locked throughout: the lockfile is committed, and a run that quietly
+      # resolved different versions would not be testing what ships.
+      - name: Build
+        run: cargo build --workspace --all-targets --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      # There is deliberately no `cargo fmt --check`. This workspace is not
+      # rustfmt-managed — the tables in diag.rs and the mask constants in
+      # trust.rs are laid out by hand to be read — and adding the check would
+      # reformat them. Please do not add it.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: The CLI must survive unfamiliar hardware
+        run: |
+          # A runner has no Type-C port, no PD contract, no battery and no USB
+          # storage. That is the shape of machine most likely to make a
+          # sysfs-reading diagnostic panic on an assumption, and the one shape
+          # the author cannot test against — every rule in this project was
+          # written while looking at one particular laptop.
+          #
+          # Exit 0 is "nothing actionable" and 1 is "a medium-or-worse finding";
+          # both mean the tool worked. 2 is a usage error and 101 is a panic,
+          # and either is a bug worth failing the build over.
+          ./target/debug/usbdiag json > snapshot.json && code=0 || code=$?
+          echo "usbdiag json exited $code"
+          case "$code" in
+            0|1) ;;
+            *) echo "::error::usbdiag exited $code (2 = usage error, 101 = panic)"
+               exit 1 ;;
+          esac
+          # The JSON surface is an API, so parsing it is part of the contract.
+          python3 -c "
+          import json
+          d = json.load(open('snapshot.json'))
+          missing = {'snapshot', 'findings', 'verdicts', 'exonerations'} - d.keys()
+          assert not missing, f'missing top-level keys: {missing}'
+          print('findings', len(d['findings']), '/ verdicts', len(d['verdicts']))
+          "
+
+      - name: Keep the snapshot from this runner
+        # Useful precisely because it is not the author's machine: it is a free
+        # sample of what the tool says about hardware it has never seen.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshot-${{ matrix.os }}
+          path: snapshot.json
+          if-no-files-found: ignore

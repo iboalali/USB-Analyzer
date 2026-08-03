@@ -1,5 +1,7 @@
 # usb-analyzer
 
+[![CI](https://github.com/iboalali/USB-Analyzer/actions/workflows/ci.yml/badge.svg)](https://github.com/iboalali/USB-Analyzer/actions/workflows/ci.yml)
+
 USB-C cable and Power Delivery diagnostics for Linux, in Rust.
 
 Answers the two questions that actually come up:
