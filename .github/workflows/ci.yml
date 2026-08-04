@@ -117,6 +117,25 @@ jobs:
       - name: Icons must load as icons
         run: ./scripts/check-icons.py
 
+      # Same failure class as the icons, one directory over: polkitd ignores an
+      # actions file it cannot parse and says nothing, so a typo in the policy
+      # would break nothing visibly — every probe would simply go back to asking
+      # for a password, which nobody attributes to a data file. The unit tests
+      # check the *values* in it; this checks it is XML at all.
+      - name: Shipped XML must parse
+        run: |
+          python3 - <<'PY'
+          import glob
+          import xml.etree.ElementTree as ET
+          files = [
+              "data/com.iboalali.usbdiag.policy",
+              "data/com.iboalali.usbdiag.metainfo.xml",
+          ] + sorted(glob.glob("data/icons/**/*.svg", recursive=True))
+          assert len(files) >= 4, f"expected the shipped data files, found {files}"
+          for f in files:
+              print("ok", f, "->", ET.parse(f).getroot().tag.rsplit("}", 1)[-1])
+          PY
+
       - name: The CLI must survive unfamiliar hardware
         run: |
           # A runner has no Type-C port, no PD contract, no battery and no USB

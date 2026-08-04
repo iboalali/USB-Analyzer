@@ -57,6 +57,21 @@ const AUTH_TOOL: [&str; 2] = ["/usr/bin/pkexec", "/bin/pkexec"];
 /// Where a system-installed `usbdiag` lives.
 const SYSTEM_PATHS: [&str; 2] = ["/usr/local/bin/usbdiag", "/usr/bin/usbdiag"];
 
+/// The polkit action that turns one prompt per probe into one prompt per
+/// session.
+///
+/// Shipped as `data/com.iboalali.usbdiag.policy` and installed by
+/// `scripts/install-system.sh`. Nothing here loads it or checks for it —
+/// [`Helper::spawn`] behaves identically either way, and polkit decides whether
+/// to ask. It is named here because `pkexec` finds an action by matching the
+/// path *and first argument* it is about to execute, so the file and this module
+/// have to agree about both, and a disagreement is silent: every probe simply
+/// starts prompting again.
+///
+/// See `the_shipped_policy_covers_a_path_the_finder_would_use`, which is what
+/// keeps them in step.
+pub const POLKIT_ACTION: &str = "com.iboalali.usbdiag.probe";
+
 /// Why no probe can be escalated here. Every variant names what would fix it.
 #[derive(Debug, Clone)]
 pub enum Unavailable {
@@ -533,6 +548,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The shipped polkit action and this module must agree, because `pkexec`
+    /// finds an action by matching the path and first argument it is about to
+    /// execute — and a mismatch is *silent*. Nothing breaks; every probe just
+    /// goes back to asking for a password, which is the symptom nobody
+    /// attributes to a data file.
+    ///
+    /// A string search rather than an XML parse on purpose: `usb-probe` has no
+    /// XML dependency and will not grow one to check four values.
+    #[test]
+    fn the_shipped_policy_covers_a_path_the_finder_would_use() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../data/com.iboalali.usbdiag.policy");
+        let policy = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} is part of the tree: {e}", path.display()));
+
+        let between = |after: &str| {
+            policy
+                .split_once(after)
+                .and_then(|(_, rest)| rest.split_once('<'))
+                .map(|(v, _)| v.trim().to_string())
+        };
+
+        assert!(
+            policy.contains(&format!("id=\"{POLKIT_ACTION}\"")),
+            "the file must define the action this module names"
+        );
+
+        // The path pkexec will be asked to run has to be one the finder picks.
+        let declared = between("exec.path\">").expect("the action pins a path");
+        assert!(
+            SYSTEM_PATHS.contains(&declared.as_str()),
+            "policy names {declared}, but the finder only looks at {SYSTEM_PATHS:?}"
+        );
+
+        // And the first argument, which is what narrows the cached grant to the
+        // probe subcommand rather than to the whole binary.
+        let argv1 = between("exec.argv1\">").expect("the action pins a first argument");
+        let ours = probe_args(&Request::new("urb-errors", Duration::from_secs(1)));
+        assert_eq!(
+            argv1, ours[0],
+            "the action matches on argv[1]; we pass {:?} first",
+            ours[0]
+        );
+
+        // Caching for the active session is the entire reason the file exists.
+        assert!(
+            policy.contains("<allow_active>auth_admin_keep</allow_active>"),
+            "without auth_admin_keep this file buys nothing"
+        );
     }
 
     fn a_report() -> Report {

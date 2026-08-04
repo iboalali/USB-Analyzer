@@ -604,7 +604,58 @@ Still unexercised in the window: the dismissed-prompt note, and *Stop* mid-run. 
 unit tests, and neither can be driven from here — the polkit prompt is a shell surface that XTEST
 cannot reach. `throughput` and `reenumerate` remain fixtures-and-units, for #23's reasons.
 
-Remaining slice: **(5)** the polkit action, so one prompt covers a session instead of every run.
+**Slice 5 — the polkit action — done.** `data/com.iboalali.usbdiag.policy` and
+`scripts/install-system.sh`.
+
+**`exec.argv1` narrowed the grant beyond what this entry planned.** The plan was an action pinned to
+the binary; polkit can also pin the *first argument*, so the cached authorization covers
+`/usr/local/bin/usbdiag probe …` and nothing else. `usbdiag labels`, or any other subcommand, falls
+back to polkit's default action and prompts. **The file changes how often you are asked, not who may
+answer** — `auth_admin_keep` has exactly the audience `auth_admin` had.
+
+**`auth_admin_keep` is not "one prompt per session", and this entry said it was.** Corrected against
+`pkcheck --list-temp` on polkit 124, after the prompt appeared on a run I had just called
+unattended:
+
+```
+action:   com.iboalali.usbdiag.probe
+subject:  unix-process:2624687:38014939 (./target/debug/usbdiag-gui)
+obtained: (17:10:54)      expires: (17:15:53)
+```
+
+The subject is the **calling process**, not the session — the authorization belongs to that one
+window, so a terminal or a second copy of the app authenticates separately and restarting the app
+discards it — and it lasts **five minutes**, polkitd's retention rather than anything we chose. What
+the action actually buys is a *burst*: several probes from one window while a cable is being swapped
+need one authentication instead of one each. Worth having, and smaller than advertised.
+
+**How the wrong claim survived.** I ran the same `pkexec` twice from a shell, saw 5.84 s then 6.02 s,
+and read "no prompt" out of the second timing. Wall-clock time is not evidence of an absent prompt —
+a human answering in under a second is indistinguishable from no prompt, and there was no reason to
+assume nobody was watching the screen. The thing that *is* evidence, `pkcheck --list-temp`, was one
+command away and would have shown the process subject and the 5-minute expiry the first time.
+
+**`allow_any` and `allow_inactive` stay at `auth_admin`, deliberately.** `no` would be tighter, and
+it would mean that *shipping this file removes* something that worked before it: polkit's own
+`exec` action permits an inactive-session `pkexec` at `auth_admin`, so ours refusing outright would
+break a `pkexec` over ssh. A file whose only purpose is to ask fewer times must not take a
+capability away.
+
+**Nothing in the code knows about it.** `Helper::spawn` is identical either way and polkit decides
+whether to ask, which is why the dialog now says root "may" be asked for rather than promising a
+prompt — with the action installed, every probe after the first has none. The one thing the code
+does carry is `escalate::POLKIT_ACTION` and a test tying the shipped file to the finder: pkexec
+matches an action by path *and* argv[1], so the policy naming a path `Helper::find` would not pick,
+or an argv[1] that is not what `probe_args` puts first, silently stops applying. The symptom is a
+password prompt that never goes away, which nobody attributes to a data file.
+
+**Same reason CI now parses the shipped XML.** polkitd ignores an actions file it cannot read and
+says nothing — the icon failure mode one directory over. The unit test checks the values; the CI
+step checks it is XML at all.
+
+`install-system.sh` refuses to build under `sudo`: `cargo` as root would leave a root-owned
+`target/` that the user's next ordinary build cannot write. It reads the action back with `pkaction`
+afterwards rather than assuming polkitd noticed, and `--uninstall` removes both files.
 
 ### Still out of v1
 

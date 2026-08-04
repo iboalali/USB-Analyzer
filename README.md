@@ -130,6 +130,58 @@ Stored device labels live in `$XDG_CONFIG_HOME/usbdiag/devices.json` and are lef
 alone by both installing and removing; `usbdiag labels` lists them and
 `usbdiag labels ID --forget` clears one.
 
+### Optional: let the window run privileged probes
+
+Only if you want that. The application install above is complete without it, and
+`sudo usbdiag probe NAME` from a terminal never needed it.
+
+```sh
+cargo build --release --bin usbdiag
+sudo ./scripts/install-system.sh
+```
+
+Two files, and nothing else — no setuid bit, no service, no daemon:
+
+| path | why |
+|---|---|
+| `/usr/local/bin/usbdiag` | the GUI will not escalate a binary you can rewrite; see [The window](#the-window) |
+| `/usr/share/polkit-1/actions/com.iboalali.usbdiag.policy` | one authentication per burst of probes instead of one per probe |
+
+Without the polkit action, `pkexec` falls under polkit's own
+`org.freedesktop.policykit.exec`, whose implicit authorization is `auth_admin` —
+**no caching, so every single probe asks for a password.** Diagnosing a cable
+means running several in a row, and a prompt per run is how people learn to stop
+reading prompts.
+
+What one authentication buys is narrower than `auth_admin_keep` sounds, and these
+are measured values rather than a reading of the documentation — `pkcheck
+--list-temp` on polkit 124:
+
+| | |
+|---|---|
+| which program | `/usr/local/bin/usbdiag` only, and only its `probe` subcommand — the action is pinned to both, via `exec.path` and `exec.argv1` |
+| whose | the **calling process**. The authorization's subject is `unix-process:<pid>`, so it belongs to that one window; a terminal or a second copy of the app authenticates separately, and restarting the app discards it |
+| how long | **five minutes**, which is polkitd's retention and not ours to set |
+| who may answer | an administrator, exactly as before |
+
+So it buys a *burst*: several probes from one window while a cable is being
+swapped need one authentication instead of one each. That is the case worth
+having. It is not "one prompt per session", and `auth_admin_keep` does not mean
+until logout.
+
+The most invasive thing it grants is `probe reenumerate`, which takes one device
+off the bus and back on, and which refuses outright — not overridably — on a disk
+holding a mounted filesystem or a subtree containing an input device.
+
+`allow_any` and `allow_inactive` are left at `auth_admin`, matching what the
+default action already permitted. Tightening them to `no` would mean that
+*shipping this file removes* a capability that existed before it, such as a
+`pkexec` over ssh. Asking fewer times should not take anything away.
+
+```sh
+sudo ./scripts/install-system.sh --uninstall     # removes both files
+```
+
 ### Running it without installing
 
 ```sh
@@ -165,17 +217,14 @@ would authenticate and then fail anyway, `needs something to run it on` is fixed
 by plugging a drive in, and cycling a port has to be aimed at one device, so it
 is not offered from a panel about the machine.
 
-**Escalation needs the system install.** `install-local.sh` writes
-`~/.local/bin/usbdiag`, which you own and can write — running that as root would
-mean root executing a file anything running as you can rewrite first. So the
-helper and every directory above it must be root-owned and unwritable by anyone
-else, or the app says which binary it refused and why. `/usr/local/bin/usbdiag`
-satisfies it:
-
-```sh
-cargo build --release
-sudo install -m 0755 target/release/usbdiag /usr/local/bin/usbdiag
-```
+**Escalation needs the system install** — see
+[the optional step above](#optional-let-the-window-run-privileged-probes).
+`install-local.sh` writes `~/.local/bin/usbdiag`, which you own and can write, and
+running that as root would mean root executing a file anything running as you can
+rewrite first. So the helper *and every directory above it* must be root-owned and
+unwritable by anyone else — replacing a directory replaces everything under it —
+or the app names the binary it refused and why. A build tree is checked and
+refused for exactly this reason rather than escalated for being nearest.
 
 Before the password prompt there is a dialog, because polkit authenticates *who
 you are* and never says what is about to happen: it names the probe, its class,

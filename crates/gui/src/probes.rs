@@ -100,9 +100,9 @@ pub fn card(snap: &Snapshot, panel: &Panel, sender: &relm4::Sender<Msg>) -> Opti
     let offers = PROBES.iter().any(|p| offerable(p, snap));
     body.append(&findings::paragraph(
         match (escalation.is_ok(), offers) {
-            (true, true) => "A probe that only lacks privilege can be run from here: you are \
-                             asked for your password, and only that one probe runs as root. The \
-                             app never does.",
+            (true, true) => "A probe that only lacks privilege can be run from here: polkit asks \
+                             for a password, and only that one probe runs as root. The app never \
+                             does.",
             (true, false) => "Nothing below can be started from here — each row says what stands \
                               in its way.",
             (false, true) => "One of these needs only privilege, and could be run from here — but \
@@ -326,8 +326,13 @@ pub fn confirm(
     use relm4::adw::{self, prelude::*};
 
     let name = preview.probe.name;
+    // "may ask" rather than "will ask". With the polkit action installed, one
+    // authentication covers a burst of them — so a promise of a password prompt would
+    // be wrong for every probe after the first. Which of the two it is, is
+    // polkit's decision and not visible from here, and the dialog is the wrong
+    // place to explain the caching rule.
     let body = format!(
-        "{}\n\nYou will be asked for your password, and this is what runs:\n\n{}",
+        "{}\n\nRoot is needed for this, so polkit may ask for a password. This is what runs:\n\n{}",
         preview.what_it_does(),
         helper.command_line(req)
     );

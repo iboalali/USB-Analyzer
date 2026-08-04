@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD polkit Policy Configuration 1.0//EN"
+"http://www.freedesktop.org/software/polkit/policyconfig-1.dtd">
+
+<!--
+  One authentication per burst of usbdiag probes, instead of one per probe.
+
+  Without this file, `pkexec usbdiag probe …` falls under polkit's own
+  org.freedesktop.policykit.exec, whose implicit authorization is `auth_admin`
+  — no caching, so every single probe asks for a password. Diagnosing a cable
+  means running several in a row, and a password prompt per run is how people
+  learn to stop reading prompts.
+
+  WHAT ONE AUTHENTICATION BUYS, exactly. Measured by listing polkit's temporary
+  authorizations (`pkcheck`, flag `list-temp`) on polkit 124, not assumed: the
+  first draft of this comment claimed "the lifetime of the session", and that is
+  not what polkit does. Note the flag is spelled without its leading dashes
+  above, because an XML comment may not contain two of them in a row — which is
+  how this file stopped parsing the first time.
+
+    * only `/usr/local/bin/usbdiag`, and only its `probe` subcommand — that is
+      what the two annotations below pin down. `usbdiag labels`, or any other
+      binary, is not covered and falls back to polkit's default action.
+    * only for the **calling process**. The temporary authorization's subject is
+      `unix-process:<pid>` — the window that ran pkexec, not the session. A
+      terminal, or a second copy of the app, authenticates on its own, and
+      restarting the app throws it away.
+    * for **five minutes**, which is polkitd's retention and none of our
+      business. `auth_admin_keep` does not mean "until logout".
+    * the same audience as before: an administrator. This file changes the
+      number of prompts, not who may answer them.
+
+  So what it actually buys is a burst: several probes from one window while a
+  cable is being swapped need one authentication rather than one each. That is
+  the case worth having, and it is smaller than "one prompt per session".
+
+  The most invasive thing it therefore grants is `probe reenumerate`, which
+  takes one device off the bus and puts it back. That probe refuses outright on
+  a disk holding a mounted filesystem or a subtree containing an input device,
+  and those refusals are not consent-overridable — see crates/usb-probe/src/probe.rs.
+
+  allow_any and allow_inactive deliberately match what the default action
+  already allowed. Setting them to `no` would be tighter, but shipping this
+  file would then *remove* a capability that existed before it: a `pkexec` over
+  ssh, which polkit's own action permits at `auth_admin`, would start being
+  refused outright. Making something stop working is not the job of a file
+  whose only purpose is to ask fewer times.
+
+  Installed by scripts/install-system.sh. If usbdiag lives anywhere other than
+  /usr/local/bin — a distribution package in /usr/bin, say — change exec.path
+  to match, or the action will not be found and every probe will prompt again.
+  `escalate::tests::the_shipped_policy_covers_a_path_the_finder_would_use`
+  keeps this file and that finder in step.
+-->
+
+<policyconfig>
+
+  <vendor>usb-analyzer</vendor>
+  <vendor_url>https://github.com/iboalali/USB-Analyzer</vendor_url>
+  <icon_name>com.iboalali.usbdiag</icon_name>
+
+  <action id="com.iboalali.usbdiag.probe">
+    <description>Run a USB diagnostic probe</description>
+    <message>Authentication is required to measure this machine's USB hardware</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/usbdiag</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">probe</annotate>
+  </action>
+
+</policyconfig>

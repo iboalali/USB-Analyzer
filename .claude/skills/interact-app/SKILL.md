@@ -104,7 +104,17 @@ the whole screen is not an option.
   *show hubs* is toggled. Re-screenshot and re-measure before the next click.
 - **A capture can land between your click and your grab.** The window repaints
   on udev events and on a 2 s fallback tick, and a rebuild rebuilds both panes.
-  Sleep ~1 s after clicking before grabbing.
+  Sleep ~1 s after clicking before grabbing — and ~2 s after a `scroll`, which
+  moves more pixels than a click.
+- **A partial grab looks like a bug in the app, and is not.** Symptom: the PNG is
+  correct at the top left and solid **black** down the right and bottom edges,
+  cutting through card content, often with the pane scrolled back to where it
+  started. That is `xwd` reading the window's pixmap mid-relayout, not a broken
+  widget and not an off-screen window — check the screen size before believing
+  the off-screen theory (`xdpyinfo | grep dimensions`; this host is 4992x1728, so
+  almost nothing is really off-screen). Sleep longer and grab again; if it
+  persists, re-run `screenshot-app/capture.sh`, which forces `GSK_RENDERER=cairo`
+  and waits for the first tick to settle.
 - **Window-relative coords, absolute clicks.** The driver reads the window's
   on-screen origin and adds it, so pass coordinates as measured off a screenshot.
 - **Never click outside the target window — it ends the session.** A click that
