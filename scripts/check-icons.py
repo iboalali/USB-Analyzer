@@ -24,17 +24,52 @@ the element.
 it is not installed everywhere, notably not on a bare CI runner. The byte-offset
 check needs nothing but the standard library and catches the exact regression
 above, so it always runs. When GdkPixbuf is available, a real load runs too.
+
+# A load failure is only evidence if the loader works at all
+
+GdkPixbuf can be importable on a machine with no SVG loader installed — a CI
+runner with `python3-gi` and no `librsvg2-common`, for instance. Every icon then
+"fails", which says nothing about the icons: this script's first version did
+exactly that and turned the baseline CI leg red while the icons were fine.
+
+So a control comes first: a minimal SVG written to a temporary file. If *that*
+cannot be loaded, this environment cannot rasterise SVG and the load check is
+skipped with a note. Only when the control loads does a failure on a real icon
+mean anything. It is the same reasoning that found the original bug — a sibling
+project's icon loaded, ours did not, so the loader was not the problem.
 """
 
 import glob
 import os
 import sys
+import tempfile
 
 # Comfortably below where sniffing gave up (a 905-byte preamble failed) and
 # comfortably above any reasonable `<?xml ...?>` declaration.
 MAX_SIGNATURE_OFFSET = 256
 
 ICONS = "data/icons/hicolor/*/apps/*.svg"
+
+# The smallest thing that is unarguably a loadable SVG. If this fails, the
+# machine has no SVG loader and nothing can be concluded about the real icons.
+CONTROL = (
+    b'<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16">'
+    b'<rect width="16" height="16" fill="#000"/></svg>'
+)
+
+
+def loader_works(loader) -> bool:
+    """Can this machine rasterise SVG at all?"""
+    with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as f:
+        f.write(CONTROL)
+        control = f.name
+    try:
+        loader.new_from_file_at_scale(control, 16, 16, True)
+        return True
+    except Exception:  # noqa: BLE001 — any failure means "no usable loader"
+        return False
+    finally:
+        os.unlink(control)
 
 
 def main() -> int:
@@ -56,6 +91,12 @@ def main() -> int:
         loader = GdkPixbuf.Pixbuf
     except Exception as e:  # noqa: BLE001 — any import problem means "not here"
         print(f"note: GdkPixbuf unavailable ({type(e).__name__}), offset check only")
+
+    if loader is not None and not loader_works(loader):
+        # Importable but toothless: python3-gi without librsvg2-common, say. The
+        # icons cannot be judged here, and calling them broken would be wrong.
+        print("note: no working SVG loader on this machine, offset check only")
+        loader = None
 
     failed = False
     for path in paths:
