@@ -363,6 +363,36 @@ impl AppModel {
     }
 }
 
+/// Let the icon theme find this app's icon when it has not been installed.
+///
+/// GTK resolves a window icon by *name*, through the theme's search path. An
+/// installed app is fine — `install-local.sh` puts the file in
+/// `~/.local/share/icons/hicolor` — but a `cargo run` build has its icon sitting
+/// in `data/icons/` where nothing looks, so the shell falls back to a generic
+/// one and the app appears to have no icon at all.
+///
+/// Resolved from the executable rather than the working directory: `cargo run`
+/// and `./target/debug/usbdiag-gui` are launched from anywhere, and the binary
+/// knows where it is. An installed binary has no `data/icons` above it, so the
+/// check simply fails and the real theme answers.
+fn find_our_icon(root: &adw::ApplicationWindow) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    // target/<profile>/usbdiag-gui — three parents up is the repository root.
+    let Some(repo) = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) else {
+        return;
+    };
+    let icons = repo.join("data/icons");
+    if icons.join("hicolor/scalable/apps").is_dir() {
+        // `display` is ambiguous here: an ApplicationWindow is both a Root and a
+        // Widget, and both traits offer one. Either answers; name a trait so the
+        // compiler does not have to guess.
+        let display = gtk::prelude::WidgetExt::display(root);
+        gtk::IconTheme::for_display(&display).add_search_path(&icons);
+    }
+}
+
 #[relm4::component]
 impl Component for AppModel {
     /// The first capture, plus the window size to open at.
@@ -501,6 +531,11 @@ impl Component for AppModel {
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
+        // Ask for our own icon by name, and make sure the name can be resolved
+        // from a build tree. Without both, the shell shows a generic icon.
+        find_our_icon(&root);
+        root.set_icon_name(Some(APP_ID));
+
         let monitor = monitor::MonitorWorker::builder()
             .detach_worker(())
             .forward(sender.input_sender(), |out| match out {

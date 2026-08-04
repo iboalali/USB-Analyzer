@@ -95,11 +95,53 @@ the `side_effects` list, and runs nothing. With `--json` the interactive prompt 
 entirely, since it would otherwise hang a front end on a read of a stdin nobody is typing
 into.
 
-## The window
+## Installing
 
 ```sh
-cargo run --bin usbdiag-gui          # or ./scripts/install-local.sh
+./scripts/install-local.sh
 ```
+
+No root, no sandbox. It builds release binaries, copies `usbdiag` and
+`usbdiag-gui` into `~/.local/bin`, installs the desktop entry, both icons and the
+AppStream metadata under `~/.local/share`, and refreshes the icon and desktop
+caches. Run it again to update: the binaries are replaced every time, and the
+desktop entry, icons and metadata only when they have actually changed. Nothing is
+installed setuid, no polkit rule is added, and no service is registered.
+
+*USB Diagnostics* then appears in the app grid, and `usbdiag` / `usbdiag-gui` are
+on `PATH` — the script warns if `~/.local/bin` is not on yours.
+
+Native rather than Flatpak on purpose: a sandbox cannot read `/sys/kernel/debug`,
+and traversing `/sys/bus/usb` needs `--filesystem=host` or `--device=all`, at
+which point the sandbox is decorative. For a hardware diagnostic the native
+install is the honest primary path — see
+[`docs/01-gui-concept.md`](docs/01-gui-concept.md) §10.
+
+To remove it, delete the four installed paths:
+
+```sh
+rm -f ~/.local/bin/usbdiag{,-gui} \
+      ~/.local/share/applications/com.iboalali.usbdiag.desktop \
+      ~/.local/share/metainfo/com.iboalali.usbdiag.metainfo.xml \
+      ~/.local/share/icons/hicolor/{scalable,symbolic}/apps/com.iboalali.usbdiag*.svg
+```
+
+Stored device labels live in `$XDG_CONFIG_HOME/usbdiag/devices.json` and are left
+alone by both installing and removing; `usbdiag labels` lists them and
+`usbdiag labels ID --forget` clears one.
+
+### Running it without installing
+
+```sh
+cargo run --bin usbdiag-gui
+cargo run --bin usbdiag -- diag
+```
+
+Both work straight from a build tree. The viewer finds its own icon in
+`data/icons/` when it is running from `target/`, so an uninstalled build looks
+like an installed one rather than falling back to a generic icon.
+
+## The window
 
 A read-only viewer for the same report, updating live from udev. The sidebar is
 the machine, its Type-C ports and the device tree with hubs collapsed behind

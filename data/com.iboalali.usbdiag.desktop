@@ -9,4 +9,10 @@ Terminal=false
 Categories=System;Monitor;
 Keywords=USB;USB-C;Type-C;Cable;Charger;PowerDelivery;PD;Thunderbolt;Diagnostics;
 StartupNotify=true
-StartupWMClass=com.iboalali.usbdiag
+# What the window actually reports, checked with `xprop WM_CLASS` rather than
+# assumed: GTK4 takes WM_CLASS from the program name, not from the application
+# id, so this is `usbdiag-gui` and not `com.iboalali.usbdiag`. With the wrong
+# value an X11 session cannot tie the window to this entry, and the shell shows a
+# generic icon in the dock and the wrong name in the window list. Wayland does not
+# use this key — it matches the app id against the file name instead.
+StartupWMClass=usbdiag-gui
