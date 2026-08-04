@@ -72,8 +72,17 @@ pub fn read_from(dir: &Path) -> Vec<BlockDevice> {
 /// from cumulative counters. Callers that already poll (watch mode) should diff
 /// consecutive snapshots instead of paying for this delay.
 pub fn sample(window: Duration) -> Vec<BlockDevice> {
+    sample_until(window, &crate::cancel::Cancel::never())
+}
+
+/// The same sample, abandonable part-way through.
+///
+/// A cancelled sample still returns both readings — the window was simply
+/// shorter, and a rate over a short window is still a rate. Nothing here has to
+/// be discarded, which is what makes this one safe to interrupt anywhere.
+pub fn sample_until(window: Duration, cancel: &crate::cancel::Cancel) -> Vec<BlockDevice> {
     let first = read();
-    std::thread::sleep(window);
+    cancel.sleep(window);
     let mut second = read();
     for dev in &mut second {
         if let Some(prev) = first.iter().find(|d| d.name == dev.name) {

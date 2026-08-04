@@ -505,17 +505,36 @@ the fields above, so a consumer that ignores it sees a consistent snapshot — i
 how fresh part of it is. **Untested against real hardware**, and unavoidably so: producing a
 measurement needs root and a USB disk, which is #23's blocker too. Six unit tests carry it.
 
-Remaining slices, in order: **(3)** cooperative cancel; **(4)** the confirmation dialog and
-`pkexec`; **(5)** the polkit action.
+**Slice 3 — cooperative cancel — done.** `cancel::Cancel`, and `--stop-on-eof`.
 
-Two constraints for (3) and (4) that are easy to design around and expensive to discover late:
+A cancel button cannot work by signalling: an unprivileged parent may not kill a root child. So
+the probe agrees to stop instead, and the transport is **stdin EOF** — the parent closes the pipe
+to cancel, and a parent that dies produces the identical event, which covers the case nobody
+remembers to handle. No signals, no `libc`, no pid to track.
 
-- **A cancel button cannot work by signalling.** An unprivileged parent may not kill a root
-  child, so `reenumerate` cannot be stopped from the GUI by force. It needs a cooperative stop —
-  watching stdin for EOF is the cheapest — which solves the second problem too.
-- **A root child outlives the GUI.** Close the window mid-cycle and a root process keeps cycling
-  a port unattended. It restores the port when it finishes, so it self-heals, but nothing can
-  stop it. Same family as the `udevadm` leak above, and worse.
+**The check sits between cycles and never inside one.** A cycle writes `1` then `0` to the port;
+stopping between those two writes would leave a device switched off, which is the one outcome
+this probe must never produce. Cooperation is what buys that guarantee — force could not.
+
+**A stopped run may convict and may never exonerate.** `ReenumerationRun::stopped` decides it.
+Intermittency seen in three cycles is intermittency, whatever happened next. But
+`LINK_STABLE_UNDER_CYCLING` earns its keep from the *number* of attempts, and reporting it from
+an abandoned run would turn "I changed my mind" into "your cable is fine" — the strongest claim
+in `diag.rs` on the weakest evidence. Same asymmetry as everywhere else here.
+
+**Opt-in, because stdin is the keyboard.** On a terminal, watching it would swallow what the user
+types and never see EOF until Ctrl-D, so an interactive run must not enable this. `--stop-on-eof`
+is also rejected outside `probe`, following the rule the sibling flags already follow: a flag that
+silently does nothing is worse than an error.
+
+**Verified end to end, unprivileged.** `block::sample` was made interruptible along the way,
+which matters beyond tidiness — it is the only cancellable probe that needs no root, so it is the
+only way to test the transport at all on this machine. An 8 s sample takes 8.21 s normally and
+0.22 s with stdin closed; closing the pipe 1.2 s into a 9 s window ends the child at 1.3 s. The
+two probes that motivated the work, `reenumerate` and `throughput`, are still fixtures-and-units
+only, for the same reason as #23.
+
+Remaining slices: **(4)** the confirmation dialog and `pkexec`; **(5)** the polkit action.
 
 ### Still out of v1
 

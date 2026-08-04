@@ -28,6 +28,7 @@
 //! reset-history rules; that is reported as a finding rather than hidden.
 
 pub mod block;
+pub mod cancel;
 pub mod caps;
 pub mod chain;
 pub mod diag;
@@ -101,6 +102,21 @@ pub fn capture(opts: Options) -> Snapshot {
     capture_with_log(opts, None)
 }
 
+/// A capture whose sampling window can be cut short.
+///
+/// Only `storage_sample_ms` waits for anything, and waiting is the only part a
+/// stop can affect — everything else here is a read of a file that has already
+/// been written. A shortened sample is still a valid one: two readings and a
+/// smaller interval between them.
+pub fn capture_until(opts: Options, cancel: &cancel::Cancel) -> Snapshot {
+    let labels = if opts.overrides {
+        overrides::Overrides::load()
+    } else {
+        overrides::Overrides::new()
+    };
+    capture_with_until(opts, None, &labels, cancel)
+}
+
 /// Read the current state, optionally reusing a kernel log read earlier.
 ///
 /// Reading the log is by far the most expensive part of a capture: on a machine
@@ -129,6 +145,15 @@ pub fn capture_with(
     opts: Options,
     log: Option<KernelLog>,
     labels: &overrides::Overrides,
+) -> Snapshot {
+    capture_with_until(opts, log, labels, &cancel::Cancel::never())
+}
+
+pub fn capture_with_until(
+    opts: Options,
+    log: Option<KernelLog>,
+    labels: &overrides::Overrides,
+    cancel: &cancel::Cancel,
 ) -> Snapshot {
     let ports = typec::read_ports();
     let (batteries, mains_online) = pd::read_batteries();
@@ -164,7 +189,10 @@ pub fn capture_with(
         ports,
         thunderbolt: thunderbolt::read(),
         block_devices: if opts.storage_sample_ms > 0 {
-            block::sample(std::time::Duration::from_millis(opts.storage_sample_ms))
+            block::sample_until(
+                std::time::Duration::from_millis(opts.storage_sample_ms),
+                cancel,
+            )
         } else {
             block::read()
         },

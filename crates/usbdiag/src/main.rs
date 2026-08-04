@@ -54,6 +54,13 @@ struct Args {
     /// Decide, print the decision, and stop. The step a front end takes before
     /// putting a confirmation in front of anyone.
     dry_run: bool,
+    /// Stop the probe when stdin closes.
+    ///
+    /// For a front end that launched this through `pkexec` and therefore cannot
+    /// signal it: closing the pipe cancels, and the parent dying does the same
+    /// thing by itself. Off by default because on a terminal stdin is the
+    /// keyboard — watching it would eat what the user types.
+    stop_on_eof: bool,
 
     /// Apply the user's stored labels. `--no-overrides` turns them off to get
     /// the unmodified view of the machine.
@@ -87,6 +94,7 @@ impl Default for Args {
             consented: false,
             forced: false,
             dry_run: false,
+            stop_on_eof: false,
             overrides: true,
             kind: None,
             medium: None,
@@ -335,7 +343,14 @@ fn probe(args: &Args, opts: Options) -> ExitCode {
         println!("{}", plan.describe());
     }
 
-    let report = usb_probe::probe::run(&plan, opts);
+    // A front end that cannot signal this process closes the pipe instead; see
+    // usb_probe::cancel. An interactive run must not watch a terminal's stdin.
+    let cancel = if args.stop_on_eof {
+        usb_probe::cancel::Cancel::on_stdin_eof()
+    } else {
+        usb_probe::cancel::Cancel::never()
+    };
+    let report = usb_probe::probe::run_until(&plan, opts, &cancel);
     let scoped = plan.target.as_ref().map(|t| t.sysfs_name.clone());
     let report = match &scoped {
         Some(sysfs_name) => report.scoped_to(sysfs_name),
@@ -869,6 +884,7 @@ fn parse(argv: &[String]) -> Result<Option<Args>, String> {
             "-y" | "--yes" => args.consented = true,
             "--force" => args.forced = true,
             "--dry-run" => args.dry_run = true,
+            "--stop-on-eof" => args.stop_on_eof = true,
             _ if a.starts_with('-') => return Err(format!("unknown option: {a}")),
             _ => {
                 // The word after `probe` is the probe's name, not a command.
@@ -913,8 +929,12 @@ fn parse(argv: &[String]) -> Result<Option<Args>, String> {
 
     // Consent that cannot reach a probe is a typo worth reporting, not a
     // no-op to shrug at: `usbdiag all --force` should not look like it worked.
-    if args.command != Command::Probe && (args.consented || args.forced || args.dry_run) {
-        return Err("--yes, --force and --dry-run only mean anything for 'probe'".into());
+    if args.command != Command::Probe
+        && (args.consented || args.forced || args.dry_run || args.stop_on_eof)
+    {
+        return Err(
+            "--yes, --force, --dry-run and --stop-on-eof only mean anything for 'probe'".into(),
+        );
     }
     // Same rule for the label flags: a `--kind` that reaches no command has
     // silently changed nothing, and looking like it worked is the failure.
@@ -1000,6 +1020,10 @@ PROBE OPTIONS
         --dry-run       Decide and print the decision, then stop. With --json
                         this is how a front end finds out what a probe would
                         do, and what it would interrupt, before asking anyone
+        --stop-on-eof   Stop the probe when stdin closes. For a front end that
+                        launched this through pkexec and so cannot signal it;
+                        a parent that dies sends the same message. Off by
+                        default because on a terminal stdin is the keyboard
 
 EXIT STATUS
     0   nothing actionable found
@@ -1117,6 +1141,11 @@ mod tests {
         assert!(p(&["all", "--dry-run"]).is_err());
         assert!(p(&["probe", "urb-errors", "--yes"]).is_ok());
         assert!(p(&["probe", "reenumerate", "--dry-run"]).is_ok());
+        // Same rule for the cancellation flag: outside `probe` it cancels
+        // nothing, and a flag that silently does nothing is the failure.
+        assert!(p(&["all", "--stop-on-eof"]).is_err());
+        assert!(p(&["watch", "--stop-on-eof"]).is_err());
+        assert!(p(&["probe", "reenumerate", "--stop-on-eof"]).is_ok());
     }
 
     /// Deciding and doing are separate requests, so a front end can put the

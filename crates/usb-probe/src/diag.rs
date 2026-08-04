@@ -1953,6 +1953,25 @@ fn reenumeration_rules(snap: &Snapshot, out: &mut Vec<Finding>) {
         ));
     }
     evidence.push(format!("port {} ({})", run.port, run.port_path.display()));
+    if run.stopped {
+        evidence.push(format!(
+            "stopped after {} of {} requested cycles",
+            run.cycles.len(),
+            run.requested_cycles
+        ));
+    }
+
+    // A run that was cut short may still convict, and may never exonerate.
+    //
+    // Intermittency seen in three cycles is intermittency: the observation stands
+    // whatever happened afterwards. But "trained the same way every time" earns
+    // its keep from the number of attempts, and a handful of them rules out
+    // almost nothing — so a stopped run says nothing rather than handing back a
+    // clean bill of health the user did not wait for. Same asymmetry as the rest
+    // of this file: evidence of a fault counts, absence of evidence does not.
+    if run.stopped && !run.is_intermittent() {
+        return;
+    }
 
     if !run.is_intermittent() {
         let what = distribution
@@ -2665,6 +2684,7 @@ mod tests {
             .push(device("4-1", " 3.20", 5000.0, Some("usb4")));
         snap.buses.push(bus);
         snap.reenumeration = Some(ReenumerationRun {
+            stopped: false,
             device: "4-1".into(),
             port: "usb4-port1".into(),
             port_path: "/sys/devices/usb4/4-0:1.0/usb4-port1".into(),
@@ -2742,6 +2762,53 @@ mod tests {
             .evidence
             .iter()
             .any(|e| e.contains("did not come back at all")));
+    }
+
+    /// A run the user stopped must not hand back a clean bill of health.
+    ///
+    /// The exoneration earns its keep from the *number* of attempts: twenty
+    /// identical trainings rule out intermittency, three rule out almost nothing.
+    /// Reporting the clean result from an abandoned run would turn "I changed my
+    /// mind" into "your cable is fine", which is the strongest claim in the file
+    /// made on the weakest evidence.
+    #[test]
+    fn a_stopped_run_does_not_exonerate() {
+        let mut snap = cycled(&[Some(5000.0), Some(5000.0), Some(5000.0)]);
+        let run = snap.reenumeration.as_mut().unwrap();
+        run.requested_cycles = 20;
+        run.stopped = true;
+
+        let found = analyze(&snap);
+        let found = codes(&found);
+        assert!(
+            !found.contains(&"LINK_STABLE_UNDER_CYCLING"),
+            "three cycles out of twenty prove nothing: {found:?}"
+        );
+    }
+
+    /// The other half of the asymmetry: a fault seen before the stop is still a
+    /// fault. Stopping ends the measurement; it does not unsee what was measured.
+    #[test]
+    fn a_stopped_run_still_reports_what_it_saw() {
+        let mut snap = cycled(&[Some(5000.0), Some(480.0), Some(5000.0)]);
+        let run = snap.reenumeration.as_mut().unwrap();
+        run.requested_cycles = 20;
+        run.stopped = true;
+
+        let found = analyze(&snap);
+        assert!(
+            codes(&found).contains(&"LINK_INTERMITTENT"),
+            "varying speeds are evidence whatever happened next"
+        );
+        let hit = found
+            .iter()
+            .find(|f| f.code == "LINK_INTERMITTENT")
+            .unwrap();
+        assert!(
+            hit.evidence.iter().any(|e| e.contains("stopped after 3 of 20")),
+            "and the reader must be told it was cut short: {:?}",
+            hit.evidence
+        );
     }
 
     /// One cycle cannot disagree with itself, so it must never be reported as

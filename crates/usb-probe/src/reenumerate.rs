@@ -92,8 +92,13 @@ pub fn port_for_in(devices: &Path, sysfs_name: &str) -> Option<PortRef> {
 ///
 /// The port is restored before returning whatever happens — including when a
 /// cycle fails partway and when the device never reappears.
-pub fn cycle(port: &PortRef, sysfs_name: &str, cycles: usize) -> ReenumerationRun {
-    cycle_in(Path::new(SYSFS_DEVICES), port, sysfs_name, cycles)
+pub fn cycle(
+    port: &PortRef,
+    sysfs_name: &str,
+    cycles: usize,
+    cancel: &crate::cancel::Cancel,
+) -> ReenumerationRun {
+    cycle_in(Path::new(SYSFS_DEVICES), port, sysfs_name, cycles, cancel)
 }
 
 pub fn cycle_in(
@@ -101,6 +106,7 @@ pub fn cycle_in(
     port: &PortRef,
     sysfs_name: &str,
     cycles: usize,
+    cancel: &crate::cancel::Cancel,
 ) -> ReenumerationRun {
     let device_dir = devices.join(sysfs_name);
     let mut run = ReenumerationRun {
@@ -109,6 +115,7 @@ pub fn cycle_in(
         port_path: port.dir.clone(),
         requested_cycles: cycles,
         cycles: Vec::new(),
+        stopped: false,
         error: None,
     };
 
@@ -119,6 +126,14 @@ pub fn cycle_in(
     };
 
     for index in 0..cycles {
+        // Checked *between* cycles and never inside one. A cycle writes `1` and
+        // then `0` to the port; stopping between those two writes would leave the
+        // port disabled, which is the one outcome this probe must never produce.
+        // Cooperation buys exactly that guarantee.
+        if cancel.stopped() {
+            run.stopped = true;
+            break;
+        }
         run.cycles
             .push(one_cycle(&port.disable, &device_dir, index));
     }
@@ -320,13 +335,42 @@ mod tests {
 
     /// The port must come back up even when the device never does — and the
     /// guard, not the happy path, is what has to guarantee it.
+    /// A stop asked for before the run starts must take no cycles at all, mark
+    /// the run, and still leave the port up.
+    ///
+    /// The port matters more than the count. A probe that could be interrupted
+    /// mid-cycle would leave a device switched off, which is why the check sits
+    /// between cycles and never inside one.
+    #[test]
+    fn a_stop_takes_effect_between_cycles_and_leaves_the_port_up() {
+        let (root, devices, disable) = fake_sysfs("cancelled");
+        let port = port_for_in(&devices, "4-1").unwrap();
+
+        let cancel = crate::cancel::Cancel::never();
+        cancel.stop();
+        // Twenty requested; the timeout is six seconds per cycle, so if the stop
+        // were ignored this test would take two minutes rather than fail fast.
+        let run = cycle_in(&devices, &port, "4-1", 20, &cancel);
+
+        assert!(run.cycles.is_empty(), "no cycle should have been attempted");
+        assert!(run.stopped, "and the run must say it was cut short");
+        assert_eq!(run.requested_cycles, 20, "what was asked for is kept");
+        assert_eq!(
+            fs::read_to_string(&disable).unwrap().trim(),
+            "0",
+            "the port must be enabled whatever happened"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn the_port_is_restored_even_when_the_device_never_returns() {
         let (root, devices, disable) = fake_sysfs("restore");
         let port = port_for_in(&devices, "4-1").unwrap();
         // No `speed` file is ever created, so every cycle times out. One cycle
         // only: the timeout is deliberately generous.
-        let run = cycle_in(&devices, &port, "4-1", 1);
+        let run = cycle_in(&devices, &port, "4-1", 1, &crate::cancel::Cancel::never());
 
         assert_eq!(run.cycles.len(), 1);
         assert!(!run.cycles[0].returned);

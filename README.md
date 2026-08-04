@@ -193,7 +193,21 @@ PROBE OPTIONS
     -y --yes        consent to a disruptive probe
     --force         accept the interruption without being asked
     --dry-run       decide and print the decision, then stop
+    --stop-on-eof   stop the probe when stdin closes (for a front end)
 ```
+
+`--stop-on-eof` exists because a front end cannot cancel a probe it launched
+through `pkexec`: the child is root and the parent is not, so no signal is
+available. The probe therefore agrees to stop, and closing its stdin is the
+message — which a parent that *dies* sends by itself, so an abandoned probe stops
+too. Off by default, because on a terminal stdin is the keyboard and watching it
+would swallow what you type.
+
+The stop lands between units of work, never inside one. `reenumerate` checks
+between cycles, so a port is never left switched off; a shortened run is marked as
+stopped, which withholds the clean result — three identical trainings do not rule
+out intermittency the way twenty do — while any fault it *did* see is still
+reported.
 
 Exit status is `0` when nothing actionable was found and `1` when there is a
 medium-or-worse finding, so it works as a CI or scripting gate.

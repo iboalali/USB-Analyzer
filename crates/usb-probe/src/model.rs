@@ -1500,6 +1500,16 @@ pub struct ReenumerationRun {
     pub port_path: PathBuf,
     pub requested_cycles: usize,
     pub cycles: Vec<ReenumerationCycle>,
+    /// The run was asked to stop before finishing its cycles.
+    ///
+    /// **This decides whether the clean result may be reported.** A completed run
+    /// of twenty identical trainings rules out intermittency; three do not, and
+    /// saying so from a run the user cut short would turn an abandoned test into a
+    /// clean bill of health. A fault seen in those three cycles is still a fault,
+    /// so only the exoneration is withheld — the same asymmetry as everywhere else
+    /// here: evidence of a problem counts, absence of evidence does not.
+    #[serde(default)]
+    pub stopped: bool,
     /// Set when the run could not start at all — most often because the device
     /// was unplugged between the capture and the probe. Recorded rather than
     /// left as an empty result, since "no cycles" and "nothing to report" would

@@ -110,7 +110,11 @@ const STAT_SECTOR_BYTES: u64 = 512;
 /// Read-only and non-destructive: it reads from offset zero forward and writes
 /// nothing. Nothing is unmounted, no driver is detached, and the device stays
 /// on the bus throughout.
-pub fn measure(name: &str, window: Duration) -> io::Result<ThroughputSample> {
+pub fn measure(
+    name: &str,
+    window: Duration,
+    cancel: &crate::cancel::Cancel,
+) -> io::Result<ThroughputSample> {
     let Some(flag) = O_DIRECT else {
         return Err(io::Error::other(
             "O_DIRECT's value is not known for this architecture, and reading without it \
@@ -141,7 +145,7 @@ pub fn measure(name: &str, window: Duration) -> io::Result<ThroughputSample> {
     let mut offset: u64 = 0;
     let mut error = None;
 
-    while started.elapsed() < window {
+    while started.elapsed() < window && !cancel.stopped() {
         match file.read_at(buf.as_mut_slice(), offset) {
             Ok(0) => break,
             Ok(n) => {
@@ -416,7 +420,8 @@ mod tests {
         let Some(name) = targets(&snap, None).into_iter().next() else {
             return;
         };
-        let Ok(sample) = measure(&name, Duration::from_millis(300)) else {
+        let Ok(sample) = measure(&name, Duration::from_millis(300), &crate::cancel::Cancel::never())
+        else {
             // Not root, almost certainly.
             return;
         };

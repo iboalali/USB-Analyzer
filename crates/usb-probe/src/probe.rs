@@ -246,12 +246,31 @@ fn millis<S: serde::Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
 /// without having passed [`plan`] first — the type is the proof that consent,
 /// capability and the mounted-filesystem check have all already happened.
 pub fn run(plan: &Plan, base: Options) -> crate::model::Report {
-    let mut snapshot = crate::capture(plan.capture_options(base));
+    run_until(plan, base, &crate::cancel::Cancel::never())
+}
+
+/// The same run, stoppable part-way through.
+///
+/// A privileged probe launched by a front end is a root child of an unprivileged
+/// parent, which cannot signal it — so cancelling has to be something the probe
+/// agrees to. See [`crate::cancel`] for why that is the only shape available, and
+/// for the stdin-EOF transport that also covers the parent dying.
+pub fn run_until(
+    plan: &Plan,
+    base: Options,
+    cancel: &crate::cancel::Cancel,
+) -> crate::model::Report {
+    let mut snapshot = crate::capture_until(plan.capture_options(base), cancel);
 
     if plan.probe.name == "throughput" {
         let only = plan.target.as_ref().map(|t| t.blocks.clone());
         for disk in crate::throughput::targets(&snapshot, only.as_deref()) {
-            match crate::throughput::measure(&disk, plan.window) {
+            // Between disks as well as inside a read: a stop asked for during the
+            // first of four drives should not have to wait out the other three.
+            if cancel.stopped() {
+                break;
+            }
+            match crate::throughput::measure(&disk, plan.window, cancel) {
                 Ok(sample) => snapshot.throughput.push(sample),
                 // A disk that cannot be opened is reported as a sample that
                 // failed, not omitted — a silently missing row reads as "there
@@ -285,7 +304,8 @@ pub fn run(plan: &Plan, base: Options) -> crate::model::Report {
                     });
                 }
                 Some(port) => {
-                    let run = crate::reenumerate::cycle(&port, &target.sysfs_name, plan.cycles);
+                    let run =
+                        crate::reenumerate::cycle(&port, &target.sysfs_name, plan.cycles, cancel);
                     snapshot.reenumeration = Some(run);
                     // The device has been on and off the bus several times, so
                     // everything read before is stale. Read it again.
