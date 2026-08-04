@@ -1,17 +1,23 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Symbolic variant: single colour, 16px grid, no gradients or opacity tricks.
-     The shell recolours `fill`, so everything is one filled path.
-
-     The same Material Symbols "cable" glyph as the application icon (Apache
-     License 2.0 — see data/icons/ATTRIBUTION.md), so the two cannot drift apart.
-
-     Sized by the *drawn* cable rather than by Material's box, which carries 120
-     units of padding of its own. Mapping the box straight onto 16 left the glyph
-     at 12px, visibly lighter than the shell's own symbolics beside it; 14px of
-     16 is the conventional weight. 14/720 = 0.0194444, and the 960-unit box then
-     spans 18.67, so it starts at 8 - 18.67/2 = -1.33 across and 8 + 18.67/2 =
-     17.33 down — the second because the source y run negative. -->
 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Comments go inside the element: a long leading comment pushes `<svg` past
+       the window gdk-pixbuf sniffs for the SVG signature, and the icon then fails
+       to load with "couldn't recognize the image file format". See the sibling
+       file for the full story.
+
+       Symbolic variant: single colour, 16px grid, no gradients or opacity tricks.
+       The shell recolours `fill`, so everything is one filled path.
+
+       The same Material Symbols "cable" glyph as the application icon (Apache
+       License 2.0 — see data/icons/ATTRIBUTION.md), so the two cannot drift
+       apart.
+
+       Sized by the *drawn* cable rather than by Material's box, which carries 120
+       units of padding of its own. Mapping the box straight onto 16 left the
+       glyph at 12px, visibly lighter than the shell's own symbolics beside it;
+       14px of 16 is the conventional weight. 14/720 = 0.0194444, and the 960-unit
+       box then spans 18.67, so it starts at 8 - 18.67/2 = -1.33 across and
+       8 + 18.67/2 = 17.33 down — the second because the source y run negative. -->
   <g transform="translate(-1.3333 17.3333) scale(0.0194444)" fill="currentColor">
     <path d="M200-120q-17 0-28.5-11.5T160-160v-40h-40v-160q0-17 11.5-28.5T160-400h40v-280q0-66 47-113t113-47q66 0 113 47t47 113v400q0 33 23.5 56.5T600-200q33 0 56.5-23.5T680-280v-280h-40q-17 0-28.5-11.5T600-600v-160h40v-40q0-17 11.5-28.5T680-840h80q17 0 28.5 11.5T800-800v40h40v160q0 17-11.5 28.5T800-560h-40v280q0 66-47 113t-113 47q-66 0-113-47t-47-113v-400q0-33-23.5-56.5T360-760q-33 0-56.5 23.5T280-680v280h40q17 0 28.5 11.5T360-360v160h-40v40q0 17-11.5 28.5T280-120h-80Z"/>
   </g>

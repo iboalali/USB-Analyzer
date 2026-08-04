@@ -1,19 +1,26 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- A cable, on the app's blue. The glyph is Google's Material Symbols "cable"
-     (Apache License 2.0 — see data/icons/ATTRIBUTION.md), which reads at 16px in
-     a way the previous drawing did not: it was a USB-C receptacle seen end-on
-     with the bottleneck chain inside it, and at dock size the four bars turned
-     into a smudge.
-
-     The rounded body stays. A bare glyph is a *symbolic* icon; an application
-     icon needs a shape behind it or it looks unfinished in a grid.
-
-     The glyph arrives in Material's coordinate system, a 960-unit box with y
-     running -960..0, and occupies the middle 720 of it. Mapping the full box to
-     96 units puts the drawn cable at 72 units inside a 128 canvas, centred:
-     translate(16 112) scale(0.1) — 64 - 96/2 = 16 across, 64 + 96/2 = 112 down,
-     the second because the source y are negative. -->
 <svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- KEEP `<svg` NEAR THE TOP OF THE FILE. Everything below used to sit above
+       it as a leading comment, which pushed the opening tag to byte 905 — and
+       gdk-pixbuf sniffs for the SVG signature only in the first part of the file,
+       so it reported "couldn't recognize the image file format" and GNOME drew a
+       blank tile in the app grid. A sibling project's icon, with a 134-byte
+       preamble, loaded fine; this one did not. Comments go *inside* the element.
+
+       A cable, on the app's blue. The glyph is Google's Material Symbols "cable"
+       (Apache License 2.0 — see data/icons/ATTRIBUTION.md), which reads at 16px
+       in a way the previous drawing did not: it was a USB-C receptacle seen
+       end-on with the bottleneck chain inside it, and at dock size the four bars
+       turned into a smudge.
+
+       The rounded body stays. A bare glyph is a *symbolic* icon; an application
+       icon needs a shape behind it or it looks unfinished in a grid.
+
+       The glyph arrives in Material's coordinate system, a 960-unit box with y
+       running -960..0, and occupies the middle 720 of it. Mapping the full box to
+       96 units puts the drawn cable at 72 units inside a 128 canvas, centred:
+       translate(16 112) scale(0.1) — 64 - 96/2 = 16 across, 64 + 96/2 = 112 down,
+       the second because the source y are negative. -->
   <defs>
     <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#62a0ea"/>

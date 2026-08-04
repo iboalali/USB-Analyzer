@@ -109,6 +109,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # A shipped icon can be valid SVG, render in a browser, pass an XML parser,
+      # and still not load as an *icon* — which is what happened: a long comment
+      # above the opening tag pushed `<svg` past the window gdk-pixbuf sniffs, so
+      # GNOME drew a blank tile and said nothing. Nothing else in this job would
+      # have noticed, because the icons are data and never compiled.
+      - name: Icons must load as icons
+        run: ./scripts/check-icons.py
+
       - name: The CLI must survive unfamiliar hardware
         run: |
           # A runner has no Type-C port, no PD contract, no battery and no USB
