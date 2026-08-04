@@ -33,6 +33,7 @@ pub mod caps;
 pub mod chain;
 pub mod diag;
 pub mod drm;
+pub mod escalate;
 pub mod kernel;
 pub mod kind;
 pub mod model;

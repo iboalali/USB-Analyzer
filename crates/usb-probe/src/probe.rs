@@ -103,10 +103,6 @@ pub struct Plan {
     pub side_effects: Vec<String>,
 }
 
-fn takes_a_window(probe: &ProbeInfo) -> bool {
-    matches!(probe.name, "storage-sample" | "urb-errors")
-}
-
 /// The one sentence both [`Plan`] and [`Preview`] open with.
 ///
 /// Shared rather than written twice: a confirmation dialog that described a
@@ -122,10 +118,10 @@ fn describe_probe(
     if let Some(t) = target {
         s.push_str(&format!(", on {} ({})", t.sysfs_name, t.label));
     }
-    if takes_a_window(probe) {
+    if probe.takes_a_window() {
         s.push_str(&format!(", for {:.1}s", window.as_secs_f64()));
     }
-    if probe.name == "reenumerate" {
+    if probe.takes_cycles() {
         s.push_str(&format!(", {cycles} times"));
     }
     s.push_str(match probe.class {

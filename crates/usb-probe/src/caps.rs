@@ -333,6 +333,31 @@ pub struct ProbeInfo {
     pub summary: &'static str,
 }
 
+impl ProbeInfo {
+    /// Whether a duration means anything for this probe.
+    ///
+    /// Here beside `class` and `needs` rather than in a front end, because three
+    /// separate places need the answer — the sentence shown before a run, the
+    /// command line built for a privileged child, and the options a capture is
+    /// given — and three copies of a name match would drift the first time a
+    /// probe gained a window.
+    ///
+    /// `throughput` belongs in this list: [`crate::probe::run_until`] passes the
+    /// window straight to the disk reader. It was missing while this lived
+    /// elsewhere, so the one probe that reads a disk flat out never said for how
+    /// long.
+    pub fn takes_a_window(&self) -> bool {
+        matches!(self.name, "storage-sample" | "urb-errors" | "throughput")
+    }
+
+    /// Whether a repeat count means anything. Only the probe that cycles a port:
+    /// a window would be the wrong control there, since a cycle takes as long as
+    /// the hardware takes.
+    pub fn takes_cycles(&self) -> bool {
+        self.name == "reenumerate"
+    }
+}
+
 /// Every probe the crate knows about, implemented or not.
 ///
 /// Listed here rather than discovered, so that a front end can show what the
