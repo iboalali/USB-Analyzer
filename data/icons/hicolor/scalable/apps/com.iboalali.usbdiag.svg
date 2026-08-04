@@ -1,7 +1,18 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- A USB-C receptacle seen end-on, with the bottleneck chain inside it: four
-     bars, the third one short and red. That is the app in one picture — the
-     shape says USB-C, the bars say "where does it stop". -->
+<!-- A cable, on the app's blue. The glyph is Google's Material Symbols "cable"
+     (Apache License 2.0 — see data/icons/ATTRIBUTION.md), which reads at 16px in
+     a way the previous drawing did not: it was a USB-C receptacle seen end-on
+     with the bottleneck chain inside it, and at dock size the four bars turned
+     into a smudge.
+
+     The rounded body stays. A bare glyph is a *symbolic* icon; an application
+     icon needs a shape behind it or it looks unfinished in a grid.
+
+     The glyph arrives in Material's coordinate system, a 960-unit box with y
+     running -960..0, and occupies the middle 720 of it. Mapping the full box to
+     96 units puts the drawn cable at 72 units inside a 128 canvas, centred:
+     translate(16 112) scale(0.1) — 64 - 96/2 = 16 across, 64 + 96/2 = 112 down,
+     the second because the source y are negative. -->
 <svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
   <defs>
     <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
@@ -12,16 +23,7 @@
 
   <rect x="8" y="8" width="112" height="112" rx="26" fill="url(#body)"/>
 
-  <!-- The receptacle: a flat oval, the Type-C silhouette. -->
-  <rect x="22" y="40" width="84" height="48" rx="24"
-        fill="none" stroke="#ffffff" stroke-opacity="0.92" stroke-width="6"/>
-
-  <!-- Four stages. The third is the limit. -->
-  <g stroke-linecap="round" stroke-width="7">
-    <line x1="38" y1="57" x2="90" y2="57" stroke="#ffffff" stroke-opacity="0.92"/>
-    <line x1="38" y1="71" x2="90" y2="71" stroke="#ffffff" stroke-opacity="0.92"/>
+  <g transform="translate(16 112) scale(0.1)" fill="#ffffff">
+    <path d="M200-120q-17 0-28.5-11.5T160-160v-40h-40v-160q0-17 11.5-28.5T160-400h40v-280q0-66 47-113t113-47q66 0 113 47t47 113v400q0 33 23.5 56.5T600-200q33 0 56.5-23.5T680-280v-280h-40q-17 0-28.5-11.5T600-600v-160h40v-40q0-17 11.5-28.5T680-840h80q17 0 28.5 11.5T800-800v40h40v160q0 17-11.5 28.5T800-560h-40v280q0 66-47 113t-113 47q-66 0-113-47t-47-113v-400q0-33-23.5-56.5T360-760q-33 0-56.5 23.5T280-680v280h40q17 0 28.5 11.5T360-360v160h-40v40q0 17-11.5 28.5T280-120h-80Z"/>
   </g>
-  <line x1="38" y1="64" x2="55" y2="64" stroke="#ff7b63" stroke-width="7" stroke-linecap="round"/>
-  <line x1="60" y1="64" x2="90" y2="64" stroke="#ffffff" stroke-opacity="0.35"
-        stroke-width="7" stroke-linecap="round"/>
 </svg>
