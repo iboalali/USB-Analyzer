@@ -420,7 +420,13 @@ fn cannot_answer(report: &Report, subject: &Subject) -> Vec<String> {
         ));
     }
 
-    if !snap.capabilities.usbmon.is_usable() {
+    // The *data*, not the permission. A probe run through `pkexec` hands back URB
+    // accounting this process could never have read itself, so asking whether
+    // usbmon is usable here would keep saying "not read" over a reading that is
+    // on screen two cards below. The throughput line above has always asked the
+    // right question; this one had not, and it started lying the moment the
+    // window could run a probe.
+    if snap.urb_traffic.is_none() && !snap.capabilities.usbmon.is_usable() {
         out.push(format!(
             "Transport error rates were not read: {}. Without them a link that works but retries \
              constantly looks the same as one that does not.",
@@ -429,4 +435,45 @@ fn cannot_answer(report: &Report, subject: &Subject) -> Vec<String> {
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Found by running a probe from the window for the first time: the reading
+    /// arrived, the row said *measured 17s ago*, and this card went on insisting
+    /// the transport error rates had not been read.
+    ///
+    /// The permission is genuinely still missing — that is the whole point of
+    /// escalating a child — so the only honest question is whether the *answer*
+    /// is here.
+    #[test]
+    fn a_reading_a_probe_paid_for_stops_the_pane_denying_it_exists() {
+        let says_unread = |report: &Report| {
+            cannot_answer(report, &Subject::Host)
+                .iter()
+                .any(|l| l.contains("Transport error rates were not read"))
+        };
+
+        // Default capabilities cannot use usbmon, and nothing has measured it.
+        let bare = usb_probe::diag::report(usb_probe::model::Snapshot::default());
+        assert!(says_unread(&bare), "with no reading, say so");
+
+        // The same unusable capability, with a child's measurement folded in.
+        let measured = usb_probe::diag::report(usb_probe::model::Snapshot {
+            urb_traffic: Some(usb_probe::model::UrbTraffic {
+                window_ms: 5000,
+                devices: Vec::new(),
+                lines_read: 412,
+                unparsed: 0,
+                source: None,
+            }),
+            ..Default::default()
+        });
+        assert!(
+            !says_unread(&measured),
+            "a probe answered this; the pane must not claim otherwise"
+        );
+    }
 }

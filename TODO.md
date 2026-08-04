@@ -577,10 +577,32 @@ description, the child's command line and the capture options now share it. That
 `throughput` takes a window and was missing from the old private list, so the one probe that reads
 a disk flat out never said for how long — `--dry-run` now ends *"for 3.0s"*.
 
-**Still unvalidated against hardware**, and this is the slice where that starts to bite: with no
-`usbmon` loaded, no USB disk attached and no system install, this machine offers no button at all.
-The three states were reached by reading rather than by clicking. What is needed to click one is in
-#23.
+**Validated for real**, after `modprobe usbmon` and a system install made `urb-errors` a privilege
+problem on this laptop. The dialog named `/usr/local/bin/usbdiag` and not the dev build sitting
+beside the GUI — the vet refused `target/debug/usbdiag` for being uid 1000 and kept looking, which
+is the "first reason, not first candidate" rule earning its keep. `pkexec` ran with exactly the
+argv the dialog promised, the row showed its spinner and *Stop* while the password prompt was up,
+and the reading came back and stayed: `measured 4m ago` after four minutes of uevent-driven
+captures. **That is slice 2 validated against hardware for the first time** — until now it was six
+unit tests and a hope.
+
+**Two faults found by looking, which no test would have caught.** The flat button rendered as a
+right-aligned *label* until the pointer crossed it — wrong way round for the one control that leads
+to a password prompt — and the row carrying it was dimmed by `unavailable`, fading the only thing
+on the panel that does something. A row with an action is no longer dimmed, which now separates
+"blocked, and you can do something" from "blocked, and you cannot".
+
+**And one real bug.** *What cannot be answered here* went on saying *"transport error rates were
+not read: … cannot be opened by this process"* while the row two cards below wore `measured 17s
+ago`. It asked whether **this process** may read usbmon — still perfectly true, that being the
+entire point of escalating a child — instead of whether the answer was present. The line began
+lying the moment the window could run a probe; the throughput line beside it had always asked the
+right question. It is now the GUI's first unit test, and the test was checked to fail without the
+fix rather than trusted.
+
+Still unexercised in the window: the dismissed-prompt note, and *Stop* mid-run. Both are covered by
+unit tests, and neither can be driven from here — the polkit prompt is a shell surface that XTEST
+cannot reach. `throughput` and `reenumerate` remain fixtures-and-units, for #23's reasons.
 
 Remaining slice: **(5)** the polkit action, so one prompt covers a session instead of every run.
 

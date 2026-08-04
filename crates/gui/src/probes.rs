@@ -151,10 +151,15 @@ fn row(
     sender: &relm4::Sender<Msg>,
 ) -> gtk::Box {
     let blocker = snap.capabilities.blocker(p);
+    let action = action(p, snap, panel, escalation, sender);
 
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 3);
     outer.add_css_class("probe-row");
-    if blocker.is_some() || !p.implemented {
+    // Dimmed only when there is nothing to be done about it. A row carrying a
+    // button is not unavailable — it is one password away — and dimming it would
+    // fade the one control on the panel that does something, which is how the
+    // first version looked.
+    if (blocker.is_some() || !p.implemented) && action.is_none() {
         outer.add_css_class("unavailable");
     }
 
@@ -200,8 +205,8 @@ fn row(
     spacer.set_hexpand(true);
     head.append(&spacer);
 
-    if let Some(action) = action(p, snap, panel, escalation, sender) {
-        head.append(&action);
+    if let Some(action) = &action {
+        head.append(action);
     }
     outer.append(&head);
 
@@ -267,8 +272,11 @@ fn action(
         return None;
     }
 
+    // Framed rather than flat. A flat button here rendered as a right-aligned
+    // label until the pointer happened to cross it, which is the wrong way round
+    // for the one control in the app that leads to a password prompt: it has to
+    // look pressable without being advertised.
     let button = gtk::Button::with_label("Run as root…");
-    button.add_css_class("flat");
     button.add_css_class("run-probe");
     // The ellipsis is not decoration: it promises a dialog before anything
     // happens, and there is one.

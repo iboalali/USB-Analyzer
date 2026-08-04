@@ -89,9 +89,10 @@
    same kind of statement — why the thing you asked for did not happen. */
 .probe-row .probe-note { font-style: italic; }
 
-/* The only control in this app that leads to a password prompt, and the reason
-   it is flat rather than suggested-action: escalation is a thing you may do
-   here, not the thing the panel is recommending. */
+/* The only control in this app that leads to a password prompt. Framed so it
+   reads as pressable, but never suggested-action: escalation is something you
+   may do here, not what the panel is recommending. Shrunk hard, because a
+   default-height button would set the height of every row in the card. */
 .probe-row button.run-probe {
     font-size: 0.85em;
     padding: 1px 10px;
