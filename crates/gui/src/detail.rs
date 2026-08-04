@@ -38,6 +38,9 @@ pub fn build(
     container: &gtk::Box,
     report: &Report,
     subject: &Subject,
+    // Only the host pane uses it, and only for the probe catalogue — but it is
+    // passed in rather than reached for, so this file keeps having no state.
+    probes: &crate::probes::Panel,
     sender: &relm4::Sender<crate::Msg>,
 ) {
     crate::sidebar::clear(container);
@@ -101,7 +104,7 @@ pub fn build(
     // purpose — that card says what could not be determined and this one says
     // what would determine it.
     if matches!(subject, Subject::Host) {
-        if let Some(card) = crate::probes::card(&report.snapshot) {
+        if let Some(card) = crate::probes::card(&report.snapshot, probes, sender) {
             container.append(&card);
         }
     }

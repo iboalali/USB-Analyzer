@@ -534,7 +534,55 @@ only way to test the transport at all on this machine. An 8 s sample takes 8.21 
 two probes that motivated the work, `reenumerate` and `throughput`, are still fixtures-and-units
 only, for the same reason as #23.
 
-Remaining slices: **(4)** the confirmation dialog and `pkexec`; **(5)** the polkit action.
+**Slice 4 — the dialog and `pkexec` — done.** `escalate::Helper`, and a run button on the probe
+panel.
+
+**A helper the user can rewrite is refused, not warned about.** This was the decision taken before
+building it, and the shape of the module follows from it: `Helper` cannot be constructed except by
+`find`, which walks the binary *and every directory above it* and requires root ownership with no
+write bit for anyone else — replacing a directory replaces everything under it, so a root-owned
+binary inside a directory you can rename is a root-owned binary you can swap. A development build
+is tried first and honestly refused rather than escalated because it happened to be nearest.
+Escalation is therefore a property of the system install, which is the same conclusion the polkit
+action reaches from the other direction.
+
+**The answer is on stdout; the exit code only explains its absence.** `usbdiag` exits 1 when it
+*found* something, so branching on the code first would turn every real finding into a failure.
+A dismissed password prompt is told apart from a broken run for the same reason: changing your
+mind is not an error, and it must not put a red message on the screen.
+
+**Consent travels as the flags that carry it and in no other way**, so a front end cannot assert
+what it was not given — no `--force`, and the child refuses. The child re-runs the whole gate as
+root, so a disk mounted between the dialog and the password is caught by the process that is about
+to act rather than by the one that asked. The GUI decides nothing about safety; it asks
+`probe::preview`, draws the answer, and passes the request on.
+
+**A button appears only where it can work.** Privilege must be the whole obstacle
+(`Remedy::Privilege`), the probe must need no target, and a trusted helper must exist. That
+excludes `urb-errors` on this machine (its remedy is `LoadModule`: a password would authenticate
+and the probe would still fail), `throughput` with no disk attached, and `reenumerate` always —
+cycling a port has to be aimed at one device, so it cannot be offered from a panel about the
+machine. Aiming it belongs to the device pane, which is a later slice.
+
+**Four states, each saying only what is true of itself.** The panel's opening line started as one
+sentence for both halves of the failure, ending "— see below". On this machine it pointed at
+nothing: no probe here is waiting only on privilege, so the install message was correctly
+suppressed and the reference dangled. The first wording of the replacement then claimed *"nothing
+below is waiting on a password"* — which `reenumerate`, sitting three rows down with `needs
+privilege` on it, flatly contradicted. It now says what stands in the way, which is true in every
+combination.
+
+`ProbeInfo::takes_a_window`/`takes_cycles` moved the knob table onto the probe, where the
+description, the child's command line and the capture options now share it. That found a real gap:
+`throughput` takes a window and was missing from the old private list, so the one probe that reads
+a disk flat out never said for how long — `--dry-run` now ends *"for 3.0s"*.
+
+**Still unvalidated against hardware**, and this is the slice where that starts to bite: with no
+`usbmon` loaded, no USB disk attached and no system install, this machine offers no button at all.
+The three states were reached by reading rather than by clicking. What is needed to click one is in
+#23.
+
+Remaining slice: **(5)** the polkit action, so one prompt covers a session instead of every run.
 
 ### Still out of v1
 

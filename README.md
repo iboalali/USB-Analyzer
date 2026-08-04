@@ -151,9 +151,40 @@ reason: the bottleneck chain is the one thing several other tools already draw,
 and the findings are what none of them has, so the chain appears last, under a
 heading saying it supports a statement above rather than being one.
 
-It needs no privileges and has none of the probes — those stay in `usbdiag
-probe`, behind the consent gate, in a process that can be given root without a
-window sitting open as root all day.
+It needs no privileges, and never acquires any. A probe that needs root runs as
+a **separate process** for as long as it takes to answer — `pkexec usbdiag probe
+NAME --json` — and the window gains nothing from it. That is the trade the whole
+design turns on: root for the seconds a measurement takes, not for as long as a
+window is open.
+
+The *Active probes* card on the host pane offers a run where — and only where —
+privilege is the whole obstacle, the probe needs no target, and there is a
+`usbdiag` on this machine that is safe to escalate. Everything else explains
+itself instead of offering a button that cannot work: `needs a kernel module`
+would authenticate and then fail anyway, `needs something to run it on` is fixed
+by plugging a drive in, and cycling a port has to be aimed at one device, so it
+is not offered from a panel about the machine.
+
+**Escalation needs the system install.** `install-local.sh` writes
+`~/.local/bin/usbdiag`, which you own and can write — running that as root would
+mean root executing a file anything running as you can rewrite first. So the
+helper and every directory above it must be root-owned and unwritable by anyone
+else, or the app says which binary it refused and why. `/usr/local/bin/usbdiag`
+satisfies it:
+
+```sh
+cargo build --release
+sudo install -m 0755 target/release/usbdiag /usr/local/bin/usbdiag
+```
+
+Before the password prompt there is a dialog, because polkit authenticates *who
+you are* and never says what is about to happen: it names the probe, its class,
+how long it will run, anything that will drop off the bus, and the exact command
+line. A running probe can be stopped from the same row — by asking, since an
+unprivileged parent cannot signal a root child. The reading it produces stays on
+screen afterwards instead of being wiped by the next uevent, and stays *as
+evidence*: the numbers are folded into each later capture before the rules run,
+so every finding is re-derived against the machine as it is now.
 
 The honesty rules are the same as the CLI's, drawn rather than printed:
 confidence on every finding and never collapsed into a colour; a coloured dot

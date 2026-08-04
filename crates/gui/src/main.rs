@@ -1,15 +1,18 @@
 //! `usbdiag-gui` — a native GTK4 viewer for `usb-probe`.
 //!
-//! **Viewer only.** Device tree, detail pane, findings and the bottleneck
-//! chain, updating live from udev. No probes, no privilege, no `pkexec`. The
-//! window opens and is useful with zero privileges, which is the whole point:
-//! running a diagnostic as root so it can read a counter is not a trade worth
-//! making for a window that sits open on a desktop. See
-//! `docs/01-gui-concept.md` §1 and §3.
+//! **The window is never privileged.** Device tree, detail pane, findings and
+//! the bottleneck chain, updating live from udev — all of it read with zero
+//! privileges, which is the whole point: running a diagnostic as root so it can
+//! read a counter is not a trade worth making for a window that sits open on a
+//! desktop. See `docs/01-gui-concept.md` §1 and §3.
 //!
 //! Reading links the library rather than shelling out to the CLI: typed data,
-//! no subprocess per refresh, no JSON round trip. The JSON API exists for the
-//! privileged half, which is out of v1 by design.
+//! no subprocess per refresh, no JSON round trip.
+//!
+//! A probe that needs root is the one exception, and it is not an exception to
+//! the rule above: it runs as a **separate process** for as long as it takes to
+//! answer, and this process gains nothing. That is what the JSON API was for.
+//! See [`usb_probe::escalate`] and `probes.rs`.
 
 mod chain;
 mod detail;
@@ -67,7 +70,7 @@ pub const KINDS: [DeviceKind; 14] = [
 const LOG_REFRESH: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
-enum Msg {
+pub enum Msg {
     /// The monitor's subprocess handle, kept so that shutdown can end it. The
     /// worker thread cannot do it itself — see [`monitor::Out::Started`].
     MonitorStarted(usb_probe::monitor::Stopper),
@@ -84,6 +87,20 @@ enum Msg {
         device: String,
         kind: Option<DeviceKind>,
     },
+
+    // --- the privileged half. Nothing here runs a probe in this process.
+    /// The button was pressed: describe the probe and ask.
+    RunProbe(&'static str),
+    /// The dialog was answered yes. The only thing that starts a child.
+    ProbeConfirmed(&'static str),
+    /// The child exists, and this is the handle that can ask it to stop. It
+    /// arrives as a message because the thread that made it is about to block
+    /// until the probe is finished. Named, so a handle from a run already
+    /// accounted for cannot be adopted as the current one.
+    ProbeStarted(&'static str, usb_probe::escalate::Stopper),
+    /// Ask the running probe to stop. It agrees or it does not; we cannot force
+    /// it, and would not want to mid-cycle. See `usb_probe::cancel`.
+    StopProbe,
 }
 
 /// Opening window size. Settable from the command line because the narrow
@@ -105,8 +122,21 @@ impl Default for Size {
 }
 
 #[derive(Debug)]
-enum Cmd {
+pub enum Cmd {
     Captured(Box<Report>),
+    /// A privileged run finished, one way or another.
+    Probed {
+        probe: &'static str,
+        outcome: Box<usb_probe::escalate::Outcome>,
+    },
+}
+
+/// A probe running in a child process.
+struct Running {
+    probe: &'static str,
+    /// `None` once it has been asked to stop, which is also how the row knows to
+    /// stop offering. Taken rather than flagged, because the handle is spent.
+    stop: Option<usb_probe::escalate::Stopper>,
 }
 
 struct AppModel {
@@ -141,6 +171,18 @@ struct AppModel {
     rendered: Cell<u64>,
     /// Set when a selection should push the content page in collapsed mode.
     show_content: Cell<bool>,
+
+    /// The privileged run in flight, if any. One at a time: two probes at once
+    /// would load the same bus and neither measurement would mean anything.
+    running: Option<Running>,
+    /// Measurements this session has paid a password for, folded into every
+    /// later capture so a reading is not wiped by the next uevent. A probe
+    /// *causes* uevents, so without this the number would vanish immediately.
+    carried: Vec<usb_probe::model::Measured>,
+    /// What each probe's last run had to say, where the measurement itself does
+    /// not say it: a refusal, a dismissed password, a failure. Kept per probe
+    /// and shown on its row, because that is where the button was.
+    probe_notes: std::collections::HashMap<&'static str, String>,
 
     _monitor: WorkerController<monitor::MonitorWorker>,
     /// Ends the monitor's `udevadm` subprocess at shutdown.
@@ -215,8 +257,14 @@ impl AppModel {
         } else {
             self.cached_log.clone()
         };
+        // Folded in *before* the rules run, so every finding is re-derived
+        // against the machine as it is now. Carrying findings instead would
+        // freeze a judgement about a world that may have changed since — see
+        // `usb_probe::report_carrying`, which this is the log-reusing twin of.
+        let carried = self.carried.clone();
         sender.spawn_oneshot_command(move || {
-            let snap = usb_probe::capture_with_log(Options::default(), reuse);
+            let mut snap = usb_probe::capture_with_log(Options::default(), reuse);
+            snap.carry_forward(&carried);
             Cmd::Captured(Box::new(usb_probe::diag::report(snap)))
         });
     }
@@ -296,6 +344,125 @@ impl AppModel {
             return;
         }
         self.start_capture(sender, false);
+    }
+
+    // -----------------------------------------------------------------------
+    // the privileged half
+    //
+    // Three steps, deliberately separate: describe, confirm, run. The gate that
+    // decides any of it is `usb_probe::probe`, and none of it is re-decided here
+    // — a GUI with its own opinion about whether a disk is mounted would
+    // eventually get it wrong, and getting it wrong means pulling a mounted
+    // filesystem off the bus.
+    // -----------------------------------------------------------------------
+
+    /// Describe the probe and ask. Runs nothing.
+    fn ask_to_run(
+        &mut self,
+        name: &'static str,
+        sender: &ComponentSender<Self>,
+        root: &adw::ApplicationWindow,
+    ) {
+        let Some(probe) = usb_probe::caps::probe(name) else {
+            return;
+        };
+        if self.running.is_some() {
+            return;
+        }
+
+        let helper = match usb_probe::escalate::Helper::find() {
+            Ok(h) => h,
+            Err(e) => return self.note(name, e.message()),
+        };
+        let request = probes::request_for(probe);
+        let snap = &self.report.snapshot;
+        match usb_probe::probe::preview(&snap.capabilities, snap, &request) {
+            Ok(preview) => probes::confirm(
+                &preview,
+                &helper,
+                &request,
+                root,
+                sender.input_sender(),
+            ),
+            // What a preview still refuses is a fact about the request that no
+            // password changes — a target that has been unplugged, a disk that is
+            // mounted. Say it on the row, and do not open a dialog that would
+            // collect consent for something already decided.
+            Err(refusal) => self.note(name, refusal.message()),
+        }
+    }
+
+    /// The dialog was answered yes. The only path that starts a child.
+    fn start_probe(&mut self, name: &'static str, sender: &ComponentSender<Self>) {
+        let Some(probe) = usb_probe::caps::probe(name) else {
+            return;
+        };
+        if self.running.is_some() {
+            return;
+        }
+        self.probe_notes.remove(name);
+        match probes::spawn(probe, sender) {
+            Ok(()) => {
+                self.running = Some(Running {
+                    probe: name,
+                    stop: None,
+                })
+            }
+            Err(why) => {
+                self.probe_notes.insert(name, why);
+            }
+        }
+        self.revision += 1;
+    }
+
+    /// What a probe's last run had to say, on the row where it was started.
+    ///
+    /// Not the banner: that means *something arrived on this machine*, and
+    /// spending it on the answer to a button somebody just pressed would blur a
+    /// distinction worth keeping. The panel is on screen — it is where the click
+    /// came from.
+    fn note(&mut self, probe: &'static str, text: String) {
+        self.probe_notes.insert(probe, text);
+        self.revision += 1;
+    }
+
+    /// Take on a report a privileged child produced.
+    fn adopt_probe(&mut self, probe: &'static str, outcome: usb_probe::escalate::Outcome) {
+        use usb_probe::escalate::Outcome;
+        self.running = None;
+        self.revision += 1;
+
+        match outcome {
+            Outcome::Ran(report) => {
+                match usb_probe::model::Measured::from_snapshot(probe, &report.snapshot) {
+                    // One reading per probe: a second run replaces the first
+                    // rather than stacking beside it.
+                    Some(m) => {
+                        self.carried.retain(|c| c.probe != m.probe);
+                        self.carried.push(m);
+                    }
+                    None => {
+                        self.probe_notes.insert(
+                            probe,
+                            "ran, and had nothing to measure — so there is nothing to keep, and \
+                             the findings below are as fresh as they get"
+                                .into(),
+                        );
+                    }
+                }
+                // The child's snapshot is fresher and richer than what is on
+                // screen, so it becomes the view. Its fingerprint goes with it,
+                // or the next ordinary capture would look like a change and
+                // rebuild both panes for nothing.
+                self.fingerprint = Some(report.snapshot.fingerprint());
+                self.adopt(*report);
+            }
+            // Refused *as root*, which is the interesting case: the child re-ran
+            // the whole gate, so this is a fact discovered after the dialog.
+            Outcome::Refused(r) => self.note(probe, r.message),
+            Outcome::NotAuthorised(why) => self.note(probe, format!("not run — {why}")),
+            Outcome::Failed(why) => self.note(probe, why),
+        }
     }
 
     fn title(&self) -> String {
@@ -568,6 +735,9 @@ impl Component for AppModel {
             revision: 1,
             rendered: Cell::new(0),
             show_content: Cell::new(false),
+            running: None,
+            carried: Vec::new(),
+            probe_notes: std::collections::HashMap::new(),
             _monitor: monitor,
             stopper: None,
         };
@@ -589,7 +759,7 @@ impl Component for AppModel {
         ComponentParts { model, widgets }
     }
 
-    fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>, _root: &Self::Root) {
+    fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>, root: &Self::Root) {
         match msg {
             Msg::MonitorStarted(stopper) => self.stopper = Some(stopper),
             Msg::Woke { events } => self.start_capture(&sender, events > 0),
@@ -613,6 +783,27 @@ impl Component for AppModel {
             }
             Msg::DismissBanner => self.banner_text = None,
             Msg::SetKind { device, kind } => self.set_kind(&device, kind, &sender),
+            Msg::RunProbe(name) => self.ask_to_run(name, &sender, root),
+            Msg::ProbeConfirmed(name) => self.start_probe(name, &sender),
+            Msg::ProbeStarted(probe, stopper) => match &mut self.running {
+                // The handle belongs to the run we are watching, or to nothing:
+                // an unmatched one means the run was already accounted for, and
+                // leaving a root child unstoppable is the one outcome to avoid.
+                Some(r) if r.probe == probe => r.stop = Some(stopper),
+                _ => {
+                    stopper.stop();
+                }
+            },
+            Msg::StopProbe => {
+                if let Some(r) = &mut self.running {
+                    // Taken rather than flagged: the handle is spent once used,
+                    // and the row reads "stopping…" from its absence.
+                    if let Some(stop) = r.stop.take() {
+                        stop.stop();
+                    }
+                    self.revision += 1;
+                }
+            }
         }
     }
 
@@ -631,10 +822,20 @@ impl Component for AppModel {
         if let Some(stopper) = self.stopper.take() {
             stopper.stop();
         }
+        // A probe running as root would survive us — we cannot signal it — so ask
+        // it to stop on the way out. Exiting closes the pipe anyway and it would
+        // notice, but only once this process is gone; asking now means the port
+        // comes back up while there is still somebody to see it.
+        if let Some(stop) = self.running.take().and_then(|r| r.stop) {
+            stop.stop();
+        }
     }
 
     fn update_cmd(&mut self, cmd: Self::CommandOutput, sender: ComponentSender<Self>, _: &Self::Root) {
-        let Cmd::Captured(report) = cmd;
+        let report = match cmd {
+            Cmd::Captured(report) => report,
+            Cmd::Probed { probe, outcome } => return self.adopt_probe(probe, *outcome),
+        };
         self.capturing = false;
 
         // Reclaiming the log costs a clone of the event vector. The CLI moves
@@ -677,10 +878,17 @@ impl Component for AppModel {
                 self.show_hubs,
                 sender.input_sender(),
             );
-                detail::build(
+            detail::build(
                 &widgets.detail_box,
                 &self.report,
                 &self.selected,
+                &probes::Panel {
+                    carried: &self.carried,
+                    // `stop` is gone once it has been used, which is exactly
+                    // "asked to stop" — no second flag to keep in step.
+                    running: self.running.as_ref().map(|r| (r.probe, r.stop.is_none())),
+                    notes: &self.probe_notes,
+                },
                 sender.input_sender(),
             );
         }

@@ -84,6 +84,20 @@
 
 .probe-row .blocker { font-style: italic; }
 
+/* What the last run said, where the measurement does not say it itself: a
+   refusal, a dismissed password. Same italic as a blocker, because it is the
+   same kind of statement — why the thing you asked for did not happen. */
+.probe-row .probe-note { font-style: italic; }
+
+/* The only control in this app that leads to a password prompt, and the reason
+   it is flat rather than suggested-action: escalation is a thing you may do
+   here, not the thing the panel is recommending. */
+.probe-row button.run-probe {
+    font-size: 0.85em;
+    padding: 1px 10px;
+    min-height: 0;
+}
+
 /* ---------- sidebar ---------- */
 
 .sidebar-list {

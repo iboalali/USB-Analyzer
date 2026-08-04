@@ -182,12 +182,23 @@ impl Preview {
         self.blocked_by.is_some() && caps.remedy(self.probe).root_may_help()
     }
 
-    /// The same sentence [`Plan::describe`] gives, plus what is outstanding.
-    pub fn describe(&self) -> String {
+    /// What will happen, with no account of what is standing in the way.
+    ///
+    /// The half a confirmation dialog wants: the obstacle is the *reason the
+    /// dialog is open*, and repeating it inside the question reads as an argument
+    /// against the button beside it. A terminal explaining why nothing ran wants
+    /// [`Preview::describe`] instead.
+    pub fn what_it_does(&self) -> String {
         let mut s = describe_probe(self.probe, &self.target, self.window, self.cycles);
         for effect in &self.side_effects {
             s.push_str(&format!("\n  · {effect}"));
         }
+        s
+    }
+
+    /// The same sentence [`Plan::describe`] gives, plus what is outstanding.
+    pub fn describe(&self) -> String {
+        let mut s = self.what_it_does();
         if let Some(why) = &self.blocked_by {
             s.push_str(&format!("\n  ! cannot run as this process: {why}"));
         }
