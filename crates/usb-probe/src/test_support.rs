@@ -32,6 +32,7 @@ pub fn empty_snapshot() -> Snapshot {
         urb_traffic: None,
         throughput: Vec::new(),
         reenumeration: None,
+        carried: Vec::new(),
         kernel_log: KernelLog {
             source: KernelLogSource::Journalctl,
             note: None,

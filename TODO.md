@@ -474,8 +474,39 @@ It still refuses what no password fixes: a misspelled target, a mounted disk, a 
 way. And the existing 20 probe tests were re-pointed through the conversion, which is the proof
 the refactor changed no behaviour.
 
-Remaining slices, in order: **(2)** sticky results in the model; **(3)** cooperative cancel;
-**(4)** the confirmation dialog and `pkexec`; **(5)** the polkit action.
+**Slice 2 — sticky results — done.** `model::Measured`, `Snapshot::carry_forward`, and
+`report_carrying`. `Options` is `Copy`, so the carried measurements deliberately do **not** live
+there — a `Vec` would have cost that and rippled through every call site — and the fold happens
+between capture and analysis, which is the only seam where it can work.
+
+**Evidence is carried, never conclusions.** The numbers are folded in *before* the rules run, so
+every finding is re-derived against the machine as it is now. Carrying findings instead would
+freeze a judgement about a world that may have changed, and nothing downstream could tell.
+
+**Re-enumeration is the invalidator, not a clock.** A wall-clock TTL would be an invented
+number, and a reading of a drive nobody has touched for an hour is still true. What actually
+breaks a measurement is the device becoming a *different connection* — and
+`connected_duration_ms` says exactly that: connected for less time than the measurement is old
+means it went away and came back. Unknown duration is kept rather than dropped, because absent
+data is not evidence of a reconnect.
+
+**Address reuse is the trap, and this project has been bitten by it twice** (#18, #19: stale
+kernel events attributed to a device that arrived later). URB stats are keyed by
+`(bus, device_address)` and the kernel reissues addresses, so every entry is re-identified
+against `busnum`/`devnum` plus the same connection test, rather than assumed.
+
+Two smaller rules, each with a test: a measurement taken *this* run always beats a carried one,
+since two rates for one disk would leave every consumer choosing; and a cycling run is never
+carried at all — it is a history rather than a state, and unlike a read rate it cannot be
+re-derived, because the port is no longer being cycled.
+
+`Snapshot::carried` is provenance only. Whatever is listed there has already been folded into
+the fields above, so a consumer that ignores it sees a consistent snapshot — it just cannot say
+how fresh part of it is. **Untested against real hardware**, and unavoidably so: producing a
+measurement needs root and a USB disk, which is #23's blocker too. Six unit tests carry it.
+
+Remaining slices, in order: **(3)** cooperative cancel; **(4)** the confirmation dialog and
+`pkexec`; **(5)** the polkit action.
 
 Two constraints for (3) and (4) that are easy to design around and expensive to discover late:
 

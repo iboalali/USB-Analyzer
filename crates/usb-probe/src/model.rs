@@ -51,6 +51,15 @@ pub struct Snapshot {
     /// Port-cycling results, present only when the re-enumeration probe ran.
     #[serde(default)]
     pub reenumeration: Option<ReenumerationRun>,
+    /// Measurements carried in from earlier privileged runs and still found to
+    /// describe this machine.
+    ///
+    /// Provenance, not data: whatever is listed here has already been folded into
+    /// the fields above, and this is how a reader learns a number was measured
+    /// four minutes ago rather than now. A consumer that ignores it sees a
+    /// perfectly consistent snapshot — it just cannot say how fresh part of it is.
+    #[serde(default)]
+    pub carried: Vec<Measured>,
     pub kernel_log: KernelLog,
 }
 
@@ -1628,6 +1637,169 @@ impl Throughput {
 // Batteries and mains
 // ---------------------------------------------------------------------------
 
+/// A measurement from an earlier privileged run, kept so a later capture can
+/// still show it.
+///
+/// Probes cost a password and, for one of them, a device leaving the bus. The
+/// live viewer re-captures constantly and a probe *causes* uevents, so without
+/// somewhere to keep them these readings would survive a second or two. See
+/// [`crate::report_carrying`].
+///
+/// # What is carried, and what is not
+///
+/// **Evidence, never conclusions.** This holds the numbers a probe measured, and
+/// they are folded in before the rules run so every finding is derived afresh
+/// against the machine as it is now. A carried *finding* would be a judgement
+/// about a world that may no longer exist, and nothing downstream could tell the
+/// difference.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Measured {
+    /// Which probe produced it, for provenance in the UI.
+    pub probe: String,
+    pub taken_at_unix_ms: u64,
+    /// Disk read rates, keyed by block device name.
+    #[serde(default)]
+    pub throughput: Vec<ThroughputSample>,
+    /// URB completion counts, keyed by bus and device address.
+    #[serde(default)]
+    pub urb_traffic: Option<UrbTraffic>,
+}
+
+impl Snapshot {
+    /// Fold earlier measurements in, dropping whatever no longer describes this
+    /// machine.
+    ///
+    /// Called *before* the rules run, so findings are re-derived from carried
+    /// evidence rather than carried as conclusions.
+    ///
+    /// **A fresh measurement always wins.** If this capture measured a device
+    /// itself, the carried figure for it is discarded rather than appended:
+    /// two rates for one disk would leave every consumer picking, and the newer
+    /// one is the answer by definition.
+    pub fn carry_forward(&mut self, carried: &[Measured]) {
+        for m in carried {
+            let Some(kept) = m.pruned_for(self) else {
+                continue;
+            };
+
+            let fresh: Vec<&str> = self.throughput.iter().map(|s| s.device.as_str()).collect();
+            let new_samples: Vec<ThroughputSample> = kept
+                .throughput
+                .iter()
+                .filter(|s| !fresh.contains(&s.device.as_str()))
+                .cloned()
+                .collect();
+            self.throughput.extend(new_samples);
+
+            // Same rule for URB accounting: this run's own sampling stands.
+            if self.urb_traffic.is_none() {
+                self.urb_traffic = kept.urb_traffic.clone();
+            }
+
+            self.carried.push(kept);
+        }
+    }
+}
+
+impl Measured {
+    /// Everything worth keeping out of a probe's snapshot, or `None` when it
+    /// measured nothing.
+    ///
+    /// `reenumeration` is deliberately **not** carried. A cycling run says how a
+    /// link trained twenty times in the past minute; re-showing that against a
+    /// later capture would present a history as a current state, and unlike a
+    /// read rate it cannot be re-derived — the port is not being cycled any more.
+    pub fn from_snapshot(probe: &str, snap: &Snapshot) -> Option<Measured> {
+        let m = Measured {
+            probe: probe.to_string(),
+            taken_at_unix_ms: snap.captured_at_unix_ms,
+            throughput: snap.throughput.clone(),
+            urb_traffic: snap.urb_traffic.clone(),
+        };
+        (!m.throughput.is_empty() || m.urb_traffic.is_some()).then_some(m)
+    }
+
+    /// How long ago this was taken, against a capture's own clock.
+    ///
+    /// Saturating rather than signed: a snapshot older than the measurement means
+    /// the clock moved, not that the future was measured.
+    pub fn age_ms(&self, snap: &Snapshot) -> u64 {
+        snap.captured_at_unix_ms
+            .saturating_sub(self.taken_at_unix_ms)
+        }
+
+    /// This measurement with everything that no longer describes `snap` removed,
+    /// or `None` when nothing of it survives.
+    ///
+    /// # Re-enumeration is the invalidator, not a timeout
+    ///
+    /// A wall-clock expiry would be an invented number: a reading of a drive that
+    /// has sat untouched for an hour is still a true statement about that drive.
+    /// What actually breaks a measurement is the device becoming a *different
+    /// connection* — and `connected_duration_ms` says exactly that. If a device
+    /// has been connected for less time than the measurement is old, it went away
+    /// and came back, and its old numbers belong to a previous life.
+    ///
+    /// # Address reuse is the trap
+    ///
+    /// URB stats are keyed by `(bus, device_address)`, and the kernel reissues
+    /// addresses. This project has already fixed two bugs of exactly that shape
+    /// (stale kernel events attributed to a device that arrived later), so each
+    /// entry is re-identified rather than assumed: same address *and* a
+    /// connection old enough to be the one that was measured.
+    pub fn pruned_for(&self, snap: &Snapshot) -> Option<Measured> {
+        let age = self.age_ms(snap);
+        let same_connection = |dev: &UsbDevice| {
+            // No duration reported: unprovable either way, so keep it. The
+            // presence check above is the guarantee that survives.
+            dev.connected_duration_ms.is_none_or(|c| c >= age)
+        };
+
+        let throughput: Vec<ThroughputSample> = self
+            .throughput
+            .iter()
+            .filter(|s| {
+                snap.block_devices
+                    .iter()
+                    .find(|b| b.name == s.device)
+                    .and_then(|b| snap.owner_of(b))
+                    .is_some_and(same_connection)
+            })
+            .cloned()
+            .collect();
+
+        let urb_traffic = self.urb_traffic.as_ref().and_then(|t| {
+            let devices: Vec<UrbStats> = t
+                .devices
+                .iter()
+                .filter(|u| {
+                    snap.devices()
+                        .into_iter()
+                        .find(|d| {
+                            d.busnum == Some(u.bus) && d.devnum == Some(u.device_address)
+                        })
+                        .is_some_and(same_connection)
+                })
+                .cloned()
+                .collect();
+            (!devices.is_empty()).then(|| UrbTraffic {
+                devices,
+                ..t.clone()
+            })
+        });
+
+        if throughput.is_empty() && urb_traffic.is_none() {
+            return None;
+        }
+        Some(Measured {
+            probe: self.probe.clone(),
+            taken_at_unix_ms: self.taken_at_unix_ms,
+            throughput,
+            urb_traffic,
+        })
+    }
+}
+
 /// A battery, so the tool can say whether an attached supply is actually keeping
 /// up. The PD contract says what is *permitted*; this says what is *happening*.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2378,6 +2550,161 @@ impl Report {
 mod tests {
     use super::*;
     use crate::test_support as ts;
+
+    /// A snapshot with one USB disk on `4-1`, connected for `connected_ms`.
+    fn snap_with_disk(connected_ms: Option<u64>, captured_at: u64) -> Snapshot {
+        let mut snap = ts::empty_snapshot();
+        snap.captured_at_unix_ms = captured_at;
+        let mut bus = ts::root_hub("usb4", 5000.0);
+        let mut dev = ts::device("4-1", "3.00", 5000.0, Some("usb4"));
+        dev.connected_duration_ms = connected_ms;
+        dev.busnum = Some(4);
+        dev.devnum = Some(2);
+        bus.children.push(dev);
+        snap.buses.push(bus);
+        snap.block_devices.push(BlockDevice {
+            name: "sdb".into(),
+            sysfs_path: "/sys/devices/pci/usb4/4-1/host1/block/sdb".into(),
+            model: None,
+            vendor: None,
+            size_bytes: None,
+            rotational: None,
+            removable: Some(true),
+            stats: None,
+            throughput: None,
+            scsi: None,
+            scsi_delta: None,
+        });
+        snap
+    }
+
+    fn sample(device: &str, bps: f64) -> ThroughputSample {
+        ThroughputSample {
+            device: device.into(),
+            bytes_read: 100 * 1024 * 1024,
+            elapsed_ms: 1000,
+            bytes_per_second: Some(bps),
+            contended_bytes: Some(0),
+            error: None,
+        }
+    }
+
+    fn measured_at(taken: u64, device: &str, bps: f64) -> Measured {
+        Measured {
+            probe: "throughput".into(),
+            taken_at_unix_ms: taken,
+            throughput: vec![sample(device, bps)],
+            urb_traffic: None,
+        }
+    }
+
+    /// The point of carrying anything: a measurement that cost a password must
+    /// survive the next ordinary capture, which in the viewer is seconds away.
+    #[test]
+    fn a_measurement_survives_a_later_capture_of_the_same_connection() {
+        // Connected for an hour; measured a minute ago.
+        let mut snap = snap_with_disk(Some(3_600_000), 1_000_000);
+        snap.carry_forward(&[measured_at(940_000, "sdb", 180e6)]);
+
+        assert_eq!(snap.throughput.len(), 1, "the rate is in view");
+        assert_eq!(snap.carried.len(), 1, "and says where it came from");
+        assert_eq!(snap.carried[0].age_ms(&snap), 60_000);
+        assert_eq!(snap.carried[0].probe, "throughput");
+    }
+
+    /// Re-enumeration is the invalidator, not a clock. A device connected for
+    /// less time than the measurement is old went away and came back, so the old
+    /// numbers describe a previous connection.
+    #[test]
+    fn a_measurement_is_dropped_when_the_device_has_re_enumerated_since() {
+        // Measured 60 s ago, but this connection is only 5 s old.
+        let mut snap = snap_with_disk(Some(5_000), 1_000_000);
+        snap.carry_forward(&[measured_at(940_000, "sdb", 180e6)]);
+
+        assert!(snap.throughput.is_empty(), "that rate was another device");
+        assert!(snap.carried.is_empty());
+    }
+
+    /// An unplugged disk takes its measurement with it.
+    #[test]
+    fn a_measurement_is_dropped_when_the_disk_is_gone() {
+        let mut snap = snap_with_disk(Some(3_600_000), 1_000_000);
+        snap.block_devices.clear();
+        snap.carry_forward(&[measured_at(940_000, "sdb", 180e6)]);
+        assert!(snap.throughput.is_empty());
+        assert!(snap.carried.is_empty());
+    }
+
+    /// Two rates for one disk would leave every consumer choosing. The one
+    /// measured now is the answer by definition.
+    #[test]
+    fn a_fresh_measurement_beats_a_carried_one() {
+        let mut snap = snap_with_disk(Some(3_600_000), 1_000_000);
+        snap.throughput.push(sample("sdb", 420e6));
+        snap.carry_forward(&[measured_at(940_000, "sdb", 180e6)]);
+
+        assert_eq!(snap.throughput.len(), 1, "not appended alongside");
+        assert_eq!(snap.throughput[0].bytes_per_second, Some(420e6));
+    }
+
+    /// URB stats are keyed by `(bus, address)` and the kernel reuses addresses —
+    /// the exact shape of two bugs already fixed in this project. An entry is
+    /// kept only if that address still belongs to a connection old enough to be
+    /// the one that was measured.
+    #[test]
+    fn carried_urb_stats_are_re_identified_not_assumed() {
+        let stats = |bus, addr| UrbStats {
+            bus,
+            device_address: addr,
+            completions: 100,
+            transport_errors: 7,
+            ..Default::default()
+        };
+        let traffic = UrbTraffic {
+            window_ms: 1000,
+            devices: vec![stats(4, 2), stats(9, 9)],
+            lines_read: 200,
+            unparsed: 0,
+            source: None,
+        };
+        let carried = Measured {
+            probe: "urb-errors".into(),
+            taken_at_unix_ms: 940_000,
+            throughput: Vec::new(),
+            urb_traffic: Some(traffic),
+        };
+
+        let mut snap = snap_with_disk(Some(3_600_000), 1_000_000);
+        snap.carry_forward(std::slice::from_ref(&carried));
+        let kept = snap
+            .urb_traffic
+            .as_ref()
+            .expect("bus 4 address 2 is still here");
+        assert_eq!(kept.devices.len(), 1, "the unknown address is dropped");
+        assert_eq!(kept.devices[0].bus, 4);
+
+        // And on a machine where that address has re-enumerated, nothing is kept.
+        let mut snap = snap_with_disk(Some(5_000), 1_000_000);
+        snap.carry_forward(&[carried]);
+        assert!(snap.urb_traffic.is_none());
+        assert!(snap.carried.is_empty());
+    }
+
+    /// A cycling run is a history, not a state. It cannot be re-derived from a
+    /// later capture, so it is never carried.
+    #[test]
+    fn a_cycling_run_is_not_carried() {
+        let mut snap = snap_with_disk(Some(3_600_000), 1_000_000);
+        snap.throughput.push(sample("sdb", 420e6));
+        let m = Measured::from_snapshot("throughput", &snap).expect("a rate is worth keeping");
+        assert_eq!(m.throughput.len(), 1);
+
+        let bare = snap_with_disk(None, 1_000_000);
+        assert!(
+            Measured::from_snapshot("reenumerate", &bare).is_none(),
+            "nothing measurable means nothing to carry"
+        );
+    }
 
     /// A disk's sysfs path contains every device above it, so picking the wrong
     /// one is easy — and `usb4` is a *longer* string than `4-1` while being the

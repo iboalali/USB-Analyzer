@@ -178,6 +178,9 @@ pub fn capture_with(
         // costs seconds of wall-clock and must not happen by default.
         throughput: Vec::new(),
         reenumeration: None,
+        // Filled by `carry_forward`, which the caller invokes when it has earlier
+        // measurements to keep. A plain capture carries nothing.
+        carried: Vec::new(),
         kernel_log: log.unwrap_or_else(|| kernel::collect(opts.kernel)),
     };
     apply_overrides(&mut snap, labels);
@@ -217,6 +220,26 @@ fn sample_urb_traffic(capabilities: &caps::Capabilities, opts: Options) -> Optio
 /// Capture and analyze in one step.
 pub fn report(opts: Options) -> Report {
     diag::report(capture(opts))
+}
+
+/// A report that keeps earlier privileged measurements in view.
+///
+/// The live viewer re-captures on every uevent and on a fallback tick, and a
+/// probe *causes* uevents — so without this a throughput number appears and is
+/// wiped a second or two later by the next ordinary, unprivileged capture. That
+/// is the whole reason this exists: a measurement that cost a password should not
+/// evaporate on the next plug event.
+///
+/// **The evidence is carried, never the conclusions.** `carried` holds
+/// measurements, and they are folded into the snapshot *before* the rules run, so
+/// every finding is re-derived against the machine as it is now. Carrying
+/// findings instead would freeze a judgement made about a world that has since
+/// changed, and nothing downstream could tell. [`Measured::pruned_for`] is what
+/// decides a measurement still describes this machine.
+pub fn report_carrying(opts: Options, carried: &[model::Measured]) -> Report {
+    let mut snap = capture(opts);
+    snap.carry_forward(carried);
+    diag::report(snap)
 }
 
 fn now_ms() -> u64 {
