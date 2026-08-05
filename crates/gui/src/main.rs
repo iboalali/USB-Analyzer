@@ -167,9 +167,11 @@ struct AppModel {
     /// The previous kernel log, kept so most captures can skip re-reading it.
     cached_log: Option<KernelLog>,
     log_read_at: Instant,
-    /// `Snapshot::fingerprint` of what is on screen. It excludes time, I/O
-    /// counters and sub-0.5 W battery drift, so the view stays still while
-    /// nothing is happening.
+    /// What is on screen, as [`state_of`] hashes it: everything a rule could
+    /// decide on, and nothing that moves by itself. Time, I/O counters and the
+    /// battery's wattage are all out, so the view stays still while nothing is
+    /// happening — see [`usb_probe::model::Notice`] for why the wattage had to go
+    /// rather than be rounded more coarsely.
     fingerprint: Option<u64>,
     /// Findings already seen, so an arriving fault can be told from a standing
     /// one. Keyed by code and subject, since the same code on two ports is two
@@ -470,7 +472,7 @@ impl AppModel {
                 // screen, so it becomes the view. Its fingerprint goes with it,
                 // or the next ordinary capture would look like a change and
                 // rebuild both panes for nothing.
-                self.fingerprint = Some(report.snapshot.fingerprint());
+                self.fingerprint = Some(state_of(&report.snapshot));
                 self.adopt(*report);
             }
             // Refused *as root*, which is the interesting case: the child re-ran
@@ -534,7 +536,7 @@ impl AppModel {
                     // look like one the device declared.
                     let kind = d.kind();
                     if kind.is_known() {
-                        bits.push(kind.describe());
+                        bits.push(kind.caption());
                     }
                     if let Some(s) = &d.speed {
                         bits.push(s.label.clone());
@@ -925,7 +927,7 @@ impl Component for AppModel {
         // The fingerprint covers the hardware, and a label is not hardware — so
         // a capture taken right after one is written would otherwise be
         // discarded as "nothing changed" and the correction would not appear.
-        let fingerprint = report.snapshot.fingerprint();
+        let fingerprint = state_of(&report.snapshot);
         let labels_changed = self.declarations_of(&report) != self.declarations_of(&self.report);
         if self.fingerprint != Some(fingerprint) || labels_changed {
             self.fingerprint = Some(fingerprint);
@@ -948,7 +950,11 @@ impl Component for AppModel {
         if self.show_content.take() {
             widgets.split.set_show_content(true);
         }
-        if self.rendered.get() != self.revision {
+        // Never under an open menu: the rebuild would destroy the widget the menu
+        // belongs to and the list would vanish mid-choice. Deferring costs almost
+        // nothing — a capture arrives every couple of seconds, and the first one
+        // after the menu closes repaints with whatever is current by then.
+        if self.rendered.get() != self.revision && !detail::menu_open(&widgets.detail_box) {
             self.rendered.set(self.revision);
             sidebar::build(
                 &widgets.sidebar_box,
@@ -972,6 +978,19 @@ impl Component for AppModel {
             );
         }
     }
+}
+
+/// What this window treats as "the state I am showing".
+///
+/// One function so the two places that hash a snapshot cannot disagree: a stored
+/// fingerprint and the one it is compared against have to come from the same
+/// question, or every capture looks like a change and the panes rebuild forever.
+///
+/// [`Notice::OnlyDecisions`] rather than the default, because the window prints
+/// no analogue reading anywhere. The CLI's `watch` does, so it keeps the default
+/// and repaints when the wattage moves — see [`usb_probe::model::Notice`].
+fn state_of(snap: &usb_probe::model::Snapshot) -> u64 {
+    snap.fingerprint_of(usb_probe::model::Notice::OnlyDecisions)
 }
 
 fn now_ms() -> u64 {
@@ -1058,4 +1077,24 @@ fn main() -> glib::ExitCode {
     relm4::set_global_css(include_str!("style.css"));
     app.run::<AppModel>((report, size));
     glib::ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every kind the library knows is offerable except the one deliberately
+    /// withheld. Two lists spelling out the same set is how a kind added in
+    /// `usb-probe` quietly becomes unreachable in the window — the dropdown would
+    /// still work, and nobody would notice the missing row for months.
+    #[test]
+    fn the_dropdown_offers_every_kind_but_unknown() {
+        let offered: Vec<DeviceKind> = KINDS.to_vec();
+        let expected: Vec<DeviceKind> = DeviceKind::ALL
+            .into_iter()
+            .filter(|k| *k != DeviceKind::Unknown)
+            .collect();
+        assert_eq!(offered, expected, "see KINDS: a kind is missing or reordered");
+        assert!(!offered.contains(&DeviceKind::Unknown), "see the note on KINDS");
+    }
 }

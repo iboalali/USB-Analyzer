@@ -1045,6 +1045,52 @@ Still deliberately absent: a per-unit control in the GUI. `--this-one` exists in
 choosing between "this model" and "this one" is a question most people should not have to
 answer, and the model default is right far more often.
 
+### The device-type dropdown closed itself after a few seconds — **done**
+
+Reported from the running app: open *What this is*, and the list shuts on its own before a choice
+can be made. Two separate faults, and the second is the one that would have survived fixing only
+the first.
+
+**The list was not being dismissed; it was being destroyed.** `post_view` rebuilds both panes
+whenever `revision` moves, and a `GtkDropDown`'s popup is a *child* of the dropdown — so throwing
+away the widget takes the open list with it. `detail::menu_open` now gates that rebuild, and it asks
+the widget tree (`is_visible` on any descendant popover) rather than tracking a flag, because a flag
+set on open and cleared on close has a state to get stuck in: a popover destroyed without emitting
+`closed` would freeze the pane forever. It covers *any* popover in the pane, not the kind dropdown
+specifically — the rule worth keeping is that this pane never rebuilds under an open menu.
+
+**Why the rebuild was firing every two seconds:** the fingerprint hashed the battery's power draw in
+half-watt buckets, and a pack charging at 10.3 W with a few hundred milliwatts of jitter crosses a
+bucket boundary on most reads. Measured on this machine: **eight rebuilds in sixteen idle seconds**,
+against a kernel log that was not changing at all. The instinct to widen the bucket is wrong —
+*every* quantum has a boundary a real reading can straddle. `Snapshot::fingerprint_of(Notice)` splits
+the question instead: `AnythingShown` keeps the buckets for `usbdiag watch`, which prints the wattage
+and repaints a terminal for free; `OnlyDecisions` hashes `power_now == 0`, the one thing about that
+number any rule reads (`Battery::not_keeping_up`), and is what the window uses. Two tests, built from
+two consecutive real readings.
+
+Both remaining rebuild sources on this machine are legitimate — the Goodix reader resets every ~9 s
+and each reset is a genuine new kernel event — which is precisely why the guard, not the gate, is
+load-bearing. A menu open for ten seconds would still have been eaten.
+
+**Verified by making the app narrate its own decisions.** Timing the popover from outside proved
+nothing: a popover closes on focus-out, so any window taking focus dismisses it, and two stray test
+instances meant the driver was clicking one window while its log was read from the other. A
+temporary `eprintln!` in the render path settled it in one run — `menu_open=true -> DEFERRED` seven
+passes in a row while a label written from the CLI moved `revision` 6 → 7, then
+`menu_open=false -> REBUILD` on the pass after the list closed. All of that is now in the
+`interact-app` skill, including that `pkill -f <binary>` kills its own shell.
+
+**Also asked for, and done at the same time: title case for the type name.** `DeviceKind::title()`
+sits beside `label()` rather than replacing it — `label()` is lower case *so it reads inside a
+sentence*, which is still what "The device itself reports scanner or camera." needs. The title is
+spelled out per variant, not derived, because title case is not a string operation: *Scanner or
+Camera* keeps `or` lower and *Smart-Card Reader* capitalises after the hyphen. A test asserts each
+title lowercases back to its label, so the duplication cannot drift, and a second test asserts every
+word carries a capital unless title case leaves it alone. Used where the kind is a value — the
+dropdown, the card, the sidebar row, the header caption — and `DeviceKind::ALL` now exists so the
+GUI's offered list is checked against it instead of quietly missing a kind added later.
+
 ---
 
 ## Hand out a binary, or keep handing out nothing? — **discuss first**

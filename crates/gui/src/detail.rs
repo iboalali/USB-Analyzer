@@ -134,7 +134,7 @@ fn kind_card(dev: &usb_probe::model::UsbDevice, sender: &relm4::Sender<crate::Ms
 
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
 
-    let name = gtk::Label::new(Some(kind.kind.label()));
+    let name = gtk::Label::new(Some(kind.kind.title()));
     name.add_css_class("kindname");
     name.set_xalign(0.0);
     name.set_hexpand(true);
@@ -143,7 +143,7 @@ fn kind_card(dev: &usb_probe::model::UsbDevice, sender: &relm4::Sender<crate::Ms
     // The control. A plain dropdown of every kind, with the current one
     // selected; changing it writes a label, and "as the device says" clears it.
     let names: Vec<&str> = std::iter::once(AS_DECLARED)
-        .chain(crate::KINDS.iter().map(|k| k.label()))
+        .chain(crate::KINDS.iter().map(|k| k.title()))
         .collect();
     let choose = gtk::DropDown::from_strings(&names);
     choose.set_valign(gtk::Align::Center);
@@ -218,8 +218,43 @@ fn kind_card(dev: &usb_probe::model::UsbDevice, sender: &relm4::Sender<crate::Ms
     card
 }
 
-/// The dropdown's first entry: not a kind, but "stop overriding".
-pub const AS_DECLARED: &str = "as the device says";
+/// The dropdown's first entry: not a kind, but "stop overriding". Title case
+/// like the kinds below it, since it sits in the same list.
+pub const AS_DECLARED: &str = "As the Device Says";
+
+/// Is a popover inside `pane` on screen?
+///
+/// A rebuild replaces the pane's widgets, and destroying a `GtkDropDown` while
+/// its list is up takes the list with it — which is why *What this is* closed by
+/// itself a second or two after being opened. The list is not a separate thing
+/// that happened to be dismissed; it is a child of the widget that was thrown
+/// away.
+///
+/// This asks the widgets rather than tracking a flag, on purpose. A flag set on
+/// open and cleared on close has a state to get wrong — a popover destroyed
+/// without emitting `closed` would leave it stuck true and the pane would never
+/// repaint again. Whatever GTK says right now cannot be stale, and it costs one
+/// walk of a tree of a few hundred widgets, twice a second at worst.
+///
+/// It deliberately covers *any* popover, not the kind dropdown specifically: the
+/// rule worth keeping is that this pane never rebuilds under an open menu,
+/// whatever menu somebody adds to it next.
+pub fn menu_open(pane: &impl IsA<gtk::Widget>) -> bool {
+    let mut child = pane.as_ref().first_child();
+    while let Some(widget) = child {
+        if widget
+            .downcast_ref::<gtk::Popover>()
+            .is_some_and(|p| p.is_visible())
+        {
+            return true;
+        }
+        if menu_open(&widget) {
+            return true;
+        }
+        child = widget.next_sibling();
+    }
+    false
+}
 
 // ---------------------------------------------------------------------------
 // verdict

@@ -134,6 +134,80 @@ a stale offset lands on the wrong row or on nothing. With the list open,
 key Return` — and after a click-by-coordinate attempt of the same thing wrote no
 file at all, this is the form that worked.
 
+## One instance, and killing the right one
+
+`usbdiag-gui` is a single-instance `GApplication`. A second copy **hands off to the
+first and exits immediately** — so if the user already has the app open, your
+launch silently does nothing and the window you then drive is *theirs*, on their
+backend (native Wayland from the app grid, where XTEST cannot reach it at all).
+Check before launching:
+
+```sh
+pgrep -a usbdiag-gui
+```
+
+To run your own alongside theirs, give it a private session bus — uniqueness is
+registered there:
+
+```sh
+GSK_RENDERER=cairo GDK_BACKEND=x11 dbus-run-session -- ./target/debug/usbdiag-gui
+```
+
+It costs a nested portal/keyring startup (~8 s before the window maps, and pages
+of `dbus-daemon` noise in the log), so prefer a plain launch when the field is
+clear.
+
+**Never `pkill -f` / `pgrep -f` a pattern that names the binary.** The pattern
+matches the command line of the very shell running it, so `pkill -f
+'target/debug/usbdiag-gui'` kills your own wrapper — the tool call comes back
+`exit code 144` (SIGTERM) having done nothing you asked. Kill by explicit PID,
+and note that `dbus-run-session` means **two** processes: killing the wrapper
+leaves the app running. Two surviving instances is the worst case, because the
+driver picks the *first* window named `usbdiag` while you read the other one's
+log — every conclusion from that run is worthless. Verify:
+
+```sh
+xwininfo -root -tree | grep -c '"usbdiag":'      # must be 1
+```
+
+## Timing a popover is not evidence
+
+A `GtkPopover` closes on focus-out. Anything else taking focus — the user typing
+in another window, a notification — dismisses it, and under Xwayland
+`_NET_ACTIVE_WINDOW` goes to `0x0` when focus lands on a native Wayland window.
+So "the list closed after N seconds" cannot distinguish *your* bug from someone
+touching the keyboard, and a poll loop of `xwininfo` shell-outs gives no ordering
+you can trust either.
+
+**Make the app say what it did.** A temporary `eprintln!` in the render path,
+printing the decision rather than the symptom, settles in one run what a dozen
+screenshots cannot:
+
+```
+view rendered=6 revision=7 menu_open=true  -> DEFERRED
+view rendered=6 revision=7 menu_open=false -> REBUILD
+```
+
+Remove it before committing.
+
+**Do not try to screenshot the list.** `xwd` on a popover toplevel here comes back
+holding whatever is *behind* it — the tooltip the pointer is provoking, and the
+pane underneath — not the list. Two things make it useless: the driver leaves the
+pointer resting on the button it clicked, so a tooltip toplevel of its own appears
+beside the list, and the popover's pixmap is not readable under this
+compositor/renderer combination. What *is* reliable is its **existence**, matched
+by geometry (the kind list is ~233x454; a tooltip is a wide, short strip):
+
+```sh
+xwininfo -root -tree | grep -E '"usbdiag-gui": \("usbdiag-gui"' | grep -cE ' [0-9]{3}x4[0-9][0-9]'
+```
+
+**Open a popover in its own invocation.** Chaining `click <row> sleep 1.6 click
+<dropdown>` fails silently: selecting a sidebar row rebuilds the pane, and the
+second click can land before the control exists at that position. The row click
+did work — so the symptom is a popover that never appears, which reads exactly
+like the bug you may be trying to fix.
+
 ## Gotchas
 
 - **The sidebar reflows under you.** Rows carry a two-line reason, so their
@@ -158,8 +232,23 @@ file at all, this is the form that worked.
   lands off the window hands keyboard focus to whatever is under it, and XTEST
   cannot take it back: clicks keep working while every later `type`/`key`
   silently goes nowhere. Only a restart fixes it.
-- **Off-screen window.** If the WM parked the window partly off-screen (negative
-  origin), clicks at small coordinates map off-screen. Run `move 60 60` first.
+- **Do not `move` the window as a habit.** The driver adds the window's *current*
+  on-screen origin to every coordinate, so moving buys nothing — and on a
+  multi-head desktop it actively hurts: it drags the window off the display its
+  owner had it on. Use `move` only when the origin is negative (see below).
+- **Small coordinates are not "the top left of the screen".** Read the layout
+  before choosing any absolute position:
+  ```sh
+  xrandr --listmonitors
+  #  0: +*HDMI-1 3072/700x1728/390+1920+0   <- primary, starts at x=1920
+  #  1: +eDP-1   1920/340x1200/220+0+323    <- laptop, starts at y=323
+  ```
+  On this host `move 40 20` is on the *secondary* display **and** above where it
+  begins vertically, so the title bar lands in dead space and gets clipped. A
+  safe spot here is `move 2100 150` — inside the primary's origin.
+- **Off-screen window.** If the WM really parked it at a negative origin, clicks
+  at small coordinates map off-screen; move it onto a monitor first, using the
+  geometry above rather than a guess.
 - **One control has a side effect.** The viewer touches no hardware, but the
   *What this is* dropdown writes a label to
   `$XDG_CONFIG_HOME/usbdiag/devices.json` and every later run reads it. Check

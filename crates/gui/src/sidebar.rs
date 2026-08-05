@@ -230,7 +230,7 @@ fn fact(report: &Report, subject: &Subject) -> String {
             let mut bits = Vec::new();
             let kind = d.kind();
             if kind.is_known() {
-                bits.push(kind.kind.label().to_string());
+                bits.push(kind.kind.title().to_string());
             }
             if let Some(b) = snap.storage_on(d).first() {
                 bits.push(b.label());

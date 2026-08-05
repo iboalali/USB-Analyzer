@@ -83,6 +83,27 @@ pub enum DeviceKind {
 }
 
 impl DeviceKind {
+    /// Every kind, so a caller that must cover them all cannot quietly miss one
+    /// a later version adds. `Unknown` is included — it is a kind a device can
+    /// be, whatever a particular UI chooses to offer.
+    pub const ALL: [DeviceKind; 15] = [
+        Self::Hub,
+        Self::Keyboard,
+        Self::Mouse,
+        Self::InputDevice,
+        Self::Storage,
+        Self::Audio,
+        Self::Camera,
+        Self::Imaging,
+        Self::Printer,
+        Self::Network,
+        Self::SmartcardReader,
+        Self::Billboard,
+        Self::Wireless,
+        Self::Diagnostic,
+        Self::Unknown,
+    ];
+
     /// User-facing name, lower case so it reads inside a sentence.
     pub fn label(&self) -> &'static str {
         match self {
@@ -101,6 +122,35 @@ impl DeviceKind {
             Self::Wireless => "wireless radio",
             Self::Diagnostic => "diagnostic device",
             Self::Unknown => "unrecognised device",
+        }
+    }
+
+    /// The same name in title case, for somewhere it stands on its own rather
+    /// than sitting inside a sentence: a dropdown entry, a field's value, a
+    /// caption built out of `·` separators.
+    ///
+    /// Spelled out rather than derived by upper-casing each word, because title
+    /// case is not a string operation: *Scanner or Camera* keeps `or` lower,
+    /// *Smart-Card Reader* capitalises after the hyphen, and no rule short of a
+    /// word list gets both right. The test below keeps the two in step — a title
+    /// that stops being the same words as its label fails.
+    pub fn title(&self) -> &'static str {
+        match self {
+            Self::Hub => "Hub",
+            Self::Keyboard => "Keyboard",
+            Self::Mouse => "Mouse",
+            Self::InputDevice => "Input Device",
+            Self::Storage => "Storage",
+            Self::Audio => "Audio Device",
+            Self::Camera => "Camera",
+            Self::Imaging => "Scanner or Camera",
+            Self::Printer => "Printer",
+            Self::Network => "Network Adapter",
+            Self::SmartcardReader => "Smart-Card Reader",
+            Self::Billboard => "Alt-Mode Billboard",
+            Self::Wireless => "Wireless Radio",
+            Self::Diagnostic => "Diagnostic Device",
+            Self::Unknown => "Unrecognised Device",
         }
     }
 
@@ -227,6 +277,12 @@ impl Kind {
     pub fn describe(&self) -> String {
         format!("{} \u{00b7} {}", self.kind.label(), self.source.label())
     }
+
+    /// `Camera · guessed from its name` — [`Kind::describe`] with the kind as a
+    /// value rather than as prose, for a caption under a heading.
+    pub fn caption(&self) -> String {
+        format!("{} \u{00b7} {}", self.kind.title(), self.source.label())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -349,6 +405,37 @@ mod tests {
         let mut d = ts::device("1-1", "2.00", 480.0, Some("usb1"));
         d.interfaces = ifaces;
         d
+    }
+
+    /// Two spellings of one name, and nothing but capitals may differ between
+    /// them. Catches the drift the duplication invites: a label reworded and its
+    /// title left behind, which would show one device two different names
+    /// depending on which widget it appeared in.
+    #[test]
+    fn a_title_is_its_label_with_capitals() {
+        for k in DeviceKind::ALL {
+            let (label, title) = (k.label(), k.title());
+            assert_eq!(
+                title.to_lowercase(),
+                label,
+                "{k:?}: title {title:?} is not the same words as label {label:?}"
+            );
+            assert!(
+                title.starts_with(|c: char| c.is_uppercase()),
+                "{k:?}: {title:?} does not start with a capital"
+            );
+            // Sentence-cased instead of title-cased is the likely slip, so name
+            // it: every word carries a capital unless it is a word title case
+            // leaves alone.
+            for word in title.split(' ') {
+                let minor = matches!(word, "or" | "and" | "the" | "a" | "of");
+                assert_eq!(
+                    !minor,
+                    word.starts_with(|c: char| c.is_uppercase()),
+                    "{k:?}: {word:?} in {title:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -63,6 +63,25 @@ pub struct Snapshot {
     pub kernel_log: KernelLog,
 }
 
+/// Which changes a [`Snapshot::fingerprint_of`] should notice.
+///
+/// Two callers ask "has anything changed?" for different reasons, and what they
+/// pay for a false yes is not the same. `usbdiag watch` clears a terminal and
+/// prints again — cheap, and it *shows* the battery's wattage, so a wattage that
+/// moved is something on screen that moved. A window rebuilds widget trees, which
+/// destroys whatever the person in front of it was using: an open dropdown, a
+/// scroll position, a partly-made choice. There, a reading that wobbles is not
+/// news, and treating it as news is a bug you can feel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Notice {
+    /// Anything a renderer would print differently, including a live reading that
+    /// moves on its own.
+    AnythingShown,
+    /// Only what could change a rule's mind. A pack charging at 10.3 W is the
+    /// same situation it was at 10.6 W a second ago.
+    OnlyDecisions,
+}
+
 impl Snapshot {
     /// Depth-first walk of every USB device on every bus.
     pub fn devices(&self) -> Vec<&UsbDevice> {
@@ -294,15 +313,26 @@ impl Snapshot {
     /// state, batteries, USB4 routers, and how many kernel events have been
     /// logged.
     ///
-    /// Three things are deliberately left out, because they move on their own
-    /// and would make a change-driven display repaint forever:
+    /// Things are deliberately left out, because they move on their own and would
+    /// make a change-driven display repaint forever:
     ///
     /// * capture time and uptime — always different;
     /// * I/O counters and throughput — non-zero whenever any disk is busy;
-    /// * battery power draw below half a watt of change — it wanders constantly
-    ///   on a charging machine. This is the one place where the display can show
-    ///   a slightly stale number, and it is worth it to keep the screen still.
+    /// * battery power draw, to the extent [`Notice`] allows — it wanders
+    ///   constantly on a charging machine.
+    ///
+    /// Rounding the wattage to half a watt was the first attempt at that last one
+    /// and it does not work: a pack charging at 10.3 W with a few hundred
+    /// milliwatts of jitter crosses a bucket boundary on most reads, so the hash
+    /// changed every two seconds anyway — measured at eight changes in sixteen
+    /// idle seconds. **Every** quantum has a boundary a real reading can straddle,
+    /// so a coarser bucket only moves the problem. That is what [`Notice`] is for.
     pub fn fingerprint(&self) -> u64 {
+        self.fingerprint_of(Notice::AnythingShown)
+    }
+
+    /// [`Snapshot::fingerprint`], with a say in what counts as a change.
+    pub fn fingerprint_of(&self, notice: Notice) -> u64 {
         let h = &mut DefaultHasher::new();
         for bus in &self.buses {
             hash_device(bus, h);
@@ -319,7 +349,16 @@ impl Snapshot {
         }
         for b in &self.batteries {
             (&b.name, &b.status, b.capacity_pct).hash(h);
-            b.power_now_w.map(|w| (w * 2.0).round() as i64).hash(h);
+            match notice {
+                // Half-watt buckets. `usbdiag watch` prints the wattage, so a
+                // change in it is a change on screen, and repainting a terminal
+                // costs nothing.
+                Notice::AnythingShown => b.power_now_w.map(|w| (w * 2.0).round() as i64).hash(h),
+                // Whether the pack is gaining nothing at all, which is the only
+                // thing about this number a rule reads:
+                // `Battery::not_keeping_up` turns on `power_now == 0`.
+                Notice::OnlyDecisions => b.power_now_w.map(|w| w == 0.0).hash(h),
+            }
         }
         self.mains_online.hash(h);
 
@@ -2815,6 +2854,71 @@ mod tests {
         });
 
         assert_eq!(a.fingerprint(), b.fingerprint());
+    }
+
+    fn charging_at(watts: f64) -> Snapshot {
+        let mut s = ts::empty_snapshot();
+        s.buses.push(ts::root_hub("usb1", 5000.0));
+        s.mains_online = Some(true);
+        s.batteries.push(Battery {
+            name: "BAT0".into(),
+            scope: None,
+            status: Some("Charging".into()),
+            capacity_pct: Some(80),
+            energy_now_wh: Some(40.0),
+            energy_full_wh: Some(50.0),
+            energy_full_design_wh: Some(57.0),
+            power_now_w: Some(watts),
+            voltage_now_v: Some(17.3),
+            cycle_count: Some(12),
+        });
+        s
+    }
+
+    /// The bug this pair exists for: a window rebuilt its widget trees every two
+    /// seconds — eight times in sixteen idle seconds, measured — because a pack
+    /// charging at 10.3 W jitters across a half-watt bucket boundary. The list a
+    /// user had open was a child of a widget that kept being thrown away.
+    ///
+    /// Note what is *not* the fix: a coarser bucket. Every quantum has a boundary
+    /// a real reading can straddle, so this asks a different question instead.
+    #[test]
+    fn a_wobbling_wattage_is_not_news_to_a_window() {
+        // Two consecutive readings off a real pack, two seconds apart. They land
+        // in different half-watt buckets (21 and 20) — which is exactly how a
+        // machine sitting idle produced a change on nearly every poll.
+        let (a, b) = (charging_at(10.337), charging_at(10.229));
+
+        assert_ne!(
+            a.fingerprint_of(Notice::AnythingShown),
+            b.fingerprint_of(Notice::AnythingShown),
+            "watch prints the wattage, so a changed wattage is a changed screen"
+        );
+        assert_eq!(
+            a.fingerprint_of(Notice::OnlyDecisions),
+            b.fingerprint_of(Notice::OnlyDecisions),
+            "no rule reads the wattage itself, so this must not count as a change"
+        );
+    }
+
+    /// The one thing about that number a rule *does* read, so ignoring drift must
+    /// not go as far as ignoring this: `not_keeping_up` fires on a pack that is
+    /// charging and gaining nothing, which is a fault worth a finding.
+    #[test]
+    fn a_pack_that_stops_gaining_is_noticed_by_both() {
+        let (moving, stalled) = (charging_at(10.337), charging_at(0.0));
+        assert!(
+            stalled.batteries[0].not_keeping_up(true),
+            "0 W while charging is the case this must not be able to hide"
+        );
+
+        for notice in [Notice::AnythingShown, Notice::OnlyDecisions] {
+            assert_ne!(
+                moving.fingerprint_of(notice),
+                stalled.fingerprint_of(notice),
+                "{notice:?} must notice a pack that stopped gaining"
+            );
+        }
     }
 
     #[test]
