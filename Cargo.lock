@@ -920,6 +920,8 @@ dependencies = [
  "gtk4",
  "libadwaita",
  "relm4",
+ "serde",
+ "serde_json",
  "usb-probe",
 ]
 

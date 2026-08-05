@@ -248,6 +248,26 @@ collapses to one pane and the chain transposes from four columns into four rows.
 `--width` / `--height` open it at a given size, which is how the narrow shape
 gets looked at.
 
+### Preferences
+
+Behind the menu button, or Ctrl+comma. One setting so far — the colour scheme,
+which can follow the system or be forced light or dark. Every colour in the window
+is a libadwaita named colour precisely so that forcing it is a one-line change
+rather than a second stylesheet.
+
+Stored in `$XDG_CONFIG_HOME/usbdiag/gui.json`, deliberately **not** in
+`devices.json`: labels are assertions about hardware worth keeping for years and
+worth copying to another machine, a colour scheme is neither, and a corrupt
+preference must not be able to cost you your labels. Nothing the file can contain
+stops the window opening — a missing file is the normal first run, an unparseable
+one is not worth a dialog, and a scheme written by a newer version falls back for
+that one setting rather than discarding the rest.
+
+GSettings would be the idiomatic choice and is the wrong one here: GLib *aborts*
+on a missing schema, so the first setting would have turned `cargo run --bin
+usbdiag-gui` — a documented way to run this — into a crash until a schema had been
+compiled and installed.
+
 ## Usage
 
 ```

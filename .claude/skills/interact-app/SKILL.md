@@ -97,6 +97,43 @@ and a second invocation would raise the toplevel and dismiss the popover.
 `xwd -root` does not work here at all (`BadMatch` under Xwayland), so grabbing
 the whole screen is not an option.
 
+## Two things XTEST cannot do here, and what to use instead
+
+- **The header bar does not take synthesized clicks.** Verified by elimination:
+  clicks on the hamburger, *and* on GTK's own minimize and maximize buttons, do
+  nothing — no popover, no change in `Map State`, no change in geometry — while a
+  click on a sidebar row in the same invocation selects it. So it is not the
+  coordinates and not the widget. Do not spend time bisecting `y` for anything in
+  that row; drive it another way.
+- **`key` has no modifiers**, so accelerators cannot be tested. It does
+  `XK.string_to_keysym(name)`, and a GTK accelerator string like
+  `<Primary>comma` is not a keysym — it resolves to NoSymbol, taps keycode 0, and
+  silently does nothing. `key Down`, `key Return`, `key Escape` are fine.
+
+**Reach a menu item through its action instead.** `GApplication` exports its
+action group on the session bus, so any app-level action is activatable without
+touching the UI — which is how the preferences dialog gets tested at all:
+
+```sh
+gdbus call --session --dest com.iboalali.usbdiag \
+  --object-path /com/iboalali/usbdiag \
+  --method org.gtk.Actions.List
+gdbus call --session --dest com.iboalali.usbdiag \
+  --object-path /com/iboalali/usbdiag \
+  --method org.gtk.Actions.Activate preferences '@av []' '@a{sv} {}'
+```
+
+Only `app.`-scoped actions appear there; a `win.`-scoped one does not. That is
+one reason this app puts *Preferences* on the application.
+
+**Prefer the keyboard inside a dropdown.** Clicking a row by measured coordinates
+works once and then does not: reopening the popover can place it differently, and
+a stale offset lands on the wrong row or on nothing. With the list open,
+`key Down` × n then `key Return` needs no measurement and no second grab. Picking
+*Dark* from a three-item `AdwComboRow` is `click <row> sleep 1.2 key Down key Down
+key Return` — and after a click-by-coordinate attempt of the same thing wrote no
+file at all, this is the form that worked.
+
 ## Gotchas
 
 - **The sidebar reflows under you.** Rows carry a two-line reason, so their

@@ -16,3 +16,9 @@ usb-probe = { workspace = true }
 gtk4 = { workspace = true }
 libadwaita = { workspace = true }
 relm4 = { workspace = true }
+
+# For the preferences file only. Both are already in the tree via usb-probe, so
+# this adds no crate to the build — and the 13-crate limit that shaped two probes
+# is a property of `usb-probe`, not of the GTK layer.
+serde = { workspace = true }
+serde_json = { workspace = true }

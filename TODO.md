@@ -657,6 +657,52 @@ step checks it is XML at all.
 `target/` that the user's next ordinary build cannot write. It reads the action back with `pkaction`
 afterwards rather than assuming polkitd noticed, and `--uninstall` removes both files.
 
+### A settings page, with the colour scheme as its first setting — **done**
+
+`crates/gui/src/settings.rs` and `prefs.rs`, reached from a menu button in the header bar or
+Ctrl+comma. An `AdwPreferencesDialog` rather than a lone control, so the second setting costs a row
+instead of a redesign — and adaptive for free, which matters for a window meant to be usable narrow
+while cables are swapped.
+
+**GSettings is the idiomatic answer and the wrong one.** Not a matter of taste: **GLib aborts the
+process when a schema is missing.** `g_settings_new` on an unregistered id is fatal, not an error to
+handle — so the first setting would have turned `cargo run --bin usbdiag-gui`, which the README
+documents as a supported way to run this, into a crash until a schema had been compiled into a
+schema directory. A user-local install avoids root but not the compile step or the cache that has to
+stay in step with it. One small JSON file has none of that, and a build tree behaves like an install.
+
+**Not `devices.json`.** Labels are assertions about hardware, worth keeping for years and worth
+copying to another machine; a colour scheme is neither. Mixing them would make one file whose halves
+have nothing to do with each other, and a corrupt preference would cost somebody their labels.
+There is a test asserting the two paths differ, for exactly that reason.
+
+**Nothing a file can say stops the window opening.** Missing is the normal first run; unparseable is
+not worth a dialog on startup; and a scheme written by a *newer* version falls back for that one
+setting rather than failing the whole parse and discarding every other setting alongside it. Four
+tests, one per way a file can disappoint.
+
+**The action lives on the application, not the window.** `app.preferences` is the conventional
+namespace and a preference is not a property of one window — and it has a second benefit that
+decided it: `GApplication` exports its action group on the session bus, so the dialog can be opened
+without touching the UI. That is the only way it could be tested here at all, because **XTEST clicks
+do not reach the header bar on this compositor** — proven by elimination, since clicks on GTK's own
+minimize and maximize buttons do nothing either while a sidebar click in the same invocation works.
+Recorded in the `interact-app` skill along with the other two dead ends: `key` has no modifier
+support, so Ctrl+comma cannot be tested at all, and picking a dropdown row by measured coordinates
+silently wrote nothing where `key Down key Down key Return` worked.
+
+**It found a pre-existing bug.** `chain.rs` reads `StyleManager::is_dark()` inside its draw
+function, and nothing rebuilt the panes when light/dark changed — so a *desktop* theme switch under
+an open window left the chain drawn in the old palette until some unrelated uevent happened to
+rebuild it. A viewer that sits open for hours is exactly the thing that outlives a theme change.
+`connect_dark_notify` now bumps the revision, which fixes the system-theme case as well as our own
+switch.
+
+Verified end to end: the dialog opens, the row reads back the current scheme, choosing *Dark* turns
+the window dark and writes `{"theme":"dark"}`, a relaunch loads it (window interior averages
+RGB(68,63,69) against RGB(241,236,242) for light), the chain repaints in the dark palette, and
+choosing *Follow the system* reverses all of it. The test file was removed afterwards.
+
 ### Still out of v1
 
 The substitution workflow ([`docs/01-gui-concept.md`](docs/01-gui-concept.md) §9) — the

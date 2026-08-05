@@ -18,7 +18,9 @@ mod chain;
 mod detail;
 mod findings;
 mod monitor;
+mod prefs;
 mod probes;
+mod settings;
 mod sidebar;
 
 use std::cell::Cell;
@@ -101,6 +103,17 @@ pub enum Msg {
     /// Ask the running probe to stop. It agrees or it does not; we cannot force
     /// it, and would not want to mid-cycle. See `usb_probe::cancel`.
     StopProbe,
+
+    // --- appearance
+    /// Open the preferences dialog.
+    OpenPrefs,
+    /// A colour scheme was chosen. Applied, saved, and redrawn.
+    SetTheme(settings::Theme),
+    /// The effective light/dark state changed — either because we just changed
+    /// it, or because the *desktop* did while we were open. Both need the same
+    /// thing: anything that painted itself from the old palette has to paint
+    /// again. See [`Msg::Restyled`]'s handler.
+    Restyled,
 }
 
 /// Opening window size. Settable from the command line because the narrow
@@ -183,6 +196,9 @@ struct AppModel {
     /// not say it: a refusal, a dismissed password, a failure. Kept per probe
     /// and shown on its row, because that is where the button was.
     probe_notes: std::collections::HashMap<&'static str, String>,
+
+    /// Remembered preferences. One today; the field is the growth point.
+    settings: settings::Settings,
 
     _monitor: WorkerController<monitor::MonitorWorker>,
     /// Ends the monitor's `udevadm` subprocess at shutdown.
@@ -628,6 +644,13 @@ impl Component for AppModel {
                                 set_subtitle: &model.subtitle(),
                             },
 
+                            #[name = "menu_button"]
+                            pack_end = &gtk::MenuButton {
+                                set_icon_name: "open-menu-symbolic",
+                                add_css_class: "flat",
+                                set_tooltip_text: Some("Main menu"),
+                            },
+
                             pack_end = &gtk::Button {
                                 set_icon_name: "view-refresh-symbolic",
                                 add_css_class: "flat",
@@ -703,6 +726,12 @@ impl Component for AppModel {
         find_our_icon(&root);
         root.set_icon_name(Some(APP_ID));
 
+        // Before the window is on screen, so a forced scheme is never a flash of
+        // the other one. libadwaita is initialised by now; it was not when the
+        // first capture ran in `main`.
+        let settings = settings::Settings::load();
+        settings.apply();
+
         let monitor = monitor::MonitorWorker::builder()
             .detach_worker(())
             .forward(sender.input_sender(), |out| match out {
@@ -738,11 +767,43 @@ impl Component for AppModel {
             running: None,
             carried: Vec::new(),
             probe_notes: std::collections::HashMap::new(),
+            settings,
             _monitor: monitor,
             stopper: None,
         };
 
         let widgets = view_output!();
+
+        // The menu, and the one action behind it. A real `GMenu` rather than a
+        // hand-built popover, so it gets the keyboard handling, the platform look
+        // and the Ctrl+comma that every other GNOME app has.
+        //
+        // On the *application* rather than the window: `app.preferences` is the
+        // conventional namespace, a preference is not a property of one window,
+        // and GApplication exports its own action group on the session bus — which
+        // is the only way this dialog can be opened by anything but a hand, since
+        // XTEST clicks do not reach the header bar on this compositor.
+        let menu = gtk::gio::Menu::new();
+        menu.append(Some("_Preferences"), Some("app.preferences"));
+        widgets.menu_button.set_menu_model(Some(&menu));
+
+        let app = relm4::main_application();
+        let open = gtk::gio::SimpleAction::new("preferences", None);
+        let to_model = sender.input_sender().clone();
+        open.connect_activate(move |_, _| to_model.emit(Msg::OpenPrefs));
+        app.add_action(&open);
+        app.set_accels_for_action("app.preferences", &["<Primary>comma"]);
+
+        // Repaint when light/dark actually changes, whoever changed it.
+        //
+        // Not only for our own switch: `chain.rs` reads `StyleManager::is_dark()`
+        // inside its draw function, so before this the chain kept the palette it
+        // was built with when the *desktop* switched theme under an open window —
+        // light bars on a dark card until some unrelated uevent happened to
+        // rebuild the pane. A viewer that sits open for hours is exactly the thing
+        // that outlives a theme change.
+        let redraw = sender.input_sender().clone();
+        adw::StyleManager::default().connect_dark_notify(move |_| redraw.emit(Msg::Restyled));
 
         // Adaptive from the first commit, per §5: below ~500 sp the split view
         // collapses to one pane at a time. Retrofitting this later would mean
@@ -794,6 +855,24 @@ impl Component for AppModel {
                     stopper.stop();
                 }
             },
+            Msg::OpenPrefs => prefs::present(&self.settings, root, sender.input_sender()),
+            Msg::SetTheme(theme) => {
+                if self.settings.theme != theme {
+                    self.settings.theme = theme;
+                    self.settings.apply();
+                    if let Err(e) = self.settings.save() {
+                        // Worth saying: the window looks right, and will not next
+                        // time. Silence would make it look like it worked.
+                        self.banner_text = Some(format!("Could not save the preference: {e}"));
+                    }
+                }
+            }
+            // Rebuild rather than `queue_draw`: the panes are what own the
+            // widgets that painted themselves from a palette, and rebuilding is
+            // the mechanism this app already has for "what is on screen is
+            // stale". Cheap, because it happens once per theme change and not
+            // once per frame.
+            Msg::Restyled => self.revision += 1,
             Msg::StopProbe => {
                 if let Some(r) = &mut self.running {
                     // Taken rather than flagged: the handle is spent once used,
