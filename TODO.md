@@ -436,7 +436,7 @@ with no disks — indistinguishable from a permission problem. Both now name the
 kernel module*, *needs something to run it on*, *needs privilege*. Three probes, three
 different instructions, where before all three read as "you are not allowed".
 
-### Ask for root per probe, never for the app — **decided, slice 1 of 5 done**
+### Ask for root per probe, never for the app — **done, all five slices**
 
 The app is never restarted and never holds privilege: one `pkexec usbdiag probe … --json` per
 run, as §9 planned. Two decisions taken: **ship a polkit action** (so one prompt covers a
@@ -769,7 +769,12 @@ parent is alive belongs to a running instance or to somebody's terminal.
 `usbdiag watch` was never affected. Ctrl-C signals the whole process group, so the shell reaps
 `udevadm` directly.
 
-### A settings page, and the first setting is a theme override
+### A settings page, and the first setting is a theme override — **done; this is the plan it was built from**
+
+Kept for the reasoning, not as open work. What was actually built, and how the three questions
+below were answered, is under *A settings page, with the colour scheme as its first setting*
+above — including the one that came out the other way (the third bullet's `connect_dark_notify`
+turned out to be needed, because nothing rebuilt the panes on a light/dark change).
 
 There is nowhere in `usbdiag-gui` to change anything about the app itself. Add one — and the
 setting wanted now is a **theme override**: follow the desktop (today's only behaviour), or
@@ -1162,11 +1167,11 @@ for. Listed here so the gap is not mistaken for coverage.
   storage. `sudo ./target/debug/usbdiag probe reenumerate --target 5-1.2 --yes --force`.
   The expected result on healthy hardware is `LINK_STABLE_UNDER_CYCLING`, 20 of 20 at
   12M — and the device must still be present afterwards.
-- **`probe urb-errors` end to end** — every refusal path was exercised against live
-  hardware, but the run itself has not been: it needs `sudo modprobe usbmon` and root,
-  and the machine has rebooted since the module was last loaded. The parser is validated
-  against 638 real lines and the gate is validated unprivileged; what is untested is only
-  the join between them.
+- ~~**`probe urb-errors` end to end**~~ — **verified.** Run from the window through
+  `pkexec` after `sudo modprobe usbmon`: the child exited 1 having found something, which
+  is a successful probe, and returned a 180 KB JSON report that was adopted as a carried
+  measurement and survived the next live capture. The join between parser and gate is no
+  longer the untested part.
 - **The udev wake path in `watch`** — parsing, threading and debouncing are covered by a
   canned stream, and `udevadm monitor` is confirmed to spawn with the right filters, but
   no real uevent has travelled the whole chain. Plugging anything in while
